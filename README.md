@@ -16,6 +16,8 @@ A functioning local prototype built with Next.js, TypeScript, Tailwind CSS, and 
 - Server-side audio transcription and structured task understanding when `OPENAI_API_KEY` is configured. The browser never receives the key and raw audio is not written to disk.
 - A bounded six-turn conversation context that lets the AI create, clarify, update, or propose cancellation of reviewable task changes. Every write and cancellation still requires confirmation.
 
+When a task needs a follow-up, LeadLoop keeps a stable unfinished draft ID, its known fields, and the pending question. A later answer updates that same review card; corrections preserve unrelated fields. If several unfinished tasks could match a vague reply, the AI is instructed to ask which task the user means.
+
 **This is still a local prototype, not a private pilot yet.** The first visit seeds fictional sample tasks and contacts. With no key, voice and AI controls enter a clearly labelled setup/demo state and the original manual review path stays available. There is no authentication, cloud database, or notification delivery. Dates on tasks do not trigger notifications. Use sample information on shared devices: localStorage is neither user-isolated nor encrypted. Clearing browser storage removes the workspace. Exports currently provide a readable backup; import is not implemented.
 
 ## Run locally

@@ -1868,6 +1868,19 @@ h1 > span {
   color: #80907c;
   margin: 0 0 14px;
 }
+.review-card .pending-question {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: #f3f7ee;
+  border-radius: 6px;
+  color: #55724a;
+  padding: 8px;
+}
+.pending-question svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
 .review-card .button {
   width: 100%;
   padding: 10px;

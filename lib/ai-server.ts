@@ -1,4 +1,5 @@
 import {
+  AVAILABLE_DRAFT_IDS_PER_TURN,
   MAX_HISTORY_TURNS,
   MAX_KNOWN_TASKS,
   localDateTimeContext,
@@ -23,13 +24,14 @@ const responseSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["type", "targetId", "question", "task"],
+        required: ["type", "targetId", "targetIds", "question", "task"],
         properties: {
           type: {
             type: "string",
             enum: ["create", "update", "cancel", "clarify"],
           },
           targetId: { type: ["string", "null"] },
+          targetIds: { type: "array", items: { type: "string" } },
           question: { type: ["string", "null"] },
           task: {
             type: ["object", "null"],
@@ -114,7 +116,53 @@ export function validateInterpretationInput(input: unknown) {
 }
 
 function systemPrompt(timeZone: string, context: ConversationContext) {
-  return `You are LeadLoop, a careful business task assistant. Return only JSON matching the schema. The user's display time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Interpret relative dates in that time zone. Never invent a date, time, contact, or task detail. If a reminder date lacks a time, emit a clarify operation asking a short question. If any detail is ambiguous, emit clarify and do not create or update a task for the ambiguous part. A due date must be an ISO 8601 timestamp with offset in UTC (for example 2026-10-23T22:00:00.000Z), or null only if no date was mentioned and no clarification is needed. For an update or cancellation, targetId must exactly match an id from KNOWN TASKS or the prior unsaved review queue. Preserve all existing task fields in update.task unless the user changes them. For an update, send the complete replacement task. Use one create operation per separate task. Do not save anything: the user must confirm later.\n\nHISTORY (bounded):\n${JSON.stringify(context.history.slice(-MAX_HISTORY_TURNS))}\n\nKNOWN TASKS (bounded):\n${JSON.stringify(context.knownTasks.slice(-MAX_KNOWN_TASKS))}`;
+  return `You are LeadLoop, a careful business task assistant. Return only JSON matching the schema. The user's display time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Interpret relative dates in that time zone. Never invent a date, time, contact, or task detail.
+
+Conversation state is authoritative. An unfinished task is a real review draft, not merely chat history. When a user says a recognizable task but omits a required reminder time, create the draft immediately with every known field and due:null, then add a clarify operation that targets that same draft. For a new create, targetId must be one unused id from AVAILABLE NEW DRAFT IDS. You may use that new id in a clarification targetIds array in the same response. For updates or cancellations, targetId must exactly match a KNOWN TASK id. Preserve all unrelated fields in update.task.
+
+If PENDING CLARIFICATIONS contains exactly one task and the user's next statement naturally answers its question, update that task by default. If the user clearly starts a separate task, create it and leave the unfinished task pending. If more than one pending task could fit an ambiguous follow-up, ask which task they mean; do not guess. Treat “that”, “it”, “him”, and “her” as references to the most recent unambiguous unfinished or reviewed task. “Actually” or “I meant” is normally an update, never a duplicate create.
+
+Use one create per separate task. A due date must be an ISO 8601 timestamp with offset in UTC (for example 2026-10-23T22:00:00.000Z), or null only while a clarification is still needed. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
+
+HISTORY (bounded):\n${JSON.stringify(context.history.slice(-MAX_HISTORY_TURNS))}\n\nKNOWN TASKS (bounded):\n${JSON.stringify(context.knownTasks.slice(-MAX_KNOWN_TASKS))}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pendingClarifications)}\n\nAVAILABLE NEW DRAFT IDS:\n${JSON.stringify(context.availableDraftIds.slice(0, AVAILABLE_DRAFT_IDS_PER_TURN))}`;
+}
+
+function validateResultTargets(
+  result: AssistantResult,
+  context: ConversationContext,
+) {
+  const knownIds = new Set(context.knownTasks.map((task) => task.id));
+  const availableIds = new Set(context.availableDraftIds);
+  const created = result.operations.filter(
+    (
+      operation,
+    ): operation is Extract<
+      AssistantResult["operations"][number],
+      { type: "create" }
+    > => operation.type === "create",
+  );
+  const createdIds = new Set(created.map((operation) => operation.targetId));
+  if (
+    created.some((operation) => !availableIds.has(operation.targetId)) ||
+    createdIds.size !== created.length
+  ) {
+    throw new Error("Invalid new draft reference.");
+  }
+  for (const operation of result.operations) {
+    if (operation.type === "create") {
+      continue;
+    }
+    if (operation.type === "update" || operation.type === "cancel") {
+      if (!knownIds.has(operation.targetId))
+        throw new Error("Invalid task reference.");
+      continue;
+    }
+    for (const targetId of operation.targetIds) {
+      if (!knownIds.has(targetId) && !createdIds.has(targetId)) {
+        throw new Error("Invalid clarification reference.");
+      }
+    }
+  }
 }
 
 async function openAiFetch(path: string, init: RequestInit) {
@@ -200,7 +248,9 @@ export async function interpretThought(
       "AI_EMPTY_RESPONSE",
     );
   try {
-    return parseAssistantResult(JSON.parse(content));
+    const result = parseAssistantResult(JSON.parse(content));
+    validateResultTargets(result, context);
+    return result;
   } catch {
     throw new ApiError(
       "LeadLoop received an invalid AI response. Please try again.",

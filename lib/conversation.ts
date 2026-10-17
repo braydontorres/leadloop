@@ -2,6 +2,8 @@ import type { Task } from "./tasks";
 
 export const MAX_HISTORY_TURNS = 6;
 export const MAX_KNOWN_TASKS = 12;
+export const MAX_PENDING_CLARIFICATIONS = 3;
+export const AVAILABLE_DRAFT_IDS_PER_TURN = 5;
 
 export type ConversationTurn = {
   role: "user" | "assistant";
@@ -21,10 +23,16 @@ export type TaskDetails = {
 };
 
 export type TaskOperation =
-  | { type: "create"; task: TaskDetails; targetId?: never }
+  | { type: "create"; targetId: string; task: TaskDetails }
   | { type: "update"; targetId: string; task: TaskDetails }
   | { type: "cancel"; targetId: string; task?: never }
-  | { type: "clarify"; question: string; task?: never; targetId?: never };
+  | {
+      type: "clarify";
+      question: string;
+      targetIds: string[];
+      task?: never;
+      targetId?: never;
+    };
 
 export type AssistantResult = {
   message: string;
@@ -34,6 +42,13 @@ export type AssistantResult = {
 export type ConversationContext = {
   history: ConversationTurn[];
   knownTasks: ContextTask[];
+  pendingClarifications: PendingClarification[];
+  availableDraftIds: string[];
+};
+
+export type PendingClarification = {
+  question: string;
+  taskIds: string[];
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -80,7 +95,11 @@ export function parseAssistantResult(value: unknown): AssistantResult {
       throw new Error("Invalid task operation.");
     }
     if (operation.type === "create")
-      return { type: "create", task: parseTask(operation.task) };
+      return {
+        type: "create",
+        targetId: text(operation.targetId, "new task reference", 120),
+        task: parseTask(operation.task),
+      };
     if (operation.type === "update") {
       return {
         type: "update",
@@ -98,6 +117,11 @@ export function parseAssistantResult(value: unknown): AssistantResult {
       return {
         type: "clarify",
         question: text(operation.question, "clarification", 400),
+        targetIds: Array.isArray(operation.targetIds)
+          ? operation.targetIds.map((id) => text(id, "task reference", 120))
+          : (() => {
+              throw new Error("Invalid clarification targets.");
+            })(),
       };
     }
     throw new Error("Unknown task operation.");
@@ -135,7 +159,30 @@ export function parseConversationContext(value: unknown): ConversationContext {
         };
       })
     : [];
-  return { history, knownTasks };
+  const pendingClarifications = Array.isArray(value.pendingClarifications)
+    ? value.pendingClarifications
+        .slice(-MAX_PENDING_CLARIFICATIONS)
+        .map((clarification) => {
+          if (
+            !isRecord(clarification) ||
+            !Array.isArray(clarification.taskIds)
+          ) {
+            throw new Error("Invalid pending clarification.");
+          }
+          return {
+            question: text(clarification.question, "clarification", 400),
+            taskIds: clarification.taskIds.map((id) =>
+              text(id, "task reference", 120),
+            ),
+          };
+        })
+    : [];
+  const availableDraftIds = Array.isArray(value.availableDraftIds)
+    ? value.availableDraftIds
+        .slice(0, AVAILABLE_DRAFT_IDS_PER_TURN)
+        .map((id) => text(id, "available draft reference", 120))
+    : [];
+  return { history, knownTasks, pendingClarifications, availableDraftIds };
 }
 
 export type ReviewItem = TaskDetails & {
@@ -143,26 +190,40 @@ export type ReviewItem = TaskDetails & {
   source: "new" | "existing";
 };
 
+export type AppliedTaskOperations = {
+  reviewItems: ReviewItem[];
+  cancelIds: string[];
+  clarification?: PendingClarification;
+  touchedIds: string[];
+};
+
 export function applyTaskOperations(
   reviewItems: ReviewItem[],
   savedTasks: ContextTask[],
   operations: TaskOperation[],
-  newId: () => string,
-): { reviewItems: ReviewItem[]; cancelIds: string[]; clarification?: string } {
+): AppliedTaskOperations {
   const next = [...reviewItems];
   const cancelIds: string[] = [];
-  let clarification: string | undefined;
+  const touchedIds: string[] = [];
+  let clarification: PendingClarification | undefined;
   for (const operation of operations) {
     if (operation.type === "clarify") {
-      clarification = operation.question;
+      clarification = {
+        question: operation.question,
+        taskIds: operation.targetIds,
+      };
       continue;
     }
     if (operation.type === "create") {
-      next.push({ id: newId(), source: "new", ...operation.task });
+      if (next.some((task) => task.id === operation.targetId)) {
+        throw new Error("LeadLoop returned a duplicate draft reference.");
+      }
+      next.push({ id: operation.targetId, source: "new", ...operation.task });
       continue;
     }
     if (operation.type === "cancel") {
       cancelIds.push(operation.targetId);
+      touchedIds.push(operation.targetId);
       continue;
     }
     const reviewIndex = next.findIndex(
@@ -170,11 +231,13 @@ export function applyTaskOperations(
     );
     if (reviewIndex >= 0) {
       next[reviewIndex] = { ...next[reviewIndex], ...operation.task };
+      touchedIds.push(operation.targetId);
       continue;
     }
     const saved = savedTasks.find((task) => task.id === operation.targetId);
     if (saved) {
       next.push({ id: saved.id, source: "existing", ...operation.task });
+      touchedIds.push(operation.targetId);
       continue;
     }
     throw new Error("LeadLoop could not find the task to update.");
@@ -183,7 +246,28 @@ export function applyTaskOperations(
     reviewItems: next,
     cancelIds: [...new Set(cancelIds)],
     clarification,
+    touchedIds: [...new Set(touchedIds)],
   };
+}
+
+export function advancePendingClarifications(
+  current: PendingClarification[],
+  applied: AppliedTaskOperations,
+) {
+  let next = current.filter(
+    (clarification) =>
+      !clarification.taskIds.some((id) => applied.touchedIds.includes(id)),
+  );
+  if (applied.clarification) {
+    next = next.filter(
+      (clarification) =>
+        !clarification.taskIds.some((id) =>
+          applied.clarification?.taskIds.includes(id),
+        ),
+    );
+    next.push(applied.clarification);
+  }
+  return next.slice(-MAX_PENDING_CLARIFICATIONS);
 }
 
 export function localDateTimeContext(

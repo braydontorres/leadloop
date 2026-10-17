@@ -44,8 +44,10 @@ import {
 } from "../lib/tasks";
 import {
   applyTaskOperations,
+  advancePendingClarifications,
   type AssistantResult,
   type ConversationContext,
+  type PendingClarification,
   type ReviewItem,
 } from "../lib/conversation";
 import {
@@ -79,6 +81,9 @@ export default function Page() {
     [assistantMessage, setAssistantMessage] = useState(""),
     [history, setHistory] = useState<ConversationContext["history"]>([]),
     [reviewItems, setReviewItems] = useState<ReviewItem[]>([]),
+    [pendingClarifications, setPendingClarifications] = useState<
+      PendingClarification[]
+    >([]),
     [cancelIds, setCancelIds] = useState<string[]>([]);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -213,31 +218,32 @@ export default function Page() {
       });
       setDraft(null);
       setReviewItems((items) => items.filter((item) => item.id !== draft.id));
+      setPendingClarifications((items) =>
+        items.filter((item) => !item.taskIds.includes(draft.id)),
+      );
       setText("");
       setNotice("Task saved on this device.");
     } catch (e) {
       setNotice((e as Error).message);
     }
   };
-  const conversationContext = (): ConversationContext => ({
-    history,
-    knownTasks: [
-      ...store.tasks.map(({ id, title, person, due, notes }) => ({
+  const conversationContext = (): ConversationContext => {
+    const known = new Map(
+      store.tasks.map(({ id, title, person, due, notes }) => [
         id,
-        title,
-        person,
-        due,
-        notes,
-      })),
-      ...reviewItems.map(({ id, title, person, due, notes }) => ({
-        id,
-        title,
-        person,
-        due: due ?? "",
-        notes,
-      })),
-    ].slice(-12),
-  });
+        { id, title, person, due, notes },
+      ]),
+    );
+    reviewItems.forEach(({ id, title, person, due, notes }) =>
+      known.set(id, { id, title, person, due: due ?? "", notes }),
+    );
+    return {
+      history,
+      knownTasks: [...known.values()].slice(-12),
+      pendingClarifications,
+      availableDraftIds: Array.from({ length: 5 }, () => crypto.randomUUID()),
+    };
+  };
   const handleAssistantResult = (
     transcript: string,
     result: AssistantResult,
@@ -247,18 +253,20 @@ export default function Page() {
         reviewItems,
         store.tasks,
         result.operations,
-        () => crypto.randomUUID(),
       );
       setReviewItems(applied.reviewItems);
       setCancelIds(applied.cancelIds);
-      setAssistantMessage(applied.clarification ?? result.message);
+      setPendingClarifications((current) =>
+        advancePendingClarifications(current, applied),
+      );
+      setAssistantMessage(applied.clarification?.question ?? result.message);
       setHistory((turns) =>
         [
           ...turns,
           { role: "user" as const, text: transcript },
           {
             role: "assistant" as const,
-            text: applied.clarification ?? result.message,
+            text: applied.clarification?.question ?? result.message,
           },
         ].slice(-6),
       );
@@ -436,6 +444,9 @@ export default function Page() {
   const confirmCancellation = (id: string) => {
     setStore({ ...store, tasks: store.tasks.filter((task) => task.id !== id) });
     setReviewItems((items) => items.filter((item) => item.id !== id));
+    setPendingClarifications((items) =>
+      items.filter((item) => !item.taskIds.includes(id)),
+    );
     setCancelIds((ids) => ids.filter((cancelId) => cancelId !== id));
     setNotice("Task cancellation confirmed.");
   };
@@ -1013,6 +1024,7 @@ export default function Page() {
               </div>
               {(assistantMessage ||
                 reviewItems.length > 0 ||
+                pendingClarifications.length > 0 ||
                 cancelIds.length > 0) && (
                 <section className="assistant-review" aria-live="polite">
                   <div className="assistant-message">
@@ -1028,47 +1040,65 @@ export default function Page() {
                     </div>
                   </div>
                   <div className="review-grid">
-                    {reviewItems.map((item) => (
-                      <article className="review-card" key={item.id}>
-                        <span className="pill">
-                          {item.source === "existing"
-                            ? "UPDATE TO REVIEW"
-                            : "NEW REMINDER"}
-                        </span>
-                        <h2>{item.title}</h2>
-                        <dl>
-                          <div>
-                            <dt>Contact</dt>
-                            <dd>{item.person || "No contact"}</dd>
-                          </div>
-                          <div>
-                            <dt>Reminder</dt>
-                            <dd>
-                              {item.due
-                                ? dateLabel(item.due, timezone)
-                                : "No reminder time"}
-                            </dd>
-                          </div>
-                        </dl>
-                        {item.notes && <p>{item.notes}</p>}
-                        <button
-                          className="button primary"
-                          onClick={() => openReviewItem(item)}
-                        >
-                          Review & confirm <ArrowRight size={15} />
-                        </button>
-                        <button
-                          className="review-dismiss"
-                          onClick={() =>
-                            setReviewItems((items) =>
-                              items.filter((entry) => entry.id !== item.id),
-                            )
-                          }
-                        >
-                          Discard draft
-                        </button>
-                      </article>
-                    ))}
+                    {reviewItems.map((item) => {
+                      const pending = pendingClarifications.find(
+                        (clarification) =>
+                          clarification.taskIds.includes(item.id),
+                      );
+                      return (
+                        <article className="review-card" key={item.id}>
+                          <span className="pill">
+                            {item.source === "existing"
+                              ? "UPDATE TO REVIEW"
+                              : "NEW REMINDER"}
+                          </span>
+                          <h2>{item.title}</h2>
+                          <dl>
+                            <div>
+                              <dt>Contact</dt>
+                              <dd>{item.person || "No contact"}</dd>
+                            </div>
+                            <div>
+                              <dt>Reminder</dt>
+                              <dd>
+                                {item.due
+                                  ? dateLabel(item.due, timezone)
+                                  : "No reminder time"}
+                              </dd>
+                            </div>
+                          </dl>
+                          {pending && (
+                            <p className="pending-question">
+                              <MessageCircle size={13} /> Waiting for:{" "}
+                              {pending.question}
+                            </p>
+                          )}
+                          {item.notes && <p>{item.notes}</p>}
+                          <button
+                            className="button primary"
+                            onClick={() => openReviewItem(item)}
+                          >
+                            Review & confirm <ArrowRight size={15} />
+                          </button>
+                          <button
+                            className="review-dismiss"
+                            onClick={() => {
+                              setReviewItems((items) =>
+                                items.filter((entry) => entry.id !== item.id),
+                              );
+                              setPendingClarifications((items) =>
+                                items.filter(
+                                  (clarification) =>
+                                    !clarification.taskIds.includes(item.id),
+                                ),
+                              );
+                            }}
+                          >
+                            Discard draft
+                          </button>
+                        </article>
+                      );
+                    })}
                     {cancelIds.map((id) => {
                       const target =
                         store.tasks.find((task) => task.id === id) ||

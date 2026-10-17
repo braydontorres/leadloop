@@ -86,6 +86,167 @@ test("shows a useful microphone-permission error and keeps text capture availabl
   ).toContainText("Microphone access was denied");
   await expect(page.getByLabel("What do you need to remember?")).toBeVisible();
 });
+
+test("keeps an unfinished reminder stable across clarification, correction, and a separate new task", async ({
+  page,
+}) => {
+  const contexts: Array<Record<string, unknown>> = [];
+  let billId = "";
+  await page.route("**/api/interpret", async (route) => {
+    const request = JSON.parse(route.request().postData() ?? "{}") as {
+      text: string;
+      context: {
+        availableDraftIds: string[];
+        knownTasks: Array<{ id: string }>;
+        pendingClarifications: unknown[];
+      };
+    };
+    contexts.push(request.context);
+    if (!billId) billId = request.context.availableDraftIds[0];
+    const response =
+      contexts.length === 1
+        ? {
+            transcript: request.text,
+            result: {
+              message: "When would you like to set this reminder?",
+              operations: [
+                {
+                  type: "create",
+                  targetId: billId,
+                  task: {
+                    title: "Talk to Bill about washing his clothes",
+                    person: "Bill",
+                    due: null,
+                    notes: "",
+                  },
+                },
+                {
+                  type: "clarify",
+                  question: "When would you like to set this reminder?",
+                  targetIds: [billId],
+                },
+              ],
+            },
+          }
+        : contexts.length === 2
+          ? {
+              transcript: request.text,
+              result: {
+                message: "I'll remind you next Friday at 5 PM.",
+                operations: [
+                  {
+                    type: "update",
+                    targetId: billId,
+                    task: {
+                      title: "Talk to Bill about washing his clothes",
+                      person: "Bill",
+                      due: "2026-10-23T22:00:00.000Z",
+                      notes: "",
+                    },
+                  },
+                ],
+              },
+            }
+          : contexts.length === 3
+            ? {
+                transcript: request.text,
+                result: {
+                  message: "Updated to 6 PM.",
+                  operations: [
+                    {
+                      type: "update",
+                      targetId: billId,
+                      task: {
+                        title: "Talk to Bill about washing his clothes",
+                        person: "Bill",
+                        due: "2026-10-23T23:00:00.000Z",
+                        notes: "",
+                      },
+                    },
+                  ],
+                },
+              }
+            : contexts.length === 4
+              ? {
+                  transcript: request.text,
+                  result: {
+                    message: "Updated Bill to Ben.",
+                    operations: [
+                      {
+                        type: "update",
+                        targetId: billId,
+                        task: {
+                          title: "Talk to Ben about washing his clothes",
+                          person: "Ben",
+                          due: "2026-10-23T23:00:00.000Z",
+                          notes: "",
+                        },
+                      },
+                    ],
+                  },
+                }
+              : {
+                  transcript: request.text,
+                  result: {
+                    message: "I added Sarah.",
+                    operations: [
+                      {
+                        type: "create",
+                        targetId: request.context.availableDraftIds[0],
+                        task: {
+                          title: "Call Sarah",
+                          person: "Sarah",
+                          due: "2026-10-18T14:00:00.000Z",
+                          notes: "",
+                        },
+                      },
+                    ],
+                  },
+                };
+    await route.fulfill({ json: response });
+  });
+  await page.goto("/");
+  const nav = page.getByRole("navigation", {
+    name:
+      page.viewportSize()!.width < 640
+        ? "Mobile navigation"
+        : "Main navigation",
+  });
+  await nav.getByRole("button", { name: /^Capture(?: & review)?$/ }).click();
+  const thought = page.getByLabel("What do you need to remember?");
+  const understand = page.getByRole("button", {
+    name: "Understand with LeadLoop",
+  });
+  await thought.fill("I need to talk to Bill about washing his clothes.");
+  await understand.click();
+  await expect(page.locator(".pending-question")).toContainText(
+    "When would you like",
+  );
+  await thought.fill("Next Friday at 5 PM.");
+  await understand.click();
+  await expect(page.locator(".review-card")).toHaveCount(1);
+  await expect(page.locator(".pending-question")).toHaveCount(0);
+  await thought.fill("Actually, make it 6 PM.");
+  await understand.click();
+  await expect(page.locator(".review-card")).toHaveCount(1);
+  await thought.fill("I meant Ben, not Bill.");
+  await understand.click();
+  await expect(
+    page.getByRole("heading", {
+      name: "Talk to Ben about washing his clothes",
+    }),
+  ).toBeVisible();
+  await thought.fill("Remind me to call Sarah tomorrow at 9 AM.");
+  await understand.click();
+  await expect(page.locator(".review-card")).toHaveCount(2);
+  await expect.poll(() => contexts.length).toBe(5);
+  expect(contexts[1].knownTasks).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: billId })]),
+  );
+  expect(contexts[1].pendingClarifications).toEqual([
+    expect.objectContaining({ taskIds: [billId] }),
+  ]);
+});
 test("contacts can be created and retained and mobile layout fits", async ({
   page,
 }) => {
