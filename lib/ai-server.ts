@@ -73,6 +73,7 @@ export class ApiError extends Error {
     message: string,
     public status: number,
     public code: string,
+    public requestId?: string,
   ) {
     super(message);
   }
@@ -275,7 +276,126 @@ export function normalizeAndValidateUpdates(
     : { ...result, operations };
 }
 
-async function openAiFetch(path: string, init: RequestInit) {
+type ProviderFailure = {
+  status?: number;
+  requestId?: string;
+  providerType?: string;
+  providerCode?: string;
+};
+
+function safeDiagnosticValue(value: unknown) {
+  return typeof value === "string" && /^[a-zA-Z0-9._-]{1,100}$/.test(value)
+    ? value
+    : undefined;
+}
+
+function requestIdFrom(response: Response) {
+  return (
+    safeDiagnosticValue(response.headers.get("x-request-id")) ??
+    safeDiagnosticValue(response.headers.get("request-id"))
+  );
+}
+
+async function providerFailure(response: Response): Promise<ProviderFailure> {
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    payload = undefined;
+  }
+  const error =
+    payload && typeof payload === "object" && "error" in payload
+      ? (payload.error as Record<string, unknown>)
+      : undefined;
+  return {
+    status: response.status,
+    requestId: requestIdFrom(response),
+    providerType: safeDiagnosticValue(error?.type),
+    providerCode: safeDiagnosticValue(error?.code),
+  };
+}
+
+function logAiFailure(
+  operation: "transcription" | "interpretation",
+  failure: ProviderFailure & { errorType: string },
+) {
+  console.error(
+    "[LeadLoop AI]",
+    JSON.stringify({
+      operation,
+      errorType: failure.errorType,
+      httpStatus: failure.status,
+      requestId: failure.requestId,
+      providerType: failure.providerType,
+      providerCode: failure.providerCode,
+    }),
+  );
+}
+
+function errorForProviderFailure(failure: ProviderFailure) {
+  if (failure.status === 401)
+    return new ApiError(
+      "OpenAI rejected the server key. Check your environment setting.",
+      502,
+      "AI_AUTH_FAILED",
+      failure.requestId,
+    );
+  if (failure.status === 403)
+    return new ApiError(
+      "This OpenAI project is not allowed to use transcription. Check the project and model permissions.",
+      502,
+      "AI_ACCESS_DENIED",
+      failure.requestId,
+    );
+  if (failure.status === 404)
+    return new ApiError(
+      "The configured transcription or AI model is unavailable to this OpenAI project.",
+      502,
+      "AI_MODEL_UNAVAILABLE",
+      failure.requestId,
+    );
+  if (failure.status === 429) {
+    const quota = failure.providerCode === "insufficient_quota";
+    return new ApiError(
+      quota
+        ? "This OpenAI project has no available quota. Check billing and project limits."
+        : "LeadLoop is receiving too many AI requests. Please wait a moment.",
+      429,
+      quota ? "AI_QUOTA_EXCEEDED" : "AI_RATE_LIMITED",
+      failure.requestId,
+    );
+  }
+  if (
+    failure.status === 400 ||
+    failure.status === 413 ||
+    failure.status === 415
+  )
+    return new ApiError(
+      "OpenAI could not accept this recording. Record a short note in a supported browser and try again.",
+      422,
+      "AI_TRANSCRIPTION_REJECTED",
+      failure.requestId,
+    );
+  if (failure.status && failure.status >= 500)
+    return new ApiError(
+      "OpenAI is temporarily unavailable. Please try again shortly.",
+      503,
+      "AI_PROVIDER_UNAVAILABLE",
+      failure.requestId,
+    );
+  return new ApiError(
+    "OpenAI could not complete this request. Please try again.",
+    502,
+    "AI_REQUEST_FAILED",
+    failure.requestId,
+  );
+}
+
+async function openAiFetch(
+  path: string,
+  init: RequestInit,
+  operation: "transcription" | "interpretation",
+) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
   try {
@@ -285,38 +405,35 @@ async function openAiFetch(path: string, init: RequestInit) {
       headers: { Authorization: `Bearer ${apiKey()}`, ...init.headers },
     });
     if (!response.ok) {
-      if (response.status === 401)
-        throw new ApiError(
-          "OpenAI rejected the server key. Check your environment setting.",
-          502,
-          "AI_AUTH_FAILED",
-        );
-      if (response.status === 429)
-        throw new ApiError(
-          "LeadLoop is receiving too many AI requests. Please wait a moment.",
-          429,
-          "AI_RATE_LIMITED",
-        );
-      throw new ApiError(
-        "LeadLoop could not reach OpenAI. Please try again.",
-        502,
-        "AI_REQUEST_FAILED",
-      );
+      const failure = await providerFailure(response);
+      const error = errorForProviderFailure(failure);
+      logAiFailure(operation, { ...failure, errorType: error.code });
+      throw error;
     }
     return response;
   } catch (error) {
     if (error instanceof ApiError) throw error;
-    if ((error as Error).name === "AbortError")
-      throw new ApiError(
+    if ((error as Error).name === "AbortError") {
+      const timeoutError = new ApiError(
         "The AI request took too long. Please try again.",
         504,
         "AI_TIMEOUT",
       );
-    throw new ApiError(
+      logAiFailure(operation, { errorType: timeoutError.code });
+      throw timeoutError;
+    }
+    const networkError = new ApiError(
       "LeadLoop could not reach OpenAI. Please try again.",
       502,
       "AI_NETWORK_ERROR",
     );
+    logAiFailure(operation, {
+      errorType: networkError.code,
+      providerCode: safeDiagnosticValue(
+        (error as { cause?: { code?: unknown } }).cause?.code,
+      ),
+    });
+    throw networkError;
   } finally {
     clearTimeout(timeout);
   }
@@ -327,26 +444,30 @@ export async function interpretThought(
   timeZone: string,
   context: ConversationContext,
 ): Promise<AssistantResult> {
-  const response = await openAiFetch("/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0,
-      response_format: {
-        type: "json_schema",
-        json_schema: {
-          name: "leadloop_task_operations",
-          strict: true,
-          schema: responseSchema,
+  const response = await openAiFetch(
+    "/chat/completions",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0,
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: "leadloop_task_operations",
+            strict: true,
+            schema: responseSchema,
+          },
         },
-      },
-      messages: [
-        { role: "system", content: systemPrompt(timeZone, context) },
-        { role: "user", content: text },
-      ],
-    }),
-  });
+        messages: [
+          { role: "system", content: systemPrompt(timeZone, context) },
+          { role: "user", content: text },
+        ],
+      }),
+    },
+    "interpretation",
+  );
   const payload = (await response.json()) as {
     choices?: Array<{ message?: { content?: string | null } }>;
   };
@@ -380,10 +501,14 @@ export async function transcribeAudio(audio: File) {
   form.append("file", audio, audio.name || "leadloop-recording.webm");
   form.append("model", "gpt-4o-mini-transcribe");
   form.append("response_format", "json");
-  const response = await openAiFetch("/audio/transcriptions", {
-    method: "POST",
-    body: form,
-  });
+  const response = await openAiFetch(
+    "/audio/transcriptions",
+    {
+      method: "POST",
+      body: form,
+    },
+    "transcription",
+  );
   const payload = (await response.json()) as { text?: unknown };
   if (
     typeof payload.text !== "string" ||

@@ -59,6 +59,14 @@ export async function POST(request: Request) {
             500,
             "UNEXPECTED_ERROR",
           );
+    console.error(
+      "[LeadLoop voice]",
+      JSON.stringify({
+        errorType: known.code,
+        httpStatus: known.status,
+        requestId: known.requestId,
+      }),
+    );
     return NextResponse.json(
       {
         error: known.message,

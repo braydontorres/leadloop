@@ -5,6 +5,7 @@ import {
   selectRecorderMimeType,
   supportedAudioFormat,
 } from "../lib/audio-format";
+import { ApiError, transcribeAudio } from "../lib/ai-server";
 import { POST as voicePost } from "../app/api/voice/route";
 
 test("recognizes Chrome WebM and Safari MP4 MIME parameters", () => {
@@ -59,6 +60,35 @@ function voiceRequest(mimeType: string) {
   });
 }
 
+async function withMockedOpenAi<T>(
+  mockFetch: (...args: Parameters<typeof fetch>) => Promise<Response>,
+  action: (diagnostics: string[]) => Promise<T>,
+) {
+  const previousKey = process.env.OPENAI_API_KEY;
+  const previousFetch = globalThis.fetch;
+  const previousConsoleError = console.error;
+  const diagnostics: string[] = [];
+  process.env.OPENAI_API_KEY = "test-key-must-not-appear-in-logs";
+  globalThis.fetch = mockFetch as typeof fetch;
+  console.error = (...args: unknown[]) => {
+    diagnostics.push(args.map(String).join(" "));
+  };
+  try {
+    return await action(diagnostics);
+  } finally {
+    globalThis.fetch = previousFetch;
+    console.error = previousConsoleError;
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+  }
+}
+
+function audioFile() {
+  return new File(["safe test audio"], "leadloop-recording.webm", {
+    type: "audio/webm",
+  });
+}
+
 test("accepts a codec-qualified supported upload before checking OpenAI credentials", async () => {
   const previous = process.env.OPENAI_API_KEY;
   delete process.env.OPENAI_API_KEY;
@@ -81,5 +111,129 @@ test("rejects an unsupported upload with a 415 response", async () => {
   assert.equal(
     ((await response.json()) as { code: string }).code,
     "AUDIO_UNSUPPORTED",
+  );
+});
+
+test("reports a missing transcription model with a safe request-id diagnostic", async () => {
+  let transcriptionForm: FormData | undefined;
+  await withMockedOpenAi(
+    async (_input, init) => {
+      transcriptionForm = init?.body as FormData;
+      return new Response(
+        JSON.stringify({
+          error: { type: "invalid_request_error", code: "model_not_found" },
+        }),
+        {
+          status: 404,
+          headers: {
+            "content-type": "application/json",
+            "x-request-id": "req_transcription_test",
+          },
+        },
+      );
+    },
+    async (diagnostics) => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_MODEL_UNAVAILABLE");
+          assert.equal(error.status, 502);
+          assert.equal(error.requestId, "req_transcription_test");
+          return true;
+        },
+      );
+      assert.match(diagnostics.join("\n"), /AI_MODEL_UNAVAILABLE/);
+      assert.match(diagnostics.join("\n"), /req_transcription_test/);
+      assert.equal(transcriptionForm?.get("model"), "gpt-4o-mini-transcribe");
+      assert.equal(transcriptionForm?.get("response_format"), "json");
+      assert(transcriptionForm?.get("file") instanceof File);
+      assert.doesNotMatch(
+        diagnostics.join("\n"),
+        /test-key-must-not-appear-in-logs/,
+      );
+    },
+  );
+});
+
+test("distinguishes an exhausted quota from a rate limit", async () => {
+  await withMockedOpenAi(
+    async () =>
+      new Response(
+        JSON.stringify({
+          error: { type: "insufficient_quota", code: "insufficient_quota" },
+        }),
+        { status: 429, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_QUOTA_EXCEEDED");
+          assert.equal(error.status, 429);
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("classifies authentication and ordinary rate-limit failures separately", async () => {
+  await withMockedOpenAi(
+    async () =>
+      new Response(
+        JSON.stringify({ error: { type: "authentication_error" } }),
+        { status: 401, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_AUTH_FAILED");
+          return true;
+        },
+      );
+    },
+  );
+  await withMockedOpenAi(
+    async () =>
+      new Response(JSON.stringify({ error: { type: "rate_limit_error" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      }),
+    async () => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_RATE_LIMITED");
+          return true;
+        },
+      );
+    },
+  );
+});
+
+test("classifies a fetch failure as a network error without logging audio data", async () => {
+  await withMockedOpenAi(
+    async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: { code: "ENOTFOUND" },
+      });
+    },
+    async (diagnostics) => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_NETWORK_ERROR");
+          return true;
+        },
+      );
+      assert.match(diagnostics.join("\n"), /ENOTFOUND/);
+      assert.doesNotMatch(diagnostics.join("\n"), /safe test audio/);
+    },
   );
 });
