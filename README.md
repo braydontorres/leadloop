@@ -42,6 +42,8 @@ Set `OPENAI_API_KEY` in `.env.local`, restart `npm run dev`, and use Capture & R
 
 If the key is absent, the app reports that fact without making an OpenAI request. You can still type a task and select **Review manually instead**.
 
+LeadLoop selects a recorder format with `MediaRecorder.isTypeSupported()`. It supports Chrome/Edge/Firefox WebM with Opus codec parameters and Safari MP4/M4A codec parameters, while the server keeps a strict allowlist for WebM, MP4/M4A, Ogg, MP3, and WAV. If your browser cannot produce one of those formats, LeadLoop explains the problem and keeps typed capture available.
+
 ```bash
 npm test          # task, context, validation, timezone, and missing-key tests
 npm run build     # production compilation and TypeScript validation

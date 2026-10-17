@@ -48,6 +48,10 @@ import {
   type ConversationContext,
   type ReviewItem,
 } from "../lib/conversation";
+import {
+  selectRecorderMimeType,
+  supportedAudioFormat,
+} from "../lib/audio-format";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -300,12 +304,14 @@ export default function Page() {
     setVoiceError("");
     setDemoMode(false);
     try {
+      const format = supportedAudioFormat(audio.type);
+      if (!format) {
+        throw new Error(
+          "This browser recorded an audio format LeadLoop cannot transcribe. Try a current version of Chrome or Safari, or type your thought instead.",
+        );
+      }
       const form = new FormData();
-      form.append(
-        "audio",
-        audio,
-        `leadloop-${Date.now()}.${audio.type.includes("mp4") ? "m4a" : "webm"}`,
-      );
+      form.append("audio", audio, `leadloop-${Date.now()}.${format.extension}`);
       form.append("timeZone", timezone);
       form.append("context", JSON.stringify(conversationContext()));
       const response = await fetch("/api/voice", {
@@ -352,14 +358,17 @@ export default function Page() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const supportedType = [
-        "audio/webm;codecs=opus",
-        "audio/mp4",
-        "audio/webm",
-      ].find((type) => MediaRecorder.isTypeSupported(type));
-      const recorder = supportedType
-        ? new MediaRecorder(stream, { mimeType: supportedType })
-        : new MediaRecorder(stream);
+      const supportedType = selectRecorderMimeType(
+        MediaRecorder.isTypeSupported.bind(MediaRecorder),
+      );
+      if (!supportedType) {
+        stream.getTracks().forEach((track) => track.stop());
+        setVoiceError(
+          "This browser cannot record a LeadLoop-supported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
+        );
+        return;
+      }
+      const recorder = new MediaRecorder(stream, { mimeType: supportedType });
       recorderRef.current = recorder;
       chunksRef.current = [];
       discardRecordingRef.current = false;
@@ -370,11 +379,18 @@ export default function Page() {
         clearRecordingTimers();
         setIsRecording(false);
         stream.getTracks().forEach((track) => track.stop());
-        const audio = new Blob(chunksRef.current, {
-          type: recorder.mimeType || "audio/webm",
-        });
+        const recordedMimeType =
+          chunksRef.current.find((chunk) => chunk.type)?.type ||
+          recorder.mimeType;
+        const audio = new Blob(chunksRef.current, { type: recordedMimeType });
         recorderRef.current = null;
-        if (!discardRecordingRef.current && audio.size) void submitAudio(audio);
+        if (!discardRecordingRef.current && audio.size) {
+          if (!supportedAudioFormat(audio.type)) {
+            setVoiceError(
+              "This browser returned an unsupported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
+            );
+          } else void submitAudio(audio);
+        }
       };
       recorder.start(250);
       setRecordingSeconds(0);

@@ -5,18 +5,11 @@ import {
   transcribeAudio,
   validateInterpretationInput,
 } from "../../../lib/ai-server";
+import { supportedAudioFormat } from "../../../lib/audio-format";
 import { clientId, limitRequest } from "../../../lib/request-limit";
 
 export const runtime = "nodejs";
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
-const ALLOWED_AUDIO = new Set([
-  "audio/webm",
-  "audio/mp4",
-  "audio/mpeg",
-  "audio/ogg",
-  "audio/wav",
-  "audio/x-wav",
-]);
 
 export async function POST(request: Request) {
   try {
@@ -35,9 +28,9 @@ export async function POST(request: Request) {
         413,
         "AUDIO_TOO_LARGE",
       );
-    if (!ALLOWED_AUDIO.has(audio.type))
+    if (!supportedAudioFormat(audio.type))
       throw new ApiError(
-        "This browser recorded an unsupported audio format. Try typing instead.",
+        "This browser recorded an audio format LeadLoop cannot transcribe. Try a current version of Chrome or Safari, or type your thought instead.",
         415,
         "AUDIO_UNSUPPORTED",
       );
