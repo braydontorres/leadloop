@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AudioLines,
   ArrowUpRight,
@@ -25,6 +25,11 @@ import {
   Download,
   Menu,
   Leaf,
+  AlertCircle,
+  LoaderCircle,
+  Square,
+  RotateCcw,
+  MessageCircle,
 } from "lucide-react";
 import {
   Task,
@@ -37,6 +42,12 @@ import {
   isToday,
   toLocalInput,
 } from "../lib/tasks";
+import {
+  applyTaskOperations,
+  type AssistantResult,
+  type ConversationContext,
+  type ReviewItem,
+} from "../lib/conversation";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -55,7 +66,21 @@ export default function Page() {
     [text, setText] = useState(""),
     [notice, setNotice] = useState(""),
     [storageError, setStorageError] = useState(false),
-    [menu, setMenu] = useState(false);
+    [menu, setMenu] = useState(false),
+    [isRecording, setIsRecording] = useState(false),
+    [recordingSeconds, setRecordingSeconds] = useState(0),
+    [voiceBusy, setVoiceBusy] = useState(false),
+    [voiceError, setVoiceError] = useState(""),
+    [demoMode, setDemoMode] = useState(false),
+    [assistantMessage, setAssistantMessage] = useState(""),
+    [history, setHistory] = useState<ConversationContext["history"]>([]),
+    [reviewItems, setReviewItems] = useState<ReviewItem[]>([]),
+    [cancelIds, setCancelIds] = useState<string[]>([]);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const discardRecordingRef = useRef(false);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingLimitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -128,6 +153,13 @@ export default function Page() {
       previous?.focus();
     };
   }, [!!draft, !!person]);
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+      if (recordingLimitRef.current) clearTimeout(recordingLimitRef.current);
+      recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
+    };
+  }, []);
   if (!store)
     return (
       <main className="loading">
@@ -176,11 +208,220 @@ export default function Page() {
         tasks: saveTask(store.tasks, { ...draft, title: draft.title.trim() }),
       });
       setDraft(null);
+      setReviewItems((items) => items.filter((item) => item.id !== draft.id));
       setText("");
       setNotice("Task saved on this device.");
     } catch (e) {
       setNotice((e as Error).message);
     }
+  };
+  const conversationContext = (): ConversationContext => ({
+    history,
+    knownTasks: [
+      ...store.tasks.map(({ id, title, person, due, notes }) => ({
+        id,
+        title,
+        person,
+        due,
+        notes,
+      })),
+      ...reviewItems.map(({ id, title, person, due, notes }) => ({
+        id,
+        title,
+        person,
+        due: due ?? "",
+        notes,
+      })),
+    ].slice(-12),
+  });
+  const handleAssistantResult = (
+    transcript: string,
+    result: AssistantResult,
+  ) => {
+    try {
+      const applied = applyTaskOperations(
+        reviewItems,
+        store.tasks,
+        result.operations,
+        () => crypto.randomUUID(),
+      );
+      setReviewItems(applied.reviewItems);
+      setCancelIds(applied.cancelIds);
+      setAssistantMessage(applied.clarification ?? result.message);
+      setHistory((turns) =>
+        [
+          ...turns,
+          { role: "user" as const, text: transcript },
+          {
+            role: "assistant" as const,
+            text: applied.clarification ?? result.message,
+          },
+        ].slice(-6),
+      );
+    } catch (error) {
+      setVoiceError((error as Error).message);
+    }
+  };
+  const requestInterpretation = async (thought: string) => {
+    setVoiceBusy(true);
+    setVoiceError("");
+    setDemoMode(false);
+    try {
+      const response = await fetch("/api/interpret", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: thought,
+          timeZone: timezone,
+          context: conversationContext(),
+        }),
+      });
+      const payload = (await response.json()) as {
+        transcript?: string;
+        result?: AssistantResult;
+        error?: string;
+        demoMode?: boolean;
+      };
+      if (!response.ok || !payload.result || !payload.transcript) {
+        setDemoMode(Boolean(payload.demoMode));
+        throw new Error(
+          payload.error || "LeadLoop couldn't understand that thought.",
+        );
+      }
+      handleAssistantResult(payload.transcript, payload.result);
+    } catch (error) {
+      setVoiceError((error as Error).message);
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+  const submitAudio = async (audio: Blob) => {
+    setVoiceBusy(true);
+    setVoiceError("");
+    setDemoMode(false);
+    try {
+      const form = new FormData();
+      form.append(
+        "audio",
+        audio,
+        `leadloop-${Date.now()}.${audio.type.includes("mp4") ? "m4a" : "webm"}`,
+      );
+      form.append("timeZone", timezone);
+      form.append("context", JSON.stringify(conversationContext()));
+      const response = await fetch("/api/voice", {
+        method: "POST",
+        body: form,
+      });
+      const payload = (await response.json()) as {
+        transcript?: string;
+        result?: AssistantResult;
+        error?: string;
+        demoMode?: boolean;
+      };
+      if (!response.ok || !payload.result || !payload.transcript) {
+        setDemoMode(Boolean(payload.demoMode));
+        throw new Error(
+          payload.error || "LeadLoop couldn't process that recording.",
+        );
+      }
+      setText(payload.transcript);
+      handleAssistantResult(payload.transcript, payload.result);
+    } catch (error) {
+      setVoiceError((error as Error).message);
+    } finally {
+      setVoiceBusy(false);
+    }
+  };
+  const clearRecordingTimers = () => {
+    if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+    if (recordingLimitRef.current) clearTimeout(recordingLimitRef.current);
+    recordingTimerRef.current = null;
+    recordingLimitRef.current = null;
+  };
+  const startRecording = async () => {
+    setVoiceError("");
+    setDemoMode(false);
+    if (
+      !navigator.mediaDevices?.getUserMedia ||
+      typeof MediaRecorder === "undefined"
+    ) {
+      setVoiceError(
+        "Voice capture is not supported in this browser. Type your thought instead.",
+      );
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const supportedType = [
+        "audio/webm;codecs=opus",
+        "audio/mp4",
+        "audio/webm",
+      ].find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = supportedType
+        ? new MediaRecorder(stream, { mimeType: supportedType })
+        : new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      chunksRef.current = [];
+      discardRecordingRef.current = false;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) chunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        clearRecordingTimers();
+        setIsRecording(false);
+        stream.getTracks().forEach((track) => track.stop());
+        const audio = new Blob(chunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        recorderRef.current = null;
+        if (!discardRecordingRef.current && audio.size) void submitAudio(audio);
+      };
+      recorder.start(250);
+      setRecordingSeconds(0);
+      setIsRecording(true);
+      recordingTimerRef.current = setInterval(
+        () => setRecordingSeconds((seconds) => seconds + 1),
+        1000,
+      );
+      recordingLimitRef.current = setTimeout(() => {
+        setVoiceError(
+          "Voice notes are limited to 90 seconds. We stopped this recording.",
+        );
+        recorder.stop();
+      }, 90_000);
+    } catch (error) {
+      const denied = (error as DOMException).name === "NotAllowedError";
+      setVoiceError(
+        denied
+          ? "Microphone access was denied. Allow access in your browser, or type your thought instead."
+          : "LeadLoop couldn't start the microphone. Check your device and try again.",
+      );
+    }
+  };
+  const stopRecording = () => {
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+  };
+  const cancelRecording = () => {
+    discardRecordingRef.current = true;
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    else setIsRecording(false);
+  };
+  const openReviewItem = (item: ReviewItem) => {
+    const saved = store.tasks.find((task) => task.id === item.id);
+    setDraft({
+      id: item.id,
+      title: item.title,
+      person: item.person,
+      due: item.due ?? "",
+      notes: item.notes,
+      completed: saved?.completed ?? false,
+    });
+  };
+  const confirmCancellation = (id: string) => {
+    setStore({ ...store, tasks: store.tasks.filter((task) => task.id !== id) });
+    setReviewItems((items) => items.filter((item) => item.id !== id));
+    setCancelIds((ids) => ids.filter((cancelId) => cancelId !== id));
+    setNotice("Task cancellation confirmed.");
   };
   const taskRow = (t: Task) => (
     <div className={"task-row " + (t.completed ? "done" : "")} key={t.id}>
@@ -365,13 +606,31 @@ export default function Page() {
                 <div className="hero-action">
                   <button
                     className="mic-button"
-                    aria-label="Open capture; voice input coming in Phase 2"
-                    onClick={() => go("Capture")}
+                    aria-label={
+                      isRecording ? "Stop recording" : "Start voice recording"
+                    }
+                    onClick={() => {
+                      go("Capture");
+                      if (isRecording) stopRecording();
+                      else void startRecording();
+                    }}
                   >
-                    <Mic size={37} strokeWidth={1.7} />
+                    {isRecording ? (
+                      <Square size={30} fill="currentColor" strokeWidth={1.7} />
+                    ) : (
+                      <Mic size={37} strokeWidth={1.7} />
+                    )}
                   </button>
-                  <strong>Capture a thought</strong>
-                  <span>Text capture available now</span>
+                  <strong>
+                    {isRecording
+                      ? "Recording… tap to stop"
+                      : "Capture a thought"}
+                  </strong>
+                  <span>
+                    {isRecording
+                      ? `${recordingSeconds}s of 90s`
+                      : "Voice or text"}
+                  </span>
                   <div className="wave" aria-hidden="true">
                     {[8, 15, 23, 12, 31, 19, 37, 24, 16, 28, 12, 20, 8].map(
                       (h, i) => (
@@ -612,33 +871,92 @@ export default function Page() {
                 <section className="card capture-panel">
                   <div className="capture-top">
                     <span className="stat-icon green">
-                      <Keyboard size={21} />
+                      <Mic size={21} />
                     </span>
                     <div>
                       <h2>Start with a thought</h2>
-                      <p>Manual capture · Phase 1</p>
+                      <p>Speak naturally or type it out</p>
                     </div>
+                  </div>
+                  <div className="recording-controls">
+                    <button
+                      className={`record-button ${isRecording ? "recording" : ""}`}
+                      type="button"
+                      aria-pressed={isRecording}
+                      disabled={voiceBusy}
+                      onClick={() =>
+                        isRecording ? stopRecording() : void startRecording()
+                      }
+                    >
+                      {isRecording ? (
+                        <Square size={18} fill="currentColor" />
+                      ) : (
+                        <Mic size={19} />
+                      )}
+                      {isRecording
+                        ? `Stop recording · ${recordingSeconds}s`
+                        : "Start recording"}
+                    </button>
+                    {isRecording && (
+                      <button
+                        className="button secondary compact"
+                        type="button"
+                        onClick={cancelRecording}
+                      >
+                        <X size={15} /> Cancel
+                      </button>
+                    )}
+                    {voiceBusy && (
+                      <span className="processing">
+                        <LoaderCircle size={16} /> Understanding your thought…
+                      </span>
+                    )}
                   </div>
                   <label className="field">
                     What do you need to remember?
                     <textarea
                       value={text}
                       onChange={(e) => setText(e.target.value)}
-                      placeholder="e.g. Call Sarah about the new project"
+                      placeholder="e.g. Call Sarah about the new project, or your transcript will appear here"
                       rows={6}
                     />
                   </label>
+                  <p className="input-note">
+                    Recording stops after 90 seconds and is sent only when you
+                    press stop. LeadLoop does not keep raw audio.
+                  </p>
                   <div className="capture-help">
-                    <Mic size={18} />
+                    <ShieldCheck size={18} />
                     <span>
-                      Push-to-talk, transcription, and AI follow-up are coming
-                      in Phase 2. For now, type your task and choose the details
-                      yourself.
+                      Your voice and text are sent to OpenAI only when you ask
+                      LeadLoop to understand them. Nothing is saved until you
+                      confirm a review card.
                     </span>
                   </div>
+                  {voiceError && (
+                    <div className="voice-alert" role="alert">
+                      <AlertCircle size={17} />
+                      <span>{voiceError}</span>
+                    </div>
+                  )}
+                  {demoMode && (
+                    <div className="demo-ai-note">
+                      <strong>Demo mode</strong> — add a server-side OpenAI key
+                      to transcribe and understand speech. You can still review
+                      typed text manually.
+                    </div>
+                  )}
                   <button
                     className="button primary wide"
-                    disabled={!text.trim()}
+                    disabled={!text.trim() || voiceBusy || isRecording}
+                    onClick={() => void requestInterpretation(text.trim())}
+                  >
+                    {voiceBusy ? "Working…" : "Understand with LeadLoop"}{" "}
+                    <ArrowRight size={17} />
+                  </button>
+                  <button
+                    className="manual-review-link"
+                    disabled={!text.trim() || voiceBusy || isRecording}
                     onClick={() =>
                       setDraft({
                         id: crypto.randomUUID(),
@@ -650,7 +968,7 @@ export default function Page() {
                       })
                     }
                   >
-                    Review task <ArrowRight size={17} />
+                    <Keyboard size={15} /> Review manually instead
                   </button>
                 </section>
                 <aside className="capture-aside">
@@ -661,10 +979,10 @@ export default function Page() {
                     to a little more clarity.
                   </h2>
                   {[
-                    "Capture what matters",
-                    "Choose a date and time",
-                    "Review and confirm",
-                    "Find it in your task list",
+                    "Press the microphone and speak",
+                    "LeadLoop transcribes and understands",
+                    "Clarify or correct with another thought",
+                    "Review and confirm before saving",
                   ].map((s, i) => (
                     <div className="step" key={s}>
                       <span>{i + 1}</span>
@@ -672,11 +990,114 @@ export default function Page() {
                     </div>
                   ))}
                   <p>
-                    This version saves one task at a time. Nothing is saved
-                    until you confirm it.
+                    Keep talking in this capture session. LeadLoop keeps a small
+                    conversation context so corrections update the same task.
                   </p>
                 </aside>
               </div>
+              {(assistantMessage ||
+                reviewItems.length > 0 ||
+                cancelIds.length > 0) && (
+                <section className="assistant-review" aria-live="polite">
+                  <div className="assistant-message">
+                    <MessageCircle size={20} />
+                    <div>
+                      <span className="eyebrow">LEADLOOP</span>
+                      <strong>
+                        {assistantMessage || "Here’s what I heard."}
+                      </strong>
+                      <p>
+                        Review every change before it reaches your task list.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="review-grid">
+                    {reviewItems.map((item) => (
+                      <article className="review-card" key={item.id}>
+                        <span className="pill">
+                          {item.source === "existing"
+                            ? "UPDATE TO REVIEW"
+                            : "NEW REMINDER"}
+                        </span>
+                        <h2>{item.title}</h2>
+                        <dl>
+                          <div>
+                            <dt>Contact</dt>
+                            <dd>{item.person || "No contact"}</dd>
+                          </div>
+                          <div>
+                            <dt>Reminder</dt>
+                            <dd>
+                              {item.due
+                                ? dateLabel(item.due, timezone)
+                                : "No reminder time"}
+                            </dd>
+                          </div>
+                        </dl>
+                        {item.notes && <p>{item.notes}</p>}
+                        <button
+                          className="button primary"
+                          onClick={() => openReviewItem(item)}
+                        >
+                          Review & confirm <ArrowRight size={15} />
+                        </button>
+                        <button
+                          className="review-dismiss"
+                          onClick={() =>
+                            setReviewItems((items) =>
+                              items.filter((entry) => entry.id !== item.id),
+                            )
+                          }
+                        >
+                          Discard draft
+                        </button>
+                      </article>
+                    ))}
+                    {cancelIds.map((id) => {
+                      const target =
+                        store.tasks.find((task) => task.id === id) ||
+                        reviewItems.find((item) => item.id === id);
+                      return (
+                        <article className="review-card cancel-card" key={id}>
+                          <span className="pill">CANCELLATION TO REVIEW</span>
+                          <h2>{target?.title || "This task"}</h2>
+                          <p>
+                            LeadLoop heard a request to cancel it. Confirm
+                            before removing anything.
+                          </p>
+                          <button
+                            className="button secondary"
+                            onClick={() => confirmCancellation(id)}
+                          >
+                            <Trash2 size={15} /> Confirm cancellation
+                          </button>
+                          <button
+                            className="review-dismiss"
+                            onClick={() =>
+                              setCancelIds((ids) =>
+                                ids.filter((cancelId) => cancelId !== id),
+                              )
+                            }
+                          >
+                            Keep task
+                          </button>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  <button
+                    className="continue-speaking"
+                    onClick={() => {
+                      setText("");
+                      setVoiceError("");
+                      void startRecording();
+                    }}
+                    disabled={voiceBusy || isRecording}
+                  >
+                    <RotateCcw size={16} /> Continue speaking
+                  </button>
+                </section>
+              )}
             </>
           )}
           {screen === "People" && (

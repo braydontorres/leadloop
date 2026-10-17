@@ -6,15 +6,19 @@ test("capture, confirm, persist, edit, complete and delete a task", async ({
   await expect(
     page.getByRole("heading", { name: "A clear mind. A good day." }),
   ).toBeVisible();
-  await page
-    .getByRole("button", {
-      name: "Open capture; voice input coming in Phase 2",
-    })
+  const navigation = page.getByRole("navigation", {
+    name:
+      page.viewportSize()!.width < 640
+        ? "Mobile navigation"
+        : "Main navigation",
+  });
+  await navigation
+    .getByRole("button", { name: /^Capture(?: & review)?$/ })
     .click();
   await page
     .getByLabel("What do you need to remember?")
     .fill("Call Robin about the estimate");
-  await page.getByRole("button", { name: "Review task" }).click();
+  await page.getByRole("button", { name: "Review manually instead" }).click();
   const dialog = page.getByRole("dialog");
   await dialog.getByLabel("Person").fill("Robin");
   await dialog.getByLabel("Date & time").fill("2027-01-15T17:00");
@@ -55,6 +59,32 @@ test("capture, confirm, persist, edit, complete and delete a task", async ({
   await page.getByRole("button", { name: "Delete task", exact: true }).click();
   await expect(page.locator(".task-row")).toHaveCount(0);
   await expect(page.getByText("No tasks match this view.")).toBeVisible();
+});
+test("shows a useful microphone-permission error and keeps text capture available", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: {
+        getUserMedia: () =>
+          Promise.reject(new DOMException("Denied", "NotAllowedError")),
+      },
+      configurable: true,
+    });
+  });
+  await page.goto("/");
+  const nav = page.getByRole("navigation", {
+    name:
+      page.viewportSize()!.width < 640
+        ? "Mobile navigation"
+        : "Main navigation",
+  });
+  await nav.getByRole("button", { name: /^Capture/ }).click();
+  await page.getByRole("button", { name: "Start recording" }).click();
+  await expect(
+    page.getByRole("alert").filter({ hasText: "Microphone access was denied" }),
+  ).toContainText("Microphone access was denied");
+  await expect(page.getByLabel("What do you need to remember?")).toBeVisible();
 });
 test("contacts can be created and retained and mobile layout fits", async ({
   page,
