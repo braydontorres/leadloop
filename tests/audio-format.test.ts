@@ -5,7 +5,7 @@ import {
   selectRecorderMimeType,
   supportedAudioFormat,
 } from "../lib/audio-format";
-import { ApiError, transcribeAudio } from "../lib/ai-server";
+import { ApiError, interpretThought, transcribeAudio } from "../lib/ai-server";
 import { POST as voicePost } from "../app/api/voice/route";
 
 test("recognizes Chrome WebM and Safari MP4 MIME parameters", () => {
@@ -236,4 +236,136 @@ test("classifies a fetch failure as a network error without logging audio data",
       assert.doesNotMatch(diagnostics.join("\n"), /safe test audio/);
     },
   );
+});
+
+const interpretationContext = {
+  history: [],
+  knownTasks: [
+    {
+      id: "task-1",
+      title: "Call Sarah",
+      person: "Sarah",
+      due: "2026-10-23T22:00:00.000Z",
+      notes: "",
+    },
+  ],
+  pendingClarifications: [],
+  availableDraftIds: ["draft-1"],
+};
+
+test("classifies a rejected interpretation schema without calling it a transcription error", async () => {
+  const exactSchemaError =
+    "Invalid schema for response_format 'leadloop_task_operations': In context=('properties', 'operations', 'items', 'properties', 'changes'), 'required' is required to be supplied and to be an array including every key in properties. Missing 'title'.";
+  await withMockedOpenAi(
+    async () =>
+      new Response(
+        JSON.stringify({
+          error: {
+            message: exactSchemaError,
+            type: "invalid_request_error",
+            param: "response_format.json_schema.schema",
+            code: "invalid_json_schema",
+          },
+        }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ),
+    async (diagnostics) => {
+      await assert.rejects(
+        () =>
+          interpretThought(
+            "Actually make it 6 PM.",
+            "America/Chicago",
+            interpretationContext,
+          ),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_INTERPRETATION_REJECTED");
+          assert.equal(error.status, 502);
+          return true;
+        },
+      );
+      assert.match(diagnostics.join("\n"), /operation.*interpretation/);
+      assert.match(diagnostics.join("\n"), /AI_INTERPRETATION_REJECTED/);
+      assert.match(
+        diagnostics.join("\n"),
+        /response_format\.json_schema\.schema/,
+      );
+      assert.match(diagnostics.join("\n"), /Missing 'title'/);
+    },
+  );
+});
+
+test("sends a strict-schema-compatible interpretation request and parses a time-only update", async () => {
+  let requestBody: Record<string, unknown> | undefined;
+  await withMockedOpenAi(
+    async (_input, init) => {
+      requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  message: "Updated to 6 PM.",
+                  operations: [
+                    {
+                      type: "update",
+                      targetId: "task-1",
+                      targetIds: [],
+                      question: null,
+                      task: null,
+                      changes: {
+                        title: null,
+                        person: null,
+                        due: "2026-10-23T23:00:00.000Z",
+                        notes: null,
+                        clearDue: false,
+                      },
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    },
+    async () => {
+      const result = await interpretThought(
+        "Actually make it 6 PM.",
+        "America/Chicago",
+        interpretationContext,
+      );
+      assert.deepEqual(result.operations, [
+        {
+          type: "update",
+          targetId: "task-1",
+          changes: { due: "2026-10-23T23:00:00.000Z" },
+        },
+      ]);
+    },
+  );
+  const responseFormat = requestBody?.response_format as {
+    type: string;
+    json_schema: { schema: Record<string, unknown> };
+  };
+  assert.equal(requestBody?.model, "gpt-4o-mini");
+  assert.equal(responseFormat.type, "json_schema");
+  const schema = responseFormat.json_schema.schema as {
+    properties: {
+      operations: {
+        items: { properties: { changes: Record<string, unknown> } };
+      };
+    };
+  };
+  const changes = schema.properties.operations.items.properties.changes;
+  assert.deepEqual(changes.required, [
+    "title",
+    "person",
+    "due",
+    "notes",
+    "clearDue",
+  ]);
+  assert.equal(changes.additionalProperties, false);
 });

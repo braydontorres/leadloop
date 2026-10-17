@@ -31,7 +31,11 @@ test("Scenario B: keeps an existing draft id when a contextual correction change
         question: null,
         task: null,
         changes: {
+          title: null,
+          person: null,
           due: "2026-10-23T23:00:00.000Z",
+          notes: null,
+          clearDue: false,
         },
       },
     ],

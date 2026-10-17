@@ -93,20 +93,25 @@ function isUtcIsoDate(value: string) {
 
 function parseChanges(value: unknown): TaskChanges {
   if (!isRecord(value)) throw new Error("Invalid task changes.");
+  if (typeof value.clearDue !== "boolean") {
+    throw new Error("Invalid reminder update.");
+  }
   const changes: TaskChanges = {};
-  if ("title" in value) changes.title = text(value.title, "task title", 240);
-  if ("person" in value)
+  if (value.title !== null)
+    changes.title = text(value.title, "task title", 240);
+  if (value.person !== null)
     changes.person = optionalText(value.person, "person", 160);
-  if ("notes" in value)
+  if (value.notes !== null)
     changes.notes = optionalText(value.notes, "notes", 1000);
-  if ("due" in value) {
-    if (
-      value.due !== null &&
-      (typeof value.due !== "string" || !isUtcIsoDate(value.due))
-    ) {
+  if (value.due !== null) {
+    if (typeof value.due !== "string" || !isUtcIsoDate(value.due)) {
       throw new Error("Invalid reminder date.");
     }
     changes.due = value.due;
+  }
+  if (value.clearDue) {
+    if (value.due !== null) throw new Error("Invalid reminder update.");
+    changes.due = null;
   }
   if (Object.keys(changes).length === 0) {
     throw new Error("An update must change at least one task field.");

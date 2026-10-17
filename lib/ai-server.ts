@@ -55,11 +55,13 @@ const responseSchema = {
           changes: {
             type: ["object", "null"],
             additionalProperties: false,
+            required: ["title", "person", "due", "notes", "clearDue"],
             properties: {
-              title: { type: "string" },
-              person: { type: "string" },
+              title: { type: ["string", "null"] },
+              person: { type: ["string", "null"] },
               due: { type: ["string", "null"] },
-              notes: { type: "string" },
+              notes: { type: ["string", "null"] },
+              clearDue: { type: "boolean" },
             },
           },
         },
@@ -137,11 +139,11 @@ export function validateInterpretationInput(input: unknown) {
 function systemPrompt(timeZone: string, context: ConversationContext) {
   return `You are LeadLoop, a careful business task assistant. Return only JSON matching the schema. The user's display time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Interpret relative dates in that time zone. Never invent a date, time, contact, or task detail.
 
-Conversation state is authoritative. An unfinished task is a real review draft, not merely chat history. When a user says a recognizable task but omits a required reminder time, create the draft immediately with every known field and due:null, then add a clarify operation that targets that same draft. For a new create, targetId must be one unused id from AVAILABLE NEW DRAFT IDS. You may use that new id in a clarification targetIds array in the same response. For updates or cancellations, targetId must exactly match a KNOWN TASK id. Preserve all unrelated fields in update.task.
+Conversation state is authoritative. An unfinished task is a real review draft, not merely chat history. When a user says a recognizable task but omits a required reminder time, create the draft immediately with every known field and due:null, then add a clarify operation that targets that same draft. For a new create, targetId must be one unused id from AVAILABLE NEW DRAFT IDS. You may use that new id in a clarification targetIds array in the same response. For updates or cancellations, targetId must exactly match a KNOWN TASK id. Preserve all unrelated fields by leaving them null in update.changes.
 
 If PENDING CLARIFICATIONS contains exactly one task and the user's next statement naturally answers its question, update that task by default. If the user clearly starts a separate task, create it and leave the unfinished task pending. If more than one pending task could fit an ambiguous follow-up, ask which task they mean; do not guess. Treat “that”, “it”, “him”, and “her” as references to the most recent unambiguous unfinished or reviewed task. “Actually” or “I meant” is normally an update, never a duplicate create. A pronoun can update a known task only when one task is unambiguous; otherwise clarify.
 
-Use one create per separate task. A response must never create and update/cancel the same intended task. For update, return only the fields the user explicitly changed in changes; do not repeat unchanged title, contact, due date, or notes. This is essential: an update to a reminder time has changes: {"due":"..."} only, so the stored date, contact, title, and notes are preserved. Never put an inferred contact into changes.person; only change it when the user explicitly names the replacement. A due date must be an ISO 8601 UTC timestamp ending in Z (for example 2026-10-23T22:00:00.000Z), or null only when the user explicitly removes a reminder. Create uses task and changes:null. Update uses changes and task:null. Cancel and clarify use task:null and changes:null. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
+Use one create per separate task. A response must never create and update/cancel the same intended task. OpenAI structured output requires every changes key: for update, changes must always be {"title":string|null,"person":string|null,"due":string|null,"notes":string|null,"clearDue":boolean}. Use null for unchanged title, person, due, and notes. Set clearDue:true only when the user explicitly removes the reminder; otherwise it is false. This is essential: a time-only update is {"title":null,"person":null,"due":"...","notes":null,"clearDue":false}, so the stored date, contact, title, and notes are preserved. Never put an inferred contact into changes.person; only change it when the user explicitly names the replacement. A due date must be an ISO 8601 UTC timestamp ending in Z (for example 2026-10-23T22:00:00.000Z). Create uses task and changes:null. Update uses changes and task:null. Cancel and clarify use task:null and changes:null. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
 
 HISTORY (bounded):\n${JSON.stringify(context.history.slice(-MAX_HISTORY_TURNS))}\n\nKNOWN TASKS (bounded):\n${JSON.stringify(context.knownTasks.slice(-MAX_KNOWN_TASKS))}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pendingClarifications)}\n\nAVAILABLE NEW DRAFT IDS:\n${JSON.stringify(context.availableDraftIds.slice(0, AVAILABLE_DRAFT_IDS_PER_TURN))}`;
 }
@@ -281,6 +283,8 @@ type ProviderFailure = {
   requestId?: string;
   providerType?: string;
   providerCode?: string;
+  providerParam?: string;
+  providerMessage?: string;
 };
 
 function safeDiagnosticValue(value: unknown) {
@@ -296,6 +300,21 @@ function requestIdFrom(response: Response) {
   );
 }
 
+function safeSchemaMessage(value: unknown, parameter?: string) {
+  if (
+    typeof value !== "string" ||
+    value.length > 1000 ||
+    !(
+      parameter?.startsWith("response_format") ||
+      value.startsWith("Invalid schema for response_format") ||
+      value.startsWith("Invalid parameter: response_format")
+    )
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
 async function providerFailure(response: Response): Promise<ProviderFailure> {
   let payload: unknown;
   try {
@@ -307,11 +326,14 @@ async function providerFailure(response: Response): Promise<ProviderFailure> {
     payload && typeof payload === "object" && "error" in payload
       ? (payload.error as Record<string, unknown>)
       : undefined;
+  const providerParam = safeDiagnosticValue(error?.param);
   return {
     status: response.status,
     requestId: requestIdFrom(response),
     providerType: safeDiagnosticValue(error?.type),
     providerCode: safeDiagnosticValue(error?.code),
+    providerParam,
+    providerMessage: safeSchemaMessage(error?.message, providerParam),
   };
 }
 
@@ -328,11 +350,16 @@ function logAiFailure(
       requestId: failure.requestId,
       providerType: failure.providerType,
       providerCode: failure.providerCode,
+      providerParam: failure.providerParam,
+      providerMessage: failure.providerMessage,
     }),
   );
 }
 
-function errorForProviderFailure(failure: ProviderFailure) {
+function errorForProviderFailure(
+  failure: ProviderFailure,
+  operation: "transcription" | "interpretation",
+) {
   if (failure.status === 401)
     return new ApiError(
       "OpenAI rejected the server key. Check your environment setting.",
@@ -342,14 +369,14 @@ function errorForProviderFailure(failure: ProviderFailure) {
     );
   if (failure.status === 403)
     return new ApiError(
-      "This OpenAI project is not allowed to use transcription. Check the project and model permissions.",
+      `This OpenAI project is not allowed to use ${operation}. Check the project and model permissions.`,
       502,
       "AI_ACCESS_DENIED",
       failure.requestId,
     );
   if (failure.status === 404)
     return new ApiError(
-      "The configured transcription or AI model is unavailable to this OpenAI project.",
+      `The configured ${operation} model is unavailable to this OpenAI project.`,
       502,
       "AI_MODEL_UNAVAILABLE",
       failure.requestId,
@@ -371,9 +398,13 @@ function errorForProviderFailure(failure: ProviderFailure) {
     failure.status === 415
   )
     return new ApiError(
-      "OpenAI could not accept this recording. Record a short note in a supported browser and try again.",
-      422,
-      "AI_TRANSCRIPTION_REJECTED",
+      operation === "transcription"
+        ? "OpenAI could not accept this recording. Record a short note in a supported browser and try again."
+        : "OpenAI rejected LeadLoop's task interpretation request. Update LeadLoop and try again.",
+      operation === "transcription" ? 422 : 502,
+      operation === "transcription"
+        ? "AI_TRANSCRIPTION_REJECTED"
+        : "AI_INTERPRETATION_REJECTED",
       failure.requestId,
     );
   if (failure.status && failure.status >= 500)
@@ -406,7 +437,7 @@ async function openAiFetch(
     });
     if (!response.ok) {
       const failure = await providerFailure(response);
-      const error = errorForProviderFailure(failure);
+      const error = errorForProviderFailure(failure, operation);
       logAiFailure(operation, { ...failure, errorType: error.code });
       throw error;
     }
