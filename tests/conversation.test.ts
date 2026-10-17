@@ -9,6 +9,7 @@ import {
   type ReviewItem,
 } from "../lib/conversation";
 import { POST as interpretPost } from "../app/api/interpret/route";
+import { normalizeAndValidateUpdates } from "../lib/ai-server";
 
 const bill: ReviewItem = {
   id: "draft-bill",
@@ -28,11 +29,9 @@ test("Scenario B: keeps an existing draft id when a contextual correction change
         targetId: "draft-bill",
         targetIds: [],
         question: null,
-        task: {
-          title: bill.title,
-          person: "Bill",
+        task: null,
+        changes: {
           due: "2026-10-23T23:00:00.000Z",
-          notes: "",
         },
       },
     ],
@@ -141,11 +140,8 @@ test("Scenario A: a time answer updates the unfinished Bill draft", () => {
       {
         type: "update",
         targetId: "draft-bill",
-        task: {
-          title: "Talk to Bill about washing his clothes",
-          person: "Bill",
+        changes: {
           due: "2026-10-23T22:00:00.000Z",
-          notes: "",
         },
       },
     ],
@@ -170,11 +166,9 @@ test("Scenario C: a contact correction preserves the reminder date and unrelated
       {
         type: "update",
         targetId: "draft-bill",
-        task: {
+        changes: {
           title: "Talk to Ben about washing his clothes",
           person: "Ben",
-          due: "2026-10-23T23:00:00.000Z",
-          notes: "Call after closing.",
         },
       },
     ],
@@ -210,6 +204,102 @@ test("Scenario D: a clearly new Sarah task does not overwrite an unfinished Bill
     result.reviewItems.map((item) => item.id),
     ["draft-bill", "draft-sarah"],
   );
+});
+
+test("Scenario C: a contextual Sarah update removes a duplicate create, preserves fields, and uses 9 PM", () => {
+  const sarah = {
+    id: "sarah-1",
+    title: "Call Sarah about the new project",
+    person: "Sarah",
+    due: "2026-10-23T21:00:00.000Z",
+    notes: "Bring the proposal.",
+  };
+  const result = normalizeAndValidateUpdates(
+    {
+      message: "Updated Sarah.",
+      operations: [
+        {
+          type: "create",
+          targetId: "draft-duplicate",
+          task: {
+            title: "Call Sarah",
+            person: "bobby true",
+            due: null,
+            notes: "",
+          },
+        },
+        {
+          type: "update",
+          targetId: sarah.id,
+          changes: { due: "2026-10-23T21:00:00.000Z", person: "bobby true" },
+        },
+      ],
+    },
+    "I wanna talk to her at 9 p.m.",
+    "America/Chicago",
+    {
+      history: [],
+      knownTasks: [sarah],
+      pendingClarifications: [],
+      availableDraftIds: ["draft-duplicate"],
+    },
+  );
+  assert.equal(result.operations.length, 1);
+  assert.deepEqual(result.operations[0], {
+    type: "update",
+    targetId: sarah.id,
+    changes: { due: "2026-10-24T02:00:00.000Z" },
+  });
+  const applied = applyTaskOperations([], [sarah], result.operations);
+  assert.equal(applied.reviewItems.length, 1);
+  assert.deepEqual(applied.reviewItems[0], {
+    ...sarah,
+    source: "existing",
+    due: "2026-10-24T02:00:00.000Z",
+  });
+  assert.equal(sarah.due, "2026-10-23T21:00:00.000Z");
+});
+
+test("Scenario D: an explicit contact correction preserves its title, date, time, and notes", () => {
+  const applied = applyTaskOperations(
+    [],
+    [
+      {
+        id: "bobby-1",
+        title: "Call Bobby about the new project",
+        person: "Bobby",
+        due: "2026-10-24T02:00:00.000Z",
+        notes: "Bring the proposal.",
+      },
+    ],
+    [{ type: "update", targetId: "bobby-1", changes: { person: "Sarah" } }],
+  );
+  assert.deepEqual(applied.reviewItems[0], {
+    id: "bobby-1",
+    source: "existing",
+    title: "Call Bobby about the new project",
+    person: "Sarah",
+    due: "2026-10-24T02:00:00.000Z",
+    notes: "Bring the proposal.",
+  });
+});
+
+test("Scenario F: multiple matching reminders retain both targets for a clarification", () => {
+  const clarification = applyTaskOperations(
+    [],
+    [],
+    [
+      {
+        type: "clarify",
+        question: "Which Sarah reminder should I update?",
+        targetIds: ["sarah-1", "sarah-2"],
+      },
+    ],
+  );
+  assert.deepEqual(clarification.clarification, {
+    question: "Which Sarah reminder should I update?",
+    taskIds: ["sarah-1", "sarah-2"],
+  });
 });
 
 test("keeps multiple pending task references so the AI can ask which one a follow-up means", () => {

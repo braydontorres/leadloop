@@ -22,9 +22,11 @@ export type TaskDetails = {
   notes: string;
 };
 
+export type TaskChanges = Partial<TaskDetails>;
+
 export type TaskOperation =
   | { type: "create"; targetId: string; task: TaskDetails }
-  | { type: "update"; targetId: string; task: TaskDetails }
+  | { type: "update"; targetId: string; changes: TaskChanges }
   | { type: "cancel"; targetId: string; task?: never }
   | {
       type: "clarify";
@@ -71,10 +73,7 @@ function optionalText(value: unknown, label: string, maxLength = 1000): string {
 function parseTask(value: unknown): TaskDetails {
   if (!isRecord(value)) throw new Error("Invalid task details.");
   const due = value.due;
-  if (
-    due !== null &&
-    (typeof due !== "string" || Number.isNaN(Date.parse(due)))
-  ) {
+  if (due !== null && (typeof due !== "string" || !isUtcIsoDate(due))) {
     throw new Error("Invalid reminder date.");
   }
   return {
@@ -83,6 +82,36 @@ function parseTask(value: unknown): TaskDetails {
     due,
     notes: optionalText(value.notes, "notes", 1000),
   };
+}
+
+function isUtcIsoDate(value: string) {
+  return (
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+function parseChanges(value: unknown): TaskChanges {
+  if (!isRecord(value)) throw new Error("Invalid task changes.");
+  const changes: TaskChanges = {};
+  if ("title" in value) changes.title = text(value.title, "task title", 240);
+  if ("person" in value)
+    changes.person = optionalText(value.person, "person", 160);
+  if ("notes" in value)
+    changes.notes = optionalText(value.notes, "notes", 1000);
+  if ("due" in value) {
+    if (
+      value.due !== null &&
+      (typeof value.due !== "string" || !isUtcIsoDate(value.due))
+    ) {
+      throw new Error("Invalid reminder date.");
+    }
+    changes.due = value.due;
+  }
+  if (Object.keys(changes).length === 0) {
+    throw new Error("An update must change at least one task field.");
+  }
+  return changes;
 }
 
 export function parseAssistantResult(value: unknown): AssistantResult {
@@ -104,7 +133,7 @@ export function parseAssistantResult(value: unknown): AssistantResult {
       return {
         type: "update",
         targetId: text(operation.targetId, "task reference", 120),
-        task: parseTask(operation.task),
+        changes: parseChanges(operation.changes),
       };
     }
     if (operation.type === "cancel") {
@@ -230,13 +259,13 @@ export function applyTaskOperations(
       (task) => task.id === operation.targetId,
     );
     if (reviewIndex >= 0) {
-      next[reviewIndex] = { ...next[reviewIndex], ...operation.task };
+      next[reviewIndex] = { ...next[reviewIndex], ...operation.changes };
       touchedIds.push(operation.targetId);
       continue;
     }
     const saved = savedTasks.find((task) => task.id === operation.targetId);
     if (saved) {
-      next.push({ id: saved.id, source: "existing", ...operation.task });
+      next.push({ ...saved, source: "existing", ...operation.changes });
       touchedIds.push(operation.targetId);
       continue;
     }

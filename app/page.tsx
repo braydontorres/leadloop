@@ -39,6 +39,7 @@ import {
   sampleStore,
   saveTask,
   dateLabel,
+  fromLocalInput,
   isToday,
   toLocalInput,
 } from "../lib/tasks";
@@ -1447,21 +1448,23 @@ export default function Page() {
                 Date & time <span>(optional)</span>
                 <input
                   type="datetime-local"
-                  value={toLocalInput(draft.due)}
-                  onChange={(e) =>
-                    setDraft({
-                      ...draft,
-                      due: e.target.value
-                        ? new Date(e.target.value).toISOString()
-                        : "",
-                    })
-                  }
+                  value={toLocalInput(draft.due, timezone)}
+                  onChange={(e) => {
+                    try {
+                      setDraft({
+                        ...draft,
+                        due: e.target.value
+                          ? fromLocalInput(e.target.value, timezone)
+                          : "",
+                      });
+                    } catch (error) {
+                      setNotice((error as Error).message);
+                    }
+                  }}
                 />
               </label>
               <p className="input-note">
-                Enter time in your device’s zone (
-                {Intl.DateTimeFormat().resolvedOptions().timeZone}). Displayed
-                below in {timezone}.
+                Enter time in your selected zone ({timezone}).
               </p>
               <label className="field">
                 Notes <span>(optional)</span>

@@ -124,8 +124,68 @@ export function isToday(iso: string, timezone: string): boolean {
   const f = new Intl.DateTimeFormat("en-CA", { timeZone: timezone });
   return f.format(new Date(iso)) === f.format(new Date());
 }
-export function toLocalInput(iso: string): string {
+export function toLocalInput(iso: string, timezone: string): string {
   if (!iso) return "";
-  const d = new Date(iso);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}T${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(iso));
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((entry) => entry.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}`;
+}
+
+function zonedParts(timestamp: number, timezone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+  return Object.fromEntries(
+    parts
+      .filter((entry) => entry.type !== "literal")
+      .map((entry) => [entry.type, Number(entry.value)]),
+  ) as Record<string, number>;
+}
+
+export function fromLocalInput(value: string, timezone: string): string {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) throw new Error("Choose a valid date and time.");
+  const [year, month, day, hour, minute] = match.slice(1).map(Number);
+  const wanted = { year, month, day, hour, minute };
+  let timestamp = Date.UTC(year, month - 1, day, hour, minute);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const actual = zonedParts(timestamp, timezone);
+    const wallClock = Date.UTC(
+      actual.year,
+      actual.month - 1,
+      actual.day,
+      actual.hour,
+      actual.minute,
+    );
+    timestamp += Date.UTC(year, month - 1, day, hour, minute) - wallClock;
+  }
+  const verified = zonedParts(timestamp, timezone);
+  if (
+    verified.year !== wanted.year ||
+    verified.month !== wanted.month ||
+    verified.day !== wanted.day ||
+    verified.hour !== wanted.hour ||
+    verified.minute !== wanted.minute
+  ) {
+    throw new Error(
+      "That local time does not exist in your selected time zone.",
+    );
+  }
+  return new Date(timestamp).toISOString();
 }

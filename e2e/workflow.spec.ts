@@ -137,11 +137,8 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                   {
                     type: "update",
                     targetId: billId,
-                    task: {
-                      title: "Talk to Bill about washing his clothes",
-                      person: "Bill",
+                    changes: {
                       due: "2026-10-23T22:00:00.000Z",
-                      notes: "",
                     },
                   },
                 ],
@@ -156,11 +153,8 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                     {
                       type: "update",
                       targetId: billId,
-                      task: {
-                        title: "Talk to Bill about washing his clothes",
-                        person: "Bill",
+                      changes: {
                         due: "2026-10-23T23:00:00.000Z",
-                        notes: "",
                       },
                     },
                   ],
@@ -175,11 +169,9 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                       {
                         type: "update",
                         targetId: billId,
-                        task: {
+                        changes: {
                           title: "Talk to Ben about washing his clothes",
                           person: "Ben",
-                          due: "2026-10-23T23:00:00.000Z",
-                          notes: "",
                         },
                       },
                     ],
@@ -246,6 +238,194 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
   expect(contexts[1].pendingClarifications).toEqual([
     expect.objectContaining({ taskIds: [billId] }),
   ]);
+});
+
+test("reviews one explicit Sarah update at 9 PM without mutating the saved task", async ({
+  page,
+}) => {
+  const initialStore = {
+    name: "Alex",
+    business: "My business",
+    timezone: "America/Chicago",
+    people: [],
+    tasks: [
+      {
+        id: "sarah-1",
+        title: "Call Sarah about the new project",
+        person: "Sarah",
+        due: "2026-10-23T21:00:00.000Z",
+        completed: false,
+        notes: "Bring the proposal.",
+      },
+    ],
+  };
+  await page.addInitScript((store) => {
+    localStorage.setItem("leadloop.phase1.v1", JSON.stringify(store));
+  }, initialStore);
+  let context: { knownTasks: Array<{ id: string }> } | undefined;
+  await page.route("**/api/interpret", async (route) => {
+    const request = JSON.parse(route.request().postData() ?? "{}") as {
+      context: { knownTasks: Array<{ id: string }> };
+    };
+    context = request.context;
+    await route.fulfill({
+      json: {
+        transcript: "I wanna talk to her at 9 p.m.",
+        result: {
+          message: "I updated Sarah's reminder.",
+          operations: [
+            {
+              type: "update",
+              targetId: "sarah-1",
+              changes: { due: "2026-10-24T02:00:00.000Z" },
+            },
+          ],
+        },
+      },
+    });
+  });
+  await page.goto("/");
+  const navigation = page.getByRole("navigation", {
+    name:
+      page.viewportSize()!.width < 640
+        ? "Mobile navigation"
+        : "Main navigation",
+  });
+  await navigation.getByRole("button", { name: /^Capture/ }).click();
+  await page
+    .getByLabel("What do you need to remember?")
+    .fill("I wanna talk to her at 9 p.m.");
+  await page.getByRole("button", { name: "Understand with LeadLoop" }).click();
+  const card = page.locator(".review-card");
+  await expect(card).toHaveCount(1);
+  await expect(card).toContainText("UPDATE TO REVIEW");
+  await expect(card).toContainText("Call Sarah about the new project");
+  await expect(card).toContainText("Sarah");
+  await expect(card).toContainText("9:00 PM");
+  await expect(card).not.toContainText("bobby true");
+  expect(context?.knownTasks).toEqual(
+    expect.arrayContaining([expect.objectContaining({ id: "sarah-1" })]),
+  );
+  const saved = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem("leadloop.phase1.v1") ?? "{}"),
+  );
+  expect(saved.tasks[0].due).toBe("2026-10-23T21:00:00.000Z");
+});
+
+test("Continue speaking sends the same pending draft context through voice", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "leadloop.phase1.v1",
+      JSON.stringify({
+        name: "Alex",
+        business: "My business",
+        timezone: "America/Chicago",
+        people: [],
+        tasks: [],
+      }),
+    );
+    class FakeRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      mimeType = "audio/webm;codecs=opus";
+      state = "inactive";
+      stream = { getTracks: () => [{ stop() {} }] } as unknown as MediaStream;
+      ondataavailable: ((event: BlobEvent) => void) | null = null;
+      onstop: (() => void) | null = null;
+      constructor(stream: MediaStream) {
+        this.stream = stream;
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        this.state = "inactive";
+        this.ondataavailable?.({
+          data: new Blob(["audio"], { type: this.mimeType }),
+        } as BlobEvent);
+        this.onstop?.();
+      }
+    }
+    Object.defineProperty(window, "MediaRecorder", {
+      value: FakeRecorder,
+      configurable: true,
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      value: {
+        getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
+      },
+      configurable: true,
+    });
+  });
+  let draftId = "";
+  await page.route("**/api/interpret", async (route) => {
+    const request = JSON.parse(route.request().postData() ?? "{}") as {
+      context: { availableDraftIds: string[] };
+    };
+    draftId = request.context.availableDraftIds[0];
+    await route.fulfill({
+      json: {
+        transcript: "Talk to Bill about the proposal",
+        result: {
+          message: "When should I remind you?",
+          operations: [
+            {
+              type: "create",
+              targetId: draftId,
+              task: {
+                title: "Talk to Bill about the proposal",
+                person: "Bill",
+                due: null,
+                notes: "",
+              },
+            },
+            {
+              type: "clarify",
+              question: "When should I remind you?",
+              targetIds: [draftId],
+            },
+          ],
+        },
+      },
+    });
+  });
+  await page.route("**/api/voice", async (route) => {
+    await route.fulfill({
+      json: {
+        transcript: "Next Friday at 5 PM.",
+        result: {
+          message: "Updated to next Friday at 5 PM.",
+          operations: [
+            {
+              type: "update",
+              targetId: draftId,
+              changes: { due: "2026-10-23T22:00:00.000Z" },
+            },
+          ],
+        },
+      },
+    });
+  });
+  await page.goto("/");
+  const navigation = page.getByRole("navigation", {
+    name:
+      page.viewportSize()!.width < 640
+        ? "Mobile navigation"
+        : "Main navigation",
+  });
+  await navigation.getByRole("button", { name: /^Capture/ }).click();
+  await page
+    .getByLabel("What do you need to remember?")
+    .fill("Talk to Bill about the proposal");
+  await page.getByRole("button", { name: "Understand with LeadLoop" }).click();
+  await page.getByRole("button", { name: "Continue speaking" }).click();
+  await page.getByRole("button", { name: /Stop recording/ }).click();
+  await expect(page.locator(".review-card")).toHaveCount(1);
+  await expect(page.locator(".review-card")).toContainText("5:00 PM");
+  await expect(page.locator(".pending-question")).toHaveCount(0);
 });
 test("contacts can be created and retained and mobile layout fits", async ({
   page,
