@@ -92,6 +92,7 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
 }) => {
   const contexts: Array<Record<string, unknown>> = [];
   let billId = "";
+  let sarahId = "";
   await page.route("**/api/interpret", async (route) => {
     const request = JSON.parse(route.request().postData() ?? "{}") as {
       text: string;
@@ -177,24 +178,34 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                     ],
                   },
                 }
-              : {
-                  transcript: request.text,
-                  result: {
-                    message: "I added Sarah.",
-                    operations: [
-                      {
-                        type: "create",
-                        targetId: request.context.availableDraftIds[0],
-                        task: {
-                          title: "Call Sarah",
-                          person: "Sarah",
-                          due: "2026-10-18T14:00:00.000Z",
-                          notes: "",
+              : contexts.length === 5
+                ? {
+                    transcript: request.text,
+                    result: {
+                      message: "I added Sarah.",
+                      operations: [
+                        {
+                          type: "create",
+                          targetId: (sarahId =
+                            request.context.availableDraftIds[0]),
+                          task: {
+                            title: "Call Sarah",
+                            person: "Sarah",
+                            due: "2026-10-18T14:00:00.000Z",
+                            notes: "",
+                          },
                         },
-                      },
-                    ],
-                  },
-                };
+                      ],
+                    },
+                  }
+                : {
+                    transcript: request.text,
+                    result: {
+                      message:
+                        "I'll cancel the Sarah reminder when you confirm.",
+                      operations: [{ type: "cancel", targetId: sarahId }],
+                    },
+                  };
     await route.fulfill({ json: response });
   });
   await page.goto("/");
@@ -231,7 +242,11 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
   await thought.fill("Remind me to call Sarah tomorrow at 9 AM.");
   await understand.click();
   await expect(page.locator(".review-card")).toHaveCount(2);
-  await expect.poll(() => contexts.length).toBe(5);
+  await thought.fill("Cancel the Sarah reminder.");
+  await understand.click();
+  await expect(page.locator(".cancel-card")).toHaveCount(1);
+  await expect(page.locator(".review-card")).toHaveCount(3);
+  await expect.poll(() => contexts.length).toBe(6);
   expect(contexts[1].knownTasks).toEqual(
     expect.arrayContaining([expect.objectContaining({ id: billId })]),
   );

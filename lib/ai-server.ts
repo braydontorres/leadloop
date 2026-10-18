@@ -143,7 +143,7 @@ Conversation state is authoritative. An unfinished task is a real review draft, 
 
 If PENDING CLARIFICATIONS contains exactly one task and the user's next statement naturally answers its question, update that task by default. If the user clearly starts a separate task, create it and leave the unfinished task pending. If more than one pending task could fit an ambiguous follow-up, ask which task they mean; do not guess. Treat “that”, “it”, “him”, and “her” as references to the most recent unambiguous unfinished or reviewed task. “Actually” or “I meant” is normally an update, never a duplicate create. A pronoun can update a known task only when one task is unambiguous; otherwise clarify.
 
-Use one create per separate task. A response must never create and update/cancel the same intended task. OpenAI structured output requires every changes key: for update, changes must always be {"title":string|null,"person":string|null,"due":string|null,"notes":string|null,"clearDue":boolean}. Use null for unchanged title, person, due, and notes. Set clearDue:true only when the user explicitly removes the reminder; otherwise it is false. This is essential: a time-only update is {"title":null,"person":null,"due":"...","notes":null,"clearDue":false}, so the stored date, contact, title, and notes are preserved. Never put an inferred contact into changes.person; only change it when the user explicitly names the replacement. A due date must be an ISO 8601 UTC timestamp ending in Z (for example 2026-10-23T22:00:00.000Z). Create uses task and changes:null. Update uses changes and task:null. Cancel and clarify use task:null and changes:null. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
+Use one create per separate task. A response must never create and update/cancel the same intended task. For a create, copy one AVAILABLE NEW DRAFT ID exactly; LeadLoop safely binds a valid create to an unused available ID. OpenAI structured output requires every changes key: for update, changes must always be {"title":string|null,"person":string|null,"due":string|null,"notes":string|null,"clearDue":boolean}. Use null for unchanged title, person, due, and notes. Set clearDue:true only when the user explicitly removes the reminder; otherwise it is false. This is essential: a time-only update is {"title":null,"person":null,"due":"...","notes":null,"clearDue":false}, so the stored date, contact, title, and notes are preserved. Never put an inferred contact into changes.person; only change it when the user explicitly names the replacement. A due date must be an ISO 8601 UTC timestamp ending in Z (for example 2026-10-23T22:00:00.000Z). Create uses task and changes:null. Update uses changes and task:null. Cancel and clarify use task:null and changes:null. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
 
 HISTORY (bounded):\n${JSON.stringify(context.history.slice(-MAX_HISTORY_TURNS))}\n\nKNOWN TASKS (bounded):\n${JSON.stringify(context.knownTasks.slice(-MAX_KNOWN_TASKS))}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pendingClarifications)}\n\nAVAILABLE NEW DRAFT IDS:\n${JSON.stringify(context.availableDraftIds.slice(0, AVAILABLE_DRAFT_IDS_PER_TURN))}`;
 }
@@ -188,6 +188,89 @@ function validateResultTargets(
       }
     }
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function bindCreateTargets(
+  value: unknown,
+  context: ConversationContext,
+): unknown {
+  if (!isRecord(value) || !Array.isArray(value.operations)) return value;
+  const available = [...new Set(context.availableDraftIds)];
+  const assigned = new Set<string>();
+  const aliases = new Map<string, string>();
+  const operations = value.operations.map((operation) => {
+    if (!isRecord(operation) || operation.type !== "create") return operation;
+    const requested =
+      typeof operation.targetId === "string" ? operation.targetId : undefined;
+    const targetId =
+      requested && available.includes(requested) && !assigned.has(requested)
+        ? requested
+        : available.find((id) => !assigned.has(id));
+    if (!targetId) return operation;
+    assigned.add(targetId);
+    if (requested) aliases.set(requested, targetId);
+    return { ...operation, targetId };
+  });
+  return {
+    ...value,
+    operations: operations.map((operation) => {
+      if (!isRecord(operation) || operation.type !== "clarify")
+        return operation;
+      if (!Array.isArray(operation.targetIds)) return operation;
+      return {
+        ...operation,
+        targetIds: operation.targetIds.map((targetId) =>
+          typeof targetId === "string"
+            ? (aliases.get(targetId) ?? targetId)
+            : targetId,
+        ),
+      };
+    }),
+  };
+}
+
+function validationDiagnostic(error: unknown) {
+  const message = error instanceof Error ? error.message : "";
+  if (message === "Invalid new draft reference.")
+    return { rule: "CREATE_TARGET_ID", field: "operations[].targetId" };
+  if (message === "Invalid task reference.")
+    return { rule: "KNOWN_TASK_TARGET", field: "operations[].targetId" };
+  if (message === "Conflicting task operations.")
+    return { rule: "ONE_MUTATION_PER_TASK", field: "operations[]" };
+  if (message === "Invalid clarification reference.")
+    return { rule: "CLARIFICATION_TARGET", field: "operations[].targetIds" };
+  if (message === "Invalid reminder date.")
+    return { rule: "ISO_REMINDER_INSTANT", field: "operations[].task.due" };
+  if (message === "Invalid reminder update.")
+    return { rule: "UPDATE_SHAPE", field: "operations[].changes" };
+  if (message === "An update must change at least one task field.")
+    return { rule: "UPDATE_HAS_CHANGE", field: "operations[].changes" };
+  if (message === "Invalid task details.")
+    return { rule: "CREATE_TASK_SHAPE", field: "operations[].task" };
+  if (message === "Invalid task operation.")
+    return { rule: "OPERATION_SHAPE", field: "operations[]" };
+  if (message === "Unknown task operation.")
+    return { rule: "OPERATION_TYPE", field: "operations[].type" };
+  if (message === "Too many task operations.")
+    return { rule: "MAX_OPERATIONS", field: "operations" };
+  return { rule: "RESPONSE_VALIDATION", field: "response" };
+}
+
+function logValidationFailure(error: unknown) {
+  const diagnostic = validationDiagnostic(error);
+  console.error(
+    "[LeadLoop AI]",
+    JSON.stringify({
+      operation: "interpretation",
+      errorType: "AI_INVALID_RESPONSE",
+      validationRule: diagnostic.rule,
+      field: diagnostic.field,
+    }),
+  );
 }
 
 function words(value: string) {
@@ -511,14 +594,15 @@ export async function interpretThought(
     );
   try {
     const result = normalizeAndValidateUpdates(
-      parseAssistantResult(JSON.parse(content)),
+      parseAssistantResult(bindCreateTargets(JSON.parse(content), context)),
       text,
       timeZone,
       context,
     );
     validateResultTargets(result, context);
     return result;
-  } catch {
+  } catch (error) {
+    logValidationFailure(error);
     throw new ApiError(
       "LeadLoop received an invalid AI response. Please try again.",
       502,

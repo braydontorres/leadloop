@@ -369,3 +369,127 @@ test("sends a strict-schema-compatible interpretation request and parses a time-
   ]);
   assert.equal(changes.additionalProperties, false);
 });
+
+test("creates a separate Sarah draft after Bill using a bound id and normalized offset time", async () => {
+  await withMockedOpenAi(
+    async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  message: "I added the Sarah reminder.",
+                  operations: [
+                    {
+                      type: "create",
+                      targetId: "model-generated-sarah-id",
+                      targetIds: [],
+                      question: null,
+                      task: {
+                        title: "Talk to Sarah",
+                        person: "Sarah",
+                        due: "2026-10-19T15:00:00-05:00",
+                        notes: "",
+                      },
+                      changes: null,
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async () => {
+      const result = await interpretThought(
+        "Remind me to talk to Sarah tomorrow at 3 PM.",
+        "America/Chicago",
+        {
+          history: [
+            { role: "user", text: "Talk to Bill about washing his clothes." },
+            { role: "assistant", text: "I'll remind you Friday at 5 PM." },
+          ],
+          knownTasks: [
+            {
+              id: "draft-bill",
+              title: "Talk to Bill about washing his clothes",
+              person: "Bill",
+              due: "2026-10-23T22:00:00.000Z",
+              notes: "",
+            },
+          ],
+          pendingClarifications: [],
+          availableDraftIds: ["client-draft-sarah"],
+        },
+      );
+      assert.deepEqual(result.operations, [
+        {
+          type: "create",
+          targetId: "client-draft-sarah",
+          task: {
+            title: "Talk to Sarah",
+            person: "Sarah",
+            due: "2026-10-19T20:00:00.000Z",
+            notes: "",
+          },
+        },
+      ]);
+    },
+  );
+});
+
+test("logs the failed validation rule without logging task content", async () => {
+  await withMockedOpenAi(
+    async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  message: "Sarah should be updated.",
+                  operations: [
+                    {
+                      type: "update",
+                      targetId: "unknown-task",
+                      targetIds: [],
+                      question: null,
+                      task: null,
+                      changes: {
+                        title: null,
+                        person: null,
+                        due: "2026-10-23T23:00:00.000Z",
+                        notes: null,
+                        clearDue: false,
+                      },
+                    },
+                  ],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    async (diagnostics) => {
+      await assert.rejects(
+        () =>
+          interpretThought(
+            "Actually make it 6 PM.",
+            "America/Chicago",
+            interpretationContext,
+          ),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "AI_INVALID_RESPONSE");
+          return true;
+        },
+      );
+      assert.match(diagnostics.join("\n"), /KNOWN_TASK_TARGET/);
+      assert.match(diagnostics.join("\n"), /operations\[\]\.targetId/);
+      assert.doesNotMatch(diagnostics.join("\n"), /Sarah should be updated/);
+    },
+  );
+});

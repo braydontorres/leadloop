@@ -73,22 +73,28 @@ function optionalText(value: unknown, label: string, maxLength = 1000): string {
 function parseTask(value: unknown): TaskDetails {
   if (!isRecord(value)) throw new Error("Invalid task details.");
   const due = value.due;
-  if (due !== null && (typeof due !== "string" || !isUtcIsoDate(due))) {
+  if (due !== null && typeof due !== "string") {
     throw new Error("Invalid reminder date.");
   }
   return {
     title: text(value.title, "task title", 240),
     person: optionalText(value.person, "person", 160),
-    due,
+    due: due === null ? null : normalizeIsoInstant(due),
     notes: optionalText(value.notes, "notes", 1000),
   };
 }
 
-function isUtcIsoDate(value: string) {
-  return (
-    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(value) &&
-    !Number.isNaN(Date.parse(value))
-  );
+function normalizeIsoInstant(value: string) {
+  if (
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(
+      value,
+    )
+  ) {
+    throw new Error("Invalid reminder date.");
+  }
+  const timestamp = Date.parse(value);
+  if (Number.isNaN(timestamp)) throw new Error("Invalid reminder date.");
+  return new Date(timestamp).toISOString();
 }
 
 function parseChanges(value: unknown): TaskChanges {
@@ -104,10 +110,10 @@ function parseChanges(value: unknown): TaskChanges {
   if (value.notes !== null)
     changes.notes = optionalText(value.notes, "notes", 1000);
   if (value.due !== null) {
-    if (typeof value.due !== "string" || !isUtcIsoDate(value.due)) {
+    if (typeof value.due !== "string") {
       throw new Error("Invalid reminder date.");
     }
-    changes.due = value.due;
+    changes.due = normalizeIsoInstant(value.due);
   }
   if (value.clearDue) {
     if (value.due !== null) throw new Error("Invalid reminder update.");
