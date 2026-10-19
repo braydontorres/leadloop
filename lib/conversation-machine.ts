@@ -14,7 +14,10 @@ export type ConversationStage =
 export type ActiveReminder = Pick<
   Task,
   "id" | "title" | "person" | "due" | "notes"
->;
+> & {
+  pendingDate: string | null;
+  pendingTime: string | null;
+};
 
 export type IntentFields = {
   title: string | null;
@@ -89,6 +92,14 @@ function activeReminder(value: unknown): ActiveReminder | null {
     person: text(value.person, "person", 160, true),
     due: text(value.due, "reminder time", 80, true),
     notes: text(value.notes, "notes", 1000, true),
+    pendingDate:
+      value.pendingDate === undefined || value.pendingDate === null
+        ? null
+        : text(value.pendingDate, "pending reminder date", 10),
+    pendingTime:
+      value.pendingTime === undefined || value.pendingTime === null
+        ? null
+        : text(value.pendingTime, "pending reminder time", 5),
   };
 }
 
@@ -198,6 +209,8 @@ function applyFields(
   timeZone: string,
 ) {
   let due = fields.clearDue ? "" : current.due;
+  let pendingDate = fields.clearDue ? null : current.pendingDate;
+  let pendingTime = fields.clearDue ? null : current.pendingTime;
   if (fields.date !== null || fields.time !== null) {
     const previous = due
       ? new Intl.DateTimeFormat("en-CA", {
@@ -212,14 +225,18 @@ function applyFields(
       : [];
     const part = (name: Intl.DateTimeFormatPartTypes) =>
       previous.find((entry) => entry.type === name)?.value ?? "";
-    const date =
-      fields.date ?? `${part("year")}-${part("month")}-${part("day")}`;
-    const time = fields.time ?? `${part("hour")}:${part("minute")}`;
-    if (!date || !time) return { reminder: current, needsTime: true };
-    try {
-      due = fromLocalInput(`${date}T${time}`, timeZone);
-    } catch {
-      return { reminder: current, needsTime: true };
+    const dueDate = `${part("year")}-${part("month")}-${part("day")}`;
+    const dueTime = `${part("hour")}:${part("minute")}`;
+    pendingDate = fields.date ?? pendingDate ?? (due ? dueDate : null);
+    pendingTime = fields.time ?? pendingTime ?? (due ? dueTime : null);
+    if (pendingDate && pendingTime) {
+      try {
+        due = fromLocalInput(`${pendingDate}T${pendingTime}`, timeZone);
+        pendingDate = null;
+        pendingTime = null;
+      } catch {
+        due = "";
+      }
     }
   }
   return {
@@ -229,8 +246,10 @@ function applyFields(
       person: fields.person ?? current.person,
       notes: fields.notes ?? current.notes,
       due,
+      pendingDate,
+      pendingTime,
     },
-    needsTime: !due,
+    needsTime: !due && !pendingTime,
   };
 }
 
@@ -251,6 +270,11 @@ function nextReply(reminder: ActiveReminder, timeZone: string) {
     return {
       stage: "awaiting_details" as const,
       reply: "What would you like me to remind you about?",
+    };
+  if (!reminder.due && reminder.pendingDate)
+    return {
+      stage: "awaiting_details" as const,
+      reply: "Of course! What time should I remind you?",
     };
   if (!reminder.due)
     return {
@@ -314,7 +338,12 @@ export function advanceConversation(args: {
     );
   if (intent.kind === "confirm") {
     if (state.stage === "awaiting_confirmation" && state.activeReminder) {
-      const savedTask: Task = { ...state.activeReminder, completed: false };
+      const {
+        pendingDate: _pendingDate,
+        pendingTime: _pendingTime,
+        ...task
+      } = state.activeReminder;
+      const savedTask: Task = { ...task, completed: false };
       const reply = "Perfect! Your reminder is saved. Anything else?";
       return {
         state: {
@@ -364,6 +393,8 @@ export function advanceConversation(args: {
       person: "",
       due: "",
       notes: "",
+      pendingDate: null,
+      pendingTime: null,
     },
     intent.fields,
     timeZone,

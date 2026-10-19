@@ -209,6 +209,38 @@ test("a single manual start alternates speech and recording, then a goodbye rele
         this.onstop?.();
       }
     }
+    const voiceFrames: number[] = [];
+    class TestAudioContext {
+      state = "running";
+      createMediaStreamSource() {
+        return { connect: () => {}, disconnect: () => {} };
+      }
+      createBiquadFilter() {
+        return {
+          type: "highpass",
+          frequency: { value: 0 },
+          connect: () => {},
+          disconnect: () => {},
+        };
+      }
+      createAnalyser() {
+        return {
+          fftSize: 2048,
+          smoothingTimeConstant: 0,
+          getByteTimeDomainData: (samples: Uint8Array) => {
+            const index = Math.max(0, recorders.length - 1);
+            const frame = voiceFrames[index] ?? 0;
+            voiceFrames[index] = frame + 1;
+            // A short utterance followed by sustained silence.
+            samples.fill(frame < 14 ? 176 : 128);
+          },
+        };
+      }
+      close() {
+        this.state = "closed";
+        return Promise.resolve();
+      }
+    }
     Object.defineProperty(window, "speechSynthesis", {
       configurable: true,
       value: {
@@ -228,6 +260,10 @@ test("a single manual start alternates speech and recording, then a goodbye rele
       configurable: true,
       value: TestRecorder,
     });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: TestAudioContext,
+    });
     Object.assign(window, {
       __spoken: spoken,
       __recorders: recorders,
@@ -237,7 +273,12 @@ test("a single manual start alternates speech and recording, then a goodbye rele
   const intents = [
     {
       kind: "new_task",
-      fields: { ...blankFields, title: "talk to Brad", person: "Brad" },
+      fields: {
+        ...blankFields,
+        title: "talk to Brad",
+        person: "Brad",
+        date: "2026-10-20",
+      },
     },
     {
       kind: "follow_up",
@@ -259,16 +300,6 @@ test("a single manual start alternates speech and recording, then a goodbye rele
     .getByRole("button", { name: /^Capture/ })
     .click();
   await page.getByRole("button", { name: "Start Conversation" }).click();
-  const stopLatest = () =>
-    page.evaluate(() => {
-      (
-        window as unknown as Window & {
-          __recorders: Array<{ stop: () => void }>;
-        }
-      ).__recorders
-        .at(-1)
-        ?.stop();
-    });
   const finishLatestReply = () =>
     page.evaluate(() => {
       (
@@ -282,27 +313,12 @@ test("a single manual start alternates speech and recording, then a goodbye rele
   await expect
     .poll(() => page.evaluate(() => (window as any).__recorders.length))
     .toBe(1);
-  await stopLatest();
-  await expect(
-    page.getByText(/When would you like me to remind you/),
-  ).toBeVisible();
+  await expect(page.getByText(/What time should I remind you/)).toBeVisible();
   await finishLatestReply();
-  await expect
-    .poll(() => page.evaluate(() => (window as any).__recorders.length))
-    .toBe(2);
-  await stopLatest();
   await expect(page.getByText(/Is that correct/)).toBeVisible();
   await finishLatestReply();
-  await expect
-    .poll(() => page.evaluate(() => (window as any).__recorders.length))
-    .toBe(3);
-  await stopLatest();
   await expect(page.getByText(/Your reminder is saved/)).toBeVisible();
   await finishLatestReply();
-  await expect
-    .poll(() => page.evaluate(() => (window as any).__recorders.length))
-    .toBe(4);
-  await stopLatest();
   await expect(
     page.getByText("Conversation ended — microphone off."),
   ).toBeVisible();

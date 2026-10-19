@@ -59,6 +59,13 @@ import {
   selectRecorderMimeType,
   supportedAudioFormat,
 } from "../lib/audio-format";
+import {
+  advanceVoiceActivity,
+  DEFAULT_VOICE_ACTIVITY_CONFIG,
+  initialVoiceActivityState,
+  rmsFromTimeDomain,
+  type VoiceActivityState,
+} from "../lib/voice-activity";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -77,6 +84,13 @@ const INACTIVITY_TIMEOUT_MS =
   configuredInactivityTimeout <= 300_000
     ? configuredInactivityTimeout
     : 45_000;
+const configuredSilenceMs = Number(process.env.NEXT_PUBLIC_VOICE_SILENCE_MS);
+const VOICE_SILENCE_MS =
+  Number.isFinite(configuredSilenceMs) &&
+  configuredSilenceMs >= 800 &&
+  configuredSilenceMs <= 2_500
+    ? configuredSilenceMs
+    : DEFAULT_VOICE_ACTIVITY_CONFIG.silenceMs;
 export default function Page() {
   const [store, setStore] = useState<Store | null>(null),
     [screen, setScreen] = useState<Screen>("Home"),
@@ -98,6 +112,7 @@ export default function Page() {
     [muted, setMuted] = useState(false),
     [retryAfterSeconds, setRetryAfterSeconds] = useState(0),
     [sessionActive, setSessionActive] = useState(false),
+    [speechDetected, setSpeechDetected] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -106,6 +121,18 @@ export default function Page() {
   const recordingLimitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoListenRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inactivityRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const analysisFrameRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analysisSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analysisFilterRef = useRef<BiquadFilterNode | null>(null);
+  const recordingFinalizedRef = useRef(false);
+  const voiceActivityRef = useRef<VoiceActivityState>(
+    initialVoiceActivityState(),
+  );
+  const voiceDetectionAvailableRef = useRef(false);
+  const recordingEndReasonRef = useRef<
+    "manual" | "silence" | "no_speech" | "limit" | "cancel"
+  >("manual");
   const submissionRef = useRef(false);
   const sessionActiveRef = useRef(false);
   const conversationRef = useRef(conversation);
@@ -202,6 +229,11 @@ export default function Page() {
       if (recordingLimitRef.current) clearTimeout(recordingLimitRef.current);
       if (autoListenRef.current) clearTimeout(autoListenRef.current);
       if (inactivityRef.current) clearTimeout(inactivityRef.current);
+      if (analysisFrameRef.current)
+        cancelAnimationFrame(analysisFrameRef.current);
+      analysisSourceRef.current?.disconnect();
+      analysisFilterRef.current?.disconnect();
+      void audioContextRef.current?.close();
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -261,6 +293,8 @@ export default function Page() {
           person: draft.person,
           due: draft.due,
           notes: draft.notes,
+          pendingDate: conversation.activeReminder?.pendingDate ?? null,
+          pendingTime: conversation.activeReminder?.pendingTime ?? null,
         };
         if (!updatedReminder.title) throw new Error("Give your task a name.");
         const reply = updatedReminder.due
@@ -455,6 +489,91 @@ export default function Page() {
     recordingTimerRef.current = null;
     recordingLimitRef.current = null;
   };
+  const stopVoiceActivityDetection = () => {
+    if (analysisFrameRef.current)
+      cancelAnimationFrame(analysisFrameRef.current);
+    analysisFrameRef.current = null;
+    analysisSourceRef.current?.disconnect();
+    analysisFilterRef.current?.disconnect();
+    analysisSourceRef.current = null;
+    analysisFilterRef.current = null;
+    const context = audioContextRef.current;
+    audioContextRef.current = null;
+    if (context && context.state !== "closed") void context.close();
+  };
+  const finishRecording = (
+    reason: "manual" | "silence" | "no_speech" | "limit" | "cancel",
+  ) => {
+    if (recordingFinalizedRef.current) return;
+    recordingFinalizedRef.current = true;
+    recordingEndReasonRef.current = reason;
+    clearRecordingTimers();
+    stopVoiceActivityDetection();
+    if (reason === "cancel" || reason === "no_speech")
+      discardRecordingRef.current = true;
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+  };
+  const startVoiceActivityDetection = (stream: MediaStream) => {
+    const AudioContextConstructor =
+      window.AudioContext ||
+      (
+        window as Window &
+          typeof globalThis & { webkitAudioContext?: typeof AudioContext }
+      ).webkitAudioContext;
+    if (!AudioContextConstructor) {
+      voiceDetectionAvailableRef.current = false;
+      return;
+    }
+    try {
+      const context = new AudioContextConstructor();
+      const source = context.createMediaStreamSource(stream);
+      const filter = context.createBiquadFilter();
+      const analyser = context.createAnalyser();
+      // Filter low-frequency rumble before measuring an adaptive noise floor.
+      filter.type = "highpass";
+      filter.frequency.value = 120;
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.2;
+      source.connect(filter);
+      filter.connect(analyser);
+      audioContextRef.current = context;
+      analysisSourceRef.current = source;
+      analysisFilterRef.current = filter;
+      voiceActivityRef.current = initialVoiceActivityState();
+      voiceDetectionAvailableRef.current = true;
+      let previousTime = performance.now();
+      const samples = new Uint8Array(analyser.fftSize);
+      const tick = (now: number) => {
+        if (!sessionActiveRef.current || recordingFinalizedRef.current) return;
+        analyser.getByteTimeDomainData(samples);
+        const update = advanceVoiceActivity(
+          voiceActivityRef.current,
+          rmsFromTimeDomain(samples),
+          now - previousTime,
+          { ...DEFAULT_VOICE_ACTIVITY_CONFIG, silenceMs: VOICE_SILENCE_MS },
+        );
+        previousTime = now;
+        voiceActivityRef.current = update.state;
+        if (update.event === "speech_started") setSpeechDetected(true);
+        if (update.event === "speech_ended") {
+          finishRecording("silence");
+          return;
+        }
+        if (update.event === "no_speech") {
+          setVoiceError(
+            "I didn't hear speech. I'll keep listening after this.",
+          );
+          finishRecording("no_speech");
+          return;
+        }
+        analysisFrameRef.current = requestAnimationFrame(tick);
+      };
+      analysisFrameRef.current = requestAnimationFrame(tick);
+    } catch {
+      // Web Audio is optional; manual stop and the maximum-duration guard remain.
+      voiceDetectionAvailableRef.current = false;
+    }
+  };
   const clearSessionTimers = () => {
     if (autoListenRef.current) clearTimeout(autoListenRef.current);
     if (inactivityRef.current) clearTimeout(inactivityRef.current);
@@ -466,8 +585,9 @@ export default function Page() {
     sessionActiveRef.current = false;
     setSessionActive(false);
     discardRecordingRef.current = true;
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (recorderRef.current?.state === "recording") finishRecording("cancel");
     else {
+      stopVoiceActivityDetection();
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
       recorderRef.current = null;
       setIsRecording(false);
@@ -520,7 +640,12 @@ export default function Page() {
   const startRecording = async () => {
     setVoiceError("");
     setDemoMode(false);
-    if (!sessionActiveRef.current || isSpeaking || submissionRef.current)
+    if (
+      !sessionActiveRef.current ||
+      isSpeaking ||
+      submissionRef.current ||
+      recorderRef.current?.state === "recording"
+    )
       return;
     if (
       !navigator.mediaDevices?.getUserMedia ||
@@ -551,11 +676,16 @@ export default function Page() {
       recorderRef.current = recorder;
       chunksRef.current = [];
       discardRecordingRef.current = false;
+      recordingFinalizedRef.current = false;
+      recordingEndReasonRef.current = "manual";
+      voiceDetectionAvailableRef.current = false;
+      setSpeechDetected(false);
       recorder.ondataavailable = (event) => {
         if (event.data.size) chunksRef.current.push(event.data);
       };
       recorder.onstop = () => {
         clearRecordingTimers();
+        stopVoiceActivityDetection();
         setIsRecording(false);
         stream.getTracks().forEach((track) => track.stop());
         const recordedMimeType =
@@ -564,9 +694,20 @@ export default function Page() {
         const audio = new Blob(chunksRef.current, { type: recordedMimeType });
         recorderRef.current = null;
         if (
+          recordingEndReasonRef.current === "no_speech" &&
+          sessionActiveRef.current
+        ) {
+          const reply = "I didn't hear anything. Please try again.";
+          setAssistantMessage(reply);
+          speakReply(reply, false, true);
+          return;
+        }
+        if (
           !discardRecordingRef.current &&
           audio.size &&
-          sessionActiveRef.current
+          sessionActiveRef.current &&
+          (!voiceDetectionAvailableRef.current ||
+            voiceActivityRef.current.speechStarted)
         ) {
           if (!supportedAudioFormat(audio.type)) {
             setVoiceError(
@@ -575,6 +716,12 @@ export default function Page() {
           } else {
             void submitAudio(audio);
           }
+        } else if (
+          !discardRecordingRef.current &&
+          voiceDetectionAvailableRef.current &&
+          !voiceActivityRef.current.speechStarted
+        ) {
+          setVoiceError("I didn't hear speech. Please try again.");
         }
       };
       recorder.start(250);
@@ -588,8 +735,9 @@ export default function Page() {
         setVoiceError(
           "Voice notes are limited to 90 seconds. We stopped this recording.",
         );
-        recorder.stop();
+        finishRecording("limit");
       }, 90_000);
+      startVoiceActivityDetection(stream);
       resetInactivityTimer();
     } catch (error) {
       const denied = (error as DOMException).name === "NotAllowedError";
@@ -601,11 +749,10 @@ export default function Page() {
     }
   };
   const stopRecording = () => {
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    finishRecording("manual");
   };
   const cancelRecording = () => {
-    discardRecordingRef.current = true;
-    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    if (recorderRef.current?.state === "recording") finishRecording("cancel");
     else setIsRecording(false);
   };
   const openReminderEditor = () => {
@@ -1105,7 +1252,9 @@ export default function Page() {
                           <Mic size={19} />
                         )}
                         {isRecording
-                          ? `Stop speaking · ${recordingSeconds}s`
+                          ? speechDetected
+                            ? `Listening — tap to stop · ${recordingSeconds}s`
+                            : `Listening for speech · ${recordingSeconds}s`
                           : isSpeaking
                             ? "LeadLoop is speaking"
                             : voiceBusy
@@ -1226,7 +1375,9 @@ export default function Page() {
                         <dd>
                           {activeReminder.due
                             ? dateLabel(activeReminder.due, timezone)
-                            : "Waiting for date and time"}
+                            : activeReminder.pendingDate
+                              ? `${activeReminder.pendingDate} · waiting for time`
+                              : "Waiting for date and time"}
                         </dd>
                       </div>
                     </dl>

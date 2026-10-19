@@ -50,6 +50,15 @@ export async function POST(request: Request) {
     });
     permit = limitRequest(clientId(request.headers));
     const transcript = await transcribeAudio(audio);
+    console.info(
+      "[LeadLoop voice]",
+      JSON.stringify({
+        operation: "transcription_complete",
+        transcriptLength: transcript.length,
+        contextStage: valid.context.stage,
+        hasActiveReminder: Boolean(valid.context.activeReminder),
+      }),
+    );
     const result = await interpretThought(
       transcript,
       valid.timeZone,

@@ -5,6 +5,7 @@ import {
   type ConversationContext,
   type IntentResult,
 } from "./conversation-machine";
+import { recoverInitialReminderIntent } from "./reminder-fallback";
 
 const OPENAI_API_URL = "https://api.openai.com/v1";
 const MAX_TEXT_LENGTH = 3000;
@@ -433,7 +434,26 @@ export async function interpretThought(
       "AI_EMPTY_RESPONSE",
     );
   try {
-    return parseIntent(JSON.parse(content));
+    const parsed = parseIntent(JSON.parse(content));
+    const intent = recoverInitialReminderIntent({
+      text,
+      timeZone,
+      activeReminder: context.activeReminder,
+      intent: parsed.intent,
+    });
+    console.info(
+      "[LeadLoop interpretation]",
+      JSON.stringify({
+        stage: context.stage,
+        hasActiveReminder: Boolean(context.activeReminder),
+        intentKind: intent.kind,
+        hasTitle: Boolean(intent.fields.title),
+        hasDate: Boolean(intent.fields.date),
+        hasTime: Boolean(intent.fields.time),
+        transcriptLength: text.length,
+      }),
+    );
+    return { intent };
   } catch (error) {
     logValidationFailure(error);
     const message = error instanceof Error ? error.message : "";

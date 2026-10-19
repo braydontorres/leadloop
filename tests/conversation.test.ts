@@ -67,6 +67,35 @@ test("A: missing time asks once, reads back, then saves exactly one task", () =>
   assert.equal(confirmed.state.stage, "saved");
 });
 
+test("a supplied date survives until a time-only follow-up completes the same draft", () => {
+  ids = 0;
+  const initial = turn(
+    emptyConversationState(),
+    {
+      kind: "new_task",
+      fields: {
+        ...fields,
+        title: "talk to Brad",
+        person: "Brad",
+        date: "2026-10-20",
+      },
+    },
+    "Remind me to talk to Brad tomorrow.",
+  );
+  assert.equal(initial.state.stage, "awaiting_details");
+  assert.equal(initial.state.activeReminder?.title, "talk to Brad");
+  assert.equal(initial.state.activeReminder?.pendingDate, "2026-10-20");
+  assert.match(initial.reply, /What time/);
+  const completed = turn(
+    initial.state,
+    { kind: "follow_up", fields: { ...fields, time: "15:00" } },
+    "3 PM.",
+  );
+  assert.equal(completed.state.activeReminder?.id, "draft-1");
+  assert.equal(completed.state.activeReminder?.pendingDate, null);
+  assert.match(completed.reply, /3:00 PM/);
+});
+
 test("B and C: complete request reads back, then correction keeps its ID", () => {
   ids = 0;
   const created = turn(
