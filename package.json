@@ -8,6 +8,7 @@
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
+    "test:live-ai": "tsx scripts/live-ai-contract.ts",
     "test:e2e": "playwright test",
     "format": "prettier --write app lib tests e2e *.ts *.mjs README.md package.json",
     "format:check": "prettier --check app lib tests e2e *.ts *.mjs README.md package.json"

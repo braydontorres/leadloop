@@ -44,13 +44,12 @@ import {
   toLocalInput,
 } from "../lib/tasks";
 import {
-  applyTaskOperations,
-  advancePendingClarifications,
-  type AssistantResult,
-  type ConversationContext,
-  type PendingClarification,
-  type ReviewItem,
-} from "../lib/conversation";
+  applyAssistantIntent,
+  conversationContext,
+  emptyConversationState,
+  type ConversationDraft,
+  type IntentResult,
+} from "../lib/conversation-machine";
 import {
   selectRecorderMimeType,
   supportedAudioFormat,
@@ -80,12 +79,7 @@ export default function Page() {
     [voiceError, setVoiceError] = useState(""),
     [demoMode, setDemoMode] = useState(false),
     [assistantMessage, setAssistantMessage] = useState(""),
-    [history, setHistory] = useState<ConversationContext["history"]>([]),
-    [reviewItems, setReviewItems] = useState<ReviewItem[]>([]),
-    [pendingClarifications, setPendingClarifications] = useState<
-      PendingClarification[]
-    >([]),
-    [cancelIds, setCancelIds] = useState<string[]>([]);
+    [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
@@ -189,6 +183,9 @@ export default function Page() {
           !isToday(t.due, timezone) && (!t.due || new Date(t.due) > new Date()),
       )
       .sort((a, b) => (a.due || "z").localeCompare(b.due || "z"));
+  const reviewItems = conversation.drafts,
+    pendingClarifications = conversation.pending,
+    cancelIds = conversation.cancellationIds;
   const go = (s: Screen) => {
     setScreen(s);
     setSearch("");
@@ -218,59 +215,36 @@ export default function Page() {
         tasks: saveTask(store.tasks, { ...draft, title: draft.title.trim() }),
       });
       setDraft(null);
-      setReviewItems((items) => items.filter((item) => item.id !== draft.id));
-      setPendingClarifications((items) =>
-        items.filter((item) => !item.taskIds.includes(draft.id)),
-      );
+      setConversation((current) => ({
+        ...current,
+        drafts: current.drafts.filter((item) => item.id !== draft.id),
+        pending: current.pending.filter(
+          (item) => !item.taskIds.includes(draft.id),
+        ),
+        cancellationIds: current.cancellationIds.filter(
+          (item) => item !== draft.id,
+        ),
+        phase: "confirmed",
+      }));
       setText("");
       setNotice("Task saved on this device.");
     } catch (e) {
       setNotice((e as Error).message);
     }
   };
-  const conversationContext = (): ConversationContext => {
-    const known = new Map(
-      store.tasks.map(({ id, title, person, due, notes }) => [
-        id,
-        { id, title, person, due, notes },
-      ]),
-    );
-    reviewItems.forEach(({ id, title, person, due, notes }) =>
-      known.set(id, { id, title, person, due: due ?? "", notes }),
-    );
-    return {
-      history,
-      knownTasks: [...known.values()].slice(-12),
-      pendingClarifications,
-      availableDraftIds: Array.from({ length: 5 }, () => crypto.randomUUID()),
-    };
-  };
-  const handleAssistantResult = (
-    transcript: string,
-    result: AssistantResult,
-  ) => {
+  const handleAssistantResult = (transcript: string, result: IntentResult) => {
     try {
-      const applied = applyTaskOperations(
-        reviewItems,
-        store.tasks,
-        result.operations,
+      setConversation((current) =>
+        applyAssistantIntent({
+          state: current,
+          savedTasks: store.tasks,
+          result,
+          text: transcript,
+          timeZone: timezone,
+          createId: () => crypto.randomUUID(),
+        }),
       );
-      setReviewItems(applied.reviewItems);
-      setCancelIds(applied.cancelIds);
-      setPendingClarifications((current) =>
-        advancePendingClarifications(current, applied),
-      );
-      setAssistantMessage(applied.clarification?.question ?? result.message);
-      setHistory((turns) =>
-        [
-          ...turns,
-          { role: "user" as const, text: transcript },
-          {
-            role: "assistant" as const,
-            text: applied.clarification?.question ?? result.message,
-          },
-        ].slice(-6),
-      );
+      setAssistantMessage(result.intent.question ?? result.message);
     } catch (error) {
       setVoiceError((error as Error).message);
     }
@@ -286,12 +260,12 @@ export default function Page() {
         body: JSON.stringify({
           text: thought,
           timeZone: timezone,
-          context: conversationContext(),
+          context: conversationContext(conversation, store.tasks),
         }),
       });
       const payload = (await response.json()) as {
         transcript?: string;
-        result?: AssistantResult;
+        result?: IntentResult;
         error?: string;
         demoMode?: boolean;
       };
@@ -322,14 +296,17 @@ export default function Page() {
       const form = new FormData();
       form.append("audio", audio, `leadloop-${Date.now()}.${format.extension}`);
       form.append("timeZone", timezone);
-      form.append("context", JSON.stringify(conversationContext()));
+      form.append(
+        "context",
+        JSON.stringify(conversationContext(conversation, store.tasks)),
+      );
       const response = await fetch("/api/voice", {
         method: "POST",
         body: form,
       });
       const payload = (await response.json()) as {
         transcript?: string;
-        result?: AssistantResult;
+        result?: IntentResult;
         error?: string;
         demoMode?: boolean;
       };
@@ -431,7 +408,7 @@ export default function Page() {
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     else setIsRecording(false);
   };
-  const openReviewItem = (item: ReviewItem) => {
+  const openReviewItem = (item: ConversationDraft) => {
     const saved = store.tasks.find((task) => task.id === item.id);
     setDraft({
       id: item.id,
@@ -444,11 +421,15 @@ export default function Page() {
   };
   const confirmCancellation = (id: string) => {
     setStore({ ...store, tasks: store.tasks.filter((task) => task.id !== id) });
-    setReviewItems((items) => items.filter((item) => item.id !== id));
-    setPendingClarifications((items) =>
-      items.filter((item) => !item.taskIds.includes(id)),
-    );
-    setCancelIds((ids) => ids.filter((cancelId) => cancelId !== id));
+    setConversation((current) => ({
+      ...current,
+      drafts: current.drafts.filter((item) => item.id !== id),
+      pending: current.pending.filter((item) => !item.taskIds.includes(id)),
+      cancellationIds: current.cancellationIds.filter(
+        (cancelId) => cancelId !== id,
+      ),
+      phase: "confirmed",
+    }));
     setNotice("Task cancellation confirmed.");
   };
   const taskRow = (t: Task) => (
@@ -1084,15 +1065,17 @@ export default function Page() {
                           <button
                             className="review-dismiss"
                             onClick={() => {
-                              setReviewItems((items) =>
-                                items.filter((entry) => entry.id !== item.id),
-                              );
-                              setPendingClarifications((items) =>
-                                items.filter(
+                              setConversation((current) => ({
+                                ...current,
+                                drafts: current.drafts.filter(
+                                  (entry) => entry.id !== item.id,
+                                ),
+                                pending: current.pending.filter(
                                   (clarification) =>
                                     !clarification.taskIds.includes(item.id),
                                 ),
-                              );
+                                phase: "canceled",
+                              }));
                             }}
                           >
                             Discard draft
@@ -1121,9 +1104,13 @@ export default function Page() {
                           <button
                             className="review-dismiss"
                             onClick={() =>
-                              setCancelIds((ids) =>
-                                ids.filter((cancelId) => cancelId !== id),
-                              )
+                              setConversation((current) => ({
+                                ...current,
+                                cancellationIds: current.cancellationIds.filter(
+                                  (cancelId) => cancelId !== id,
+                                ),
+                                phase: "ready_for_review",
+                              }))
                             }
                           >
                             Keep task
@@ -1142,6 +1129,22 @@ export default function Page() {
                     disabled={voiceBusy || isRecording}
                   >
                     <RotateCcw size={16} /> Continue speaking
+                  </button>
+                  <button
+                    className="review-dismiss"
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          "Discard unfinished reminders and start a fresh capture session?",
+                        )
+                      ) {
+                        setConversation(emptyConversationState());
+                        setAssistantMessage("");
+                        setText("");
+                      }
+                    }}
+                  >
+                    Start fresh capture
                   </button>
                 </section>
               )}

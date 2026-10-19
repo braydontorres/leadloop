@@ -1,14 +1,11 @@
+import { localDateTimeContext } from "./conversation";
 import {
-  AVAILABLE_DRAFT_IDS_PER_TURN,
-  MAX_HISTORY_TURNS,
-  MAX_KNOWN_TASKS,
-  localDateTimeContext,
-  parseAssistantResult,
   parseConversationContext,
-  type AssistantResult,
+  type AssistantIntent,
   type ConversationContext,
-} from "./conversation";
-import { fromLocalInput, toLocalInput } from "./tasks";
+  type IntentResult,
+  type PendingField,
+} from "./conversation-machine";
 
 const OPENAI_API_URL = "https://api.openai.com/v1";
 const MAX_TEXT_LENGTH = 3000;
@@ -16,53 +13,42 @@ const MAX_TEXT_LENGTH = 3000;
 const responseSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["message", "operations"],
+  required: ["message", "intent"],
   properties: {
     message: { type: "string" },
-    operations: {
-      type: "array",
-      maxItems: 5,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "type",
-          "targetId",
-          "targetIds",
-          "question",
-          "task",
-          "changes",
-        ],
-        properties: {
-          type: {
-            type: "string",
-            enum: ["create", "update", "cancel", "clarify"],
-          },
-          targetId: { type: ["string", "null"] },
-          targetIds: { type: "array", items: { type: "string" } },
-          question: { type: ["string", "null"] },
-          task: {
-            type: ["object", "null"],
-            additionalProperties: false,
-            required: ["title", "person", "due", "notes"],
-            properties: {
-              title: { type: "string" },
-              person: { type: "string" },
-              due: { type: ["string", "null"] },
-              notes: { type: "string" },
-            },
-          },
-          changes: {
-            type: ["object", "null"],
-            additionalProperties: false,
-            required: ["title", "person", "due", "notes", "clearDue"],
-            properties: {
-              title: { type: ["string", "null"] },
-              person: { type: ["string", "null"] },
-              due: { type: ["string", "null"] },
-              notes: { type: ["string", "null"] },
-              clearDue: { type: "boolean" },
-            },
+    intent: {
+      type: "object",
+      additionalProperties: false,
+      required: ["kind", "subject", "fields", "clarificationField", "question"],
+      properties: {
+        kind: {
+          type: "string",
+          enum: [
+            "new_task",
+            "follow_up",
+            "update",
+            "cancel",
+            "clarify",
+            "none",
+          ],
+        },
+        subject: { type: ["string", "null"] },
+        clarificationField: {
+          type: ["string", "null"],
+          enum: ["due", "title", "task_choice", null],
+        },
+        question: { type: ["string", "null"] },
+        fields: {
+          type: "object",
+          additionalProperties: false,
+          required: ["title", "person", "date", "time", "notes", "clearDue"],
+          properties: {
+            title: { type: ["string", "null"] },
+            person: { type: ["string", "null"] },
+            date: { type: ["string", "null"] },
+            time: { type: ["string", "null"] },
+            notes: { type: ["string", "null"] },
+            clearDue: { type: "boolean" },
           },
         },
       },
@@ -137,228 +123,98 @@ export function validateInterpretationInput(input: unknown) {
 }
 
 function systemPrompt(timeZone: string, context: ConversationContext) {
-  return `You are LeadLoop, a careful business task assistant. Return only JSON matching the schema. The user's display time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Interpret relative dates in that time zone. Never invent a date, time, contact, or task detail.
+  return `You are LeadLoop's language interpreter. Return only JSON matching the schema. The application owns every task ID, lifecycle state, pending question, date conversion, and mutation. Never return a task ID or an executable operation.
 
-Conversation state is authoritative. An unfinished task is a real review draft, not merely chat history. When a user says a recognizable task but omits a required reminder time, create the draft immediately with every known field and due:null, then add a clarify operation that targets that same draft. For a new create, targetId must be one unused id from AVAILABLE NEW DRAFT IDS. You may use that new id in a clarification targetIds array in the same response. For updates or cancellations, targetId must exactly match a KNOWN TASK id. Preserve all unrelated fields by leaving them null in update.changes.
+The user's configured time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Resolve relative dates to date as YYYY-MM-DD and time as HH:MM in that time zone. Do not return an ISO timestamp. Never invent dates, times, contacts, or task details.
 
-If PENDING CLARIFICATIONS contains exactly one task and the user's next statement naturally answers its question, update that task by default. If the user clearly starts a separate task, create it and leave the unfinished task pending. If more than one pending task could fit an ambiguous follow-up, ask which task they mean; do not guess. Treat “that”, “it”, “him”, and “her” as references to the most recent unambiguous unfinished or reviewed task. “Actually” or “I meant” is normally an update, never a duplicate create. A pronoun can update a known task only when one task is unambiguous; otherwise clarify.
+Choose new_task only when the user clearly starts a separate reminder, including “also remind me”. Choose follow_up when the user answers the one pending question. Choose update or cancel for an existing reminder and put a short identifying subject in subject when the user names one. Choose clarify with clarificationField task_choice when more than one reminder could match. For corrections such as “actually make it 5 PM”, choose follow_up or update and include only changed fields. Use null for every unchanged field. If a task is missing a reminder date or time, choose clarify with clarificationField due and a concise question. A user must confirm before anything is saved.
 
-Use one create per separate task. A response must never create and update/cancel the same intended task. For a create, copy one AVAILABLE NEW DRAFT ID exactly; LeadLoop safely binds a valid create to an unused available ID. OpenAI structured output requires every changes key: for update, changes must always be {"title":string|null,"person":string|null,"due":string|null,"notes":string|null,"clearDue":boolean}. Use null for unchanged title, person, due, and notes. Set clearDue:true only when the user explicitly removes the reminder; otherwise it is false. This is essential: a time-only update is {"title":null,"person":null,"due":"...","notes":null,"clearDue":false}, so the stored date, contact, title, and notes are preserved. Never put an inferred contact into changes.person; only change it when the user explicitly names the replacement. A due date must be an ISO 8601 UTC timestamp ending in Z (for example 2026-10-23T22:00:00.000Z). Create uses task and changes:null. Update uses changes and task:null. Cancel and clarify use task:null and changes:null. Clarify requires a short question and targetIds for every affected task. Use targetIds:[] only when no task is identifiable. For non-clarify operations use targetIds:[]. Do not save anything: the user must confirm later.
-
-HISTORY (bounded):\n${JSON.stringify(context.history.slice(-MAX_HISTORY_TURNS))}\n\nKNOWN TASKS (bounded):\n${JSON.stringify(context.knownTasks.slice(-MAX_KNOWN_TASKS))}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pendingClarifications)}\n\nAVAILABLE NEW DRAFT IDS:\n${JSON.stringify(context.availableDraftIds.slice(0, AVAILABLE_DRAFT_IDS_PER_TURN))}`;
-}
-
-function validateResultTargets(
-  result: AssistantResult,
-  context: ConversationContext,
-) {
-  const knownIds = new Set(context.knownTasks.map((task) => task.id));
-  const availableIds = new Set(context.availableDraftIds);
-  const created = result.operations.filter(
-    (
-      operation,
-    ): operation is Extract<
-      AssistantResult["operations"][number],
-      { type: "create" }
-    > => operation.type === "create",
-  );
-  const createdIds = new Set(created.map((operation) => operation.targetId));
-  if (
-    created.some((operation) => !availableIds.has(operation.targetId)) ||
-    createdIds.size !== created.length
-  ) {
-    throw new Error("Invalid new draft reference.");
-  }
-  const mutationIds = new Set<string>();
-  for (const operation of result.operations) {
-    if (operation.type === "create") {
-      continue;
-    }
-    if (operation.type === "update" || operation.type === "cancel") {
-      if (!knownIds.has(operation.targetId))
-        throw new Error("Invalid task reference.");
-      if (mutationIds.has(operation.targetId))
-        throw new Error("Conflicting task operations.");
-      mutationIds.add(operation.targetId);
-      continue;
-    }
-    for (const targetId of operation.targetIds) {
-      if (!knownIds.has(targetId) && !createdIds.has(targetId)) {
-        throw new Error("Invalid clarification reference.");
-      }
-    }
-  }
+CONVERSATION HISTORY:\n${JSON.stringify(context.history)}\n\nTASKS:\n${JSON.stringify(context.tasks)}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pending)}\n\nLAST ACTIVE TASK ID (context only; never return it):\n${JSON.stringify(context.lastTaskId ?? null)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function bindCreateTargets(
-  value: unknown,
-  context: ConversationContext,
-): unknown {
-  if (!isRecord(value) || !Array.isArray(value.operations)) return value;
-  const available = [...new Set(context.availableDraftIds)];
-  const assigned = new Set<string>();
-  const aliases = new Map<string, string>();
-  const operations = value.operations.map((operation) => {
-    if (!isRecord(operation) || operation.type !== "create") return operation;
-    const requested =
-      typeof operation.targetId === "string" ? operation.targetId : undefined;
-    const targetId =
-      requested && available.includes(requested) && !assigned.has(requested)
-        ? requested
-        : available.find((id) => !assigned.has(id));
-    if (!targetId) return operation;
-    assigned.add(targetId);
-    if (requested) aliases.set(requested, targetId);
-    return { ...operation, targetId };
-  });
+function nullableText(value: unknown, label: string, maxLength: number) {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > maxLength)
+    throw new Error(`Invalid ${label}.`);
+  return value.trim();
+}
+
+function parseIntent(value: unknown): IntentResult {
+  if (!isRecord(value) || !isRecord(value.intent))
+    throw new Error("Invalid response shape.");
+  const intent = value.intent;
+  const kind = intent.kind;
+  if (
+    kind !== "new_task" &&
+    kind !== "follow_up" &&
+    kind !== "update" &&
+    kind !== "cancel" &&
+    kind !== "clarify" &&
+    kind !== "none"
+  )
+    throw new Error("Invalid intent kind.");
+  if (!isRecord(intent.fields)) throw new Error("Invalid intent fields.");
+  const fields = intent.fields;
+  const date = nullableText(fields.date, "local date", 10);
+  const time = nullableText(fields.time, "local time", 5);
+  if (date !== null && !/^\d{4}-\d{2}-\d{2}$/.test(date))
+    throw new Error("Invalid local date.");
+  if (time !== null && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))
+    throw new Error("Invalid local time.");
+  const clarificationField = intent.clarificationField;
+  if (
+    clarificationField !== null &&
+    clarificationField !== "due" &&
+    clarificationField !== "title" &&
+    clarificationField !== "task_choice"
+  )
+    throw new Error("Invalid clarification field.");
+  if (typeof fields.clearDue !== "boolean")
+    throw new Error("Invalid clear reminder flag.");
   return {
-    ...value,
-    operations: operations.map((operation) => {
-      if (!isRecord(operation) || operation.type !== "clarify")
-        return operation;
-      if (!Array.isArray(operation.targetIds)) return operation;
-      return {
-        ...operation,
-        targetIds: operation.targetIds.map((targetId) =>
-          typeof targetId === "string"
-            ? (aliases.get(targetId) ?? targetId)
-            : targetId,
-        ),
-      };
-    }),
+    message:
+      nullableText(value.message, "assistant message", 500) ||
+      "I’m ready when you are.",
+    intent: {
+      kind,
+      subject: nullableText(intent.subject, "task subject", 240),
+      fields: {
+        title: nullableText(fields.title, "task title", 240),
+        person: nullableText(fields.person, "person", 160),
+        date,
+        time,
+        notes: nullableText(fields.notes, "notes", 1000),
+        clearDue: fields.clearDue,
+      },
+      clarificationField: clarificationField as PendingField | null,
+      question: nullableText(intent.question, "clarification", 400),
+    } as AssistantIntent,
   };
 }
 
-function validationDiagnostic(error: unknown) {
-  const message = error instanceof Error ? error.message : "";
-  if (message === "Invalid new draft reference.")
-    return { rule: "CREATE_TARGET_ID", field: "operations[].targetId" };
-  if (message === "Invalid task reference.")
-    return { rule: "KNOWN_TASK_TARGET", field: "operations[].targetId" };
-  if (message === "Conflicting task operations.")
-    return { rule: "ONE_MUTATION_PER_TASK", field: "operations[]" };
-  if (message === "Invalid clarification reference.")
-    return { rule: "CLARIFICATION_TARGET", field: "operations[].targetIds" };
-  if (message === "Invalid reminder date.")
-    return { rule: "ISO_REMINDER_INSTANT", field: "operations[].task.due" };
-  if (message === "Invalid reminder update.")
-    return { rule: "UPDATE_SHAPE", field: "operations[].changes" };
-  if (message === "An update must change at least one task field.")
-    return { rule: "UPDATE_HAS_CHANGE", field: "operations[].changes" };
-  if (message === "Invalid task details.")
-    return { rule: "CREATE_TASK_SHAPE", field: "operations[].task" };
-  if (message === "Invalid task operation.")
-    return { rule: "OPERATION_SHAPE", field: "operations[]" };
-  if (message === "Unknown task operation.")
-    return { rule: "OPERATION_TYPE", field: "operations[].type" };
-  if (message === "Too many task operations.")
-    return { rule: "MAX_OPERATIONS", field: "operations" };
-  return { rule: "RESPONSE_VALIDATION", field: "response" };
-}
-
 function logValidationFailure(error: unknown) {
-  const diagnostic = validationDiagnostic(error);
+  const message = error instanceof Error ? error.message : "";
+  const rule =
+    message === "Invalid local date." || message === "Invalid local time."
+      ? "LOCAL_DATE_TIME"
+      : message === "Invalid intent kind."
+        ? "INTENT_KIND"
+        : message === "Invalid intent fields."
+          ? "INTENT_FIELDS"
+          : "RESPONSE_VALIDATION";
   console.error(
     "[LeadLoop AI]",
     JSON.stringify({
       operation: "interpretation",
       errorType: "AI_INVALID_RESPONSE",
-      validationRule: diagnostic.rule,
-      field: diagnostic.field,
+      validationRule: rule,
+      field: rule === "LOCAL_DATE_TIME" ? "intent.fields.date/time" : "intent",
     }),
   );
-}
-
-function words(value: string) {
-  return new Set(value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
-}
-
-function userExplicitlyNamed(text: string, person: string) {
-  const said = words(text);
-  const nameWords = [...words(person)].filter((word) => word.length > 1);
-  return nameWords.some((word) => said.has(word));
-}
-
-export function normalizeAndValidateUpdates(
-  result: AssistantResult,
-  text: string,
-  timeZone: string,
-  context: ConversationContext,
-): AssistantResult {
-  const known = new Map(context.knownTasks.map((task) => [task.id, task]));
-  const spokenTime = text.match(
-    /\b(?:at\s+|make (?:it|that)\s+)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/i,
-  );
-  const operations = result.operations.map((operation) => {
-    if (operation.type !== "update") return operation;
-    const current = known.get(operation.targetId);
-    if (!current) return operation;
-    let changes = operation.changes;
-    if (
-      changes.person !== undefined &&
-      changes.person !== current.person &&
-      !userExplicitlyNamed(text, changes.person)
-    ) {
-      const { person: _unsafePerson, ...safeChanges } = changes;
-      changes = safeChanges;
-      if (Object.keys(changes).length === 0) {
-        throw new Error("Unverified contact change.");
-      }
-    }
-    if (spokenTime && changes.due) {
-      const hour12 = Number(spokenTime[1]);
-      const minute = Number(spokenTime[2] ?? "0");
-      const isPm = spokenTime[3].toLowerCase().startsWith("p");
-      if (hour12 < 1 || hour12 > 12 || minute > 59) {
-        throw new Error("Invalid spoken time.");
-      }
-      const expectedHour = (hour12 % 12) + (isPm ? 12 : 0);
-      const parts = new Intl.DateTimeFormat("en-US", {
-        timeZone,
-        hour: "2-digit",
-        minute: "2-digit",
-        hourCycle: "h23",
-      }).formatToParts(new Date(changes.due));
-      const actual = Object.fromEntries(
-        parts
-          .filter((part) => part.type === "hour" || part.type === "minute")
-          .map((part) => [part.type, Number(part.value)]),
-      );
-      if (actual.hour !== expectedHour || actual.minute !== minute) {
-        const hasRelativeDate =
-          /\b(today|tomorrow|tonight|next|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\/?\d{1,2})\b/i.test(
-            text,
-          );
-        if (!current.due || hasRelativeDate) {
-          throw new Error("Reminder time did not match the request.");
-        }
-        const existingLocal = toLocalInput(current.due, timeZone);
-        changes = {
-          ...changes,
-          due: fromLocalInput(
-            `${existingLocal.slice(0, 11)}${String(expectedHour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
-            timeZone,
-          ),
-        };
-      }
-    }
-    return { ...operation, changes };
-  });
-  const pronounReference = /\b(that|it|him|her)\b/i.test(text);
-  const updates = operations.filter((operation) => operation.type === "update");
-  const creates = operations.filter((operation) => operation.type === "create");
-  return pronounReference && updates.length === 1 && creates.length > 0
-    ? {
-        ...result,
-        operations: operations.filter(
-          (operation) => operation.type !== "create",
-        ),
-      }
-    : { ...result, operations };
 }
 
 type ProviderFailure = {
@@ -557,7 +413,7 @@ export async function interpretThought(
   text: string,
   timeZone: string,
   context: ConversationContext,
-): Promise<AssistantResult> {
+): Promise<IntentResult> {
   const response = await openAiFetch(
     "/chat/completions",
     {
@@ -569,7 +425,7 @@ export async function interpretThought(
         response_format: {
           type: "json_schema",
           json_schema: {
-            name: "leadloop_task_operations",
+            name: "leadloop_task_intent",
             strict: true,
             schema: responseSchema,
           },
@@ -593,16 +449,32 @@ export async function interpretThought(
       "AI_EMPTY_RESPONSE",
     );
   try {
-    const result = normalizeAndValidateUpdates(
-      parseAssistantResult(bindCreateTargets(JSON.parse(content), context)),
-      text,
-      timeZone,
-      context,
-    );
-    validateResultTargets(result, context);
-    return result;
+    return parseIntent(JSON.parse(content));
   } catch (error) {
     logValidationFailure(error);
+    const message = error instanceof Error ? error.message : "";
+    if (
+      message === "Invalid local date." ||
+      message === "Invalid local time."
+    ) {
+      return {
+        message: "I need a valid date and time for that reminder.",
+        intent: {
+          kind: "follow_up",
+          subject: null,
+          fields: {
+            title: null,
+            person: null,
+            date: null,
+            time: null,
+            notes: null,
+            clearDue: false,
+          },
+          clarificationField: "due",
+          question: "What date and time would you like?",
+        },
+      };
+    }
     throw new ApiError(
       "LeadLoop received an invalid AI response. Please try again.",
       502,

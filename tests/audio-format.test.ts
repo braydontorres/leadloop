@@ -240,7 +240,7 @@ test("classifies a fetch failure as a network error without logging audio data",
 
 const interpretationContext = {
   history: [],
-  knownTasks: [
+  tasks: [
     {
       id: "task-1",
       title: "Call Sarah",
@@ -249,13 +249,13 @@ const interpretationContext = {
       notes: "",
     },
   ],
-  pendingClarifications: [],
-  availableDraftIds: ["draft-1"],
+  pending: [],
+  lastTaskId: "task-1",
 };
 
 test("classifies a rejected interpretation schema without calling it a transcription error", async () => {
   const exactSchemaError =
-    "Invalid schema for response_format 'leadloop_task_operations': In context=('properties', 'operations', 'items', 'properties', 'changes'), 'required' is required to be supplied and to be an array including every key in properties. Missing 'title'.";
+    "Invalid schema for response_format 'leadloop_task_intent': In context=('properties', 'intent'), required is missing.";
   await withMockedOpenAi(
     async () =>
       new Response(
@@ -290,12 +290,12 @@ test("classifies a rejected interpretation schema without calling it a transcrip
         diagnostics.join("\n"),
         /response_format\.json_schema\.schema/,
       );
-      assert.match(diagnostics.join("\n"), /Missing 'title'/);
+      assert.match(diagnostics.join("\n"), /required is missing/);
     },
   );
 });
 
-test("sends a strict-schema-compatible interpretation request and parses a time-only update", async () => {
+test("sends an intent-only strict schema and parses a time-only update", async () => {
   let requestBody: Record<string, unknown> | undefined;
   await withMockedOpenAi(
     async (_input, init) => {
@@ -307,22 +307,20 @@ test("sends a strict-schema-compatible interpretation request and parses a time-
               message: {
                 content: JSON.stringify({
                   message: "Updated to 6 PM.",
-                  operations: [
-                    {
-                      type: "update",
-                      targetId: "task-1",
-                      targetIds: [],
-                      question: null,
-                      task: null,
-                      changes: {
-                        title: null,
-                        person: null,
-                        due: "2026-10-23T23:00:00.000Z",
-                        notes: null,
-                        clearDue: false,
-                      },
+                  intent: {
+                    kind: "update",
+                    subject: "Sarah",
+                    clarificationField: null,
+                    question: null,
+                    fields: {
+                      title: null,
+                      person: null,
+                      date: null,
+                      time: "18:00",
+                      notes: null,
+                      clearDue: false,
                     },
-                  ],
+                  },
                 }),
               },
             },
@@ -337,13 +335,8 @@ test("sends a strict-schema-compatible interpretation request and parses a time-
         "America/Chicago",
         interpretationContext,
       );
-      assert.deepEqual(result.operations, [
-        {
-          type: "update",
-          targetId: "task-1",
-          changes: { due: "2026-10-23T23:00:00.000Z" },
-        },
-      ]);
+      assert.equal(result.intent.kind, "update");
+      assert.equal(result.intent.fields.time, "18:00");
     },
   );
   const responseFormat = requestBody?.response_format as {
@@ -354,23 +347,25 @@ test("sends a strict-schema-compatible interpretation request and parses a time-
   assert.equal(responseFormat.type, "json_schema");
   const schema = responseFormat.json_schema.schema as {
     properties: {
-      operations: {
-        items: { properties: { changes: Record<string, unknown> } };
-      };
+      intent: { properties: { fields: Record<string, unknown> } };
     };
   };
-  const changes = schema.properties.operations.items.properties.changes;
-  assert.deepEqual(changes.required, [
+  const fields = schema.properties.intent.properties.fields as {
+    required: string[];
+    additionalProperties: boolean;
+  };
+  assert.deepEqual(fields.required, [
     "title",
     "person",
-    "due",
+    "date",
+    "time",
     "notes",
     "clearDue",
   ]);
-  assert.equal(changes.additionalProperties, false);
+  assert.equal(fields.additionalProperties, false);
 });
 
-test("creates a separate Sarah draft after Bill using a bound id and normalized offset time", async () => {
+test("returns a safe clarification for an invalid local date-time without exposing task content", async () => {
   await withMockedOpenAi(
     async () =>
       new Response(
@@ -380,21 +375,20 @@ test("creates a separate Sarah draft after Bill using a bound id and normalized 
               message: {
                 content: JSON.stringify({
                   message: "I added the Sarah reminder.",
-                  operations: [
-                    {
-                      type: "create",
-                      targetId: "model-generated-sarah-id",
-                      targetIds: [],
-                      question: null,
-                      task: {
-                        title: "Talk to Sarah",
-                        person: "Sarah",
-                        due: "2026-10-19T15:00:00-05:00",
-                        notes: "",
-                      },
-                      changes: null,
+                  intent: {
+                    kind: "new_task",
+                    subject: "Sarah",
+                    clarificationField: null,
+                    question: null,
+                    fields: {
+                      title: "Talk to Sarah",
+                      person: "Sarah",
+                      date: "tomorrow",
+                      time: "15:00",
+                      notes: "",
+                      clearDue: false,
                     },
-                  ],
+                  },
                 }),
               },
             },
@@ -402,40 +396,16 @@ test("creates a separate Sarah draft after Bill using a bound id and normalized 
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       ),
-    async () => {
+    async (diagnostics) => {
       const result = await interpretThought(
         "Remind me to talk to Sarah tomorrow at 3 PM.",
         "America/Chicago",
-        {
-          history: [
-            { role: "user", text: "Talk to Bill about washing his clothes." },
-            { role: "assistant", text: "I'll remind you Friday at 5 PM." },
-          ],
-          knownTasks: [
-            {
-              id: "draft-bill",
-              title: "Talk to Bill about washing his clothes",
-              person: "Bill",
-              due: "2026-10-23T22:00:00.000Z",
-              notes: "",
-            },
-          ],
-          pendingClarifications: [],
-          availableDraftIds: ["client-draft-sarah"],
-        },
+        interpretationContext,
       );
-      assert.deepEqual(result.operations, [
-        {
-          type: "create",
-          targetId: "client-draft-sarah",
-          task: {
-            title: "Talk to Sarah",
-            person: "Sarah",
-            due: "2026-10-19T20:00:00.000Z",
-            notes: "",
-          },
-        },
-      ]);
+      assert.equal(result.intent.kind, "follow_up");
+      assert.equal(result.intent.clarificationField, "due");
+      assert.match(diagnostics.join("\n"), /LOCAL_DATE_TIME/);
+      assert.doesNotMatch(diagnostics.join("\n"), /Talk to Sarah/);
     },
   );
 });
@@ -450,22 +420,20 @@ test("logs the failed validation rule without logging task content", async () =>
               message: {
                 content: JSON.stringify({
                   message: "Sarah should be updated.",
-                  operations: [
-                    {
-                      type: "update",
-                      targetId: "unknown-task",
-                      targetIds: [],
-                      question: null,
-                      task: null,
-                      changes: {
-                        title: null,
-                        person: null,
-                        due: "2026-10-23T23:00:00.000Z",
-                        notes: null,
-                        clearDue: false,
-                      },
+                  intent: {
+                    kind: "update",
+                    subject: "Sarah",
+                    clarificationField: null,
+                    question: null,
+                    fields: {
+                      title: null,
+                      person: null,
+                      date: null,
+                      time: "25:00",
+                      notes: null,
+                      clearDue: false,
                     },
-                  ],
+                  },
                 }),
               },
             },
@@ -474,21 +442,14 @@ test("logs the failed validation rule without logging task content", async () =>
         { status: 200, headers: { "content-type": "application/json" } },
       ),
     async (diagnostics) => {
-      await assert.rejects(
-        () =>
-          interpretThought(
-            "Actually make it 6 PM.",
-            "America/Chicago",
-            interpretationContext,
-          ),
-        (error: unknown) => {
-          assert(error instanceof ApiError);
-          assert.equal(error.code, "AI_INVALID_RESPONSE");
-          return true;
-        },
+      const result = await interpretThought(
+        "Actually make it 6 PM.",
+        "America/Chicago",
+        interpretationContext,
       );
-      assert.match(diagnostics.join("\n"), /KNOWN_TASK_TARGET/);
-      assert.match(diagnostics.join("\n"), /operations\[\]\.targetId/);
+      assert.equal(result.intent.clarificationField, "due");
+      assert.match(diagnostics.join("\n"), /LOCAL_DATE_TIME/);
+      assert.match(diagnostics.join("\n"), /intent\.fields\.(date|time)/);
       assert.doesNotMatch(diagnostics.join("\n"), /Sarah should be updated/);
     },
   );

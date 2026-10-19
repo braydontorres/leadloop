@@ -91,42 +91,35 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
   page,
 }) => {
   const contexts: Array<Record<string, unknown>> = [];
-  let billId = "";
-  let sarahId = "";
   await page.route("**/api/interpret", async (route) => {
     const request = JSON.parse(route.request().postData() ?? "{}") as {
       text: string;
       context: {
-        availableDraftIds: string[];
-        knownTasks: Array<{ id: string }>;
-        pendingClarifications: unknown[];
+        tasks: Array<{ id: string }>;
+        pending: unknown[];
       };
     };
     contexts.push(request.context);
-    if (!billId) billId = request.context.availableDraftIds[0];
     const response =
       contexts.length === 1
         ? {
             transcript: request.text,
             result: {
               message: "When would you like to set this reminder?",
-              operations: [
-                {
-                  type: "create",
-                  targetId: billId,
-                  task: {
-                    title: "Talk to Bill about washing his clothes",
-                    person: "Bill",
-                    due: null,
-                    notes: "",
-                  },
+              intent: {
+                kind: "new_task",
+                subject: "Bill",
+                clarificationField: "due",
+                question: "When would you like to set this reminder?",
+                fields: {
+                  title: "Talk to Bill about washing his clothes",
+                  person: "Bill",
+                  date: null,
+                  time: null,
+                  notes: "",
+                  clearDue: false,
                 },
-                {
-                  type: "clarify",
-                  question: "When would you like to set this reminder?",
-                  targetIds: [billId],
-                },
-              ],
+              },
             },
           }
         : contexts.length === 2
@@ -134,15 +127,20 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
               transcript: request.text,
               result: {
                 message: "I'll remind you next Friday at 5 PM.",
-                operations: [
-                  {
-                    type: "update",
-                    targetId: billId,
-                    changes: {
-                      due: "2026-10-23T22:00:00.000Z",
-                    },
+                intent: {
+                  kind: "follow_up",
+                  subject: null,
+                  clarificationField: null,
+                  question: null,
+                  fields: {
+                    title: null,
+                    person: null,
+                    date: "2026-10-23",
+                    time: "17:00",
+                    notes: null,
+                    clearDue: false,
                   },
-                ],
+                },
               },
             }
           : contexts.length === 3
@@ -150,15 +148,20 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                 transcript: request.text,
                 result: {
                   message: "Updated to 6 PM.",
-                  operations: [
-                    {
-                      type: "update",
-                      targetId: billId,
-                      changes: {
-                        due: "2026-10-23T23:00:00.000Z",
-                      },
+                  intent: {
+                    kind: "update",
+                    subject: "Bill",
+                    clarificationField: null,
+                    question: null,
+                    fields: {
+                      title: null,
+                      person: null,
+                      date: null,
+                      time: "18:00",
+                      notes: null,
+                      clearDue: false,
                     },
-                  ],
+                  },
                 },
               }
             : contexts.length === 4
@@ -166,16 +169,20 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                   transcript: request.text,
                   result: {
                     message: "Updated Bill to Ben.",
-                    operations: [
-                      {
-                        type: "update",
-                        targetId: billId,
-                        changes: {
-                          title: "Talk to Ben about washing his clothes",
-                          person: "Ben",
-                        },
+                    intent: {
+                      kind: "update",
+                      subject: "Bill",
+                      clarificationField: null,
+                      question: null,
+                      fields: {
+                        title: "Talk to Ben about washing his clothes",
+                        person: "Ben",
+                        date: null,
+                        time: null,
+                        notes: null,
+                        clearDue: false,
                       },
-                    ],
+                    },
                   },
                 }
               : contexts.length === 5
@@ -183,19 +190,20 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                     transcript: request.text,
                     result: {
                       message: "I added Sarah.",
-                      operations: [
-                        {
-                          type: "create",
-                          targetId: (sarahId =
-                            request.context.availableDraftIds[0]),
-                          task: {
-                            title: "Call Sarah",
-                            person: "Sarah",
-                            due: "2026-10-18T14:00:00.000Z",
-                            notes: "",
-                          },
+                      intent: {
+                        kind: "new_task",
+                        subject: "Sarah",
+                        clarificationField: null,
+                        question: null,
+                        fields: {
+                          title: "Call Sarah",
+                          person: "Sarah",
+                          date: "2026-10-18",
+                          time: "09:00",
+                          notes: "",
+                          clearDue: false,
                         },
-                      ],
+                      },
                     },
                   }
                 : {
@@ -203,7 +211,20 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
                     result: {
                       message:
                         "I'll cancel the Sarah reminder when you confirm.",
-                      operations: [{ type: "cancel", targetId: sarahId }],
+                      intent: {
+                        kind: "cancel",
+                        subject: "Sarah",
+                        clarificationField: null,
+                        question: null,
+                        fields: {
+                          title: null,
+                          person: null,
+                          date: null,
+                          time: null,
+                          notes: null,
+                          clearDue: false,
+                        },
+                      },
                     },
                   };
     await route.fulfill({ json: response });
@@ -231,7 +252,12 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
   await expect(page.locator(".pending-question")).toHaveCount(0);
   await thought.fill("Actually, make it 6 PM.");
   await understand.click();
+  await expect.poll(() => contexts.length).toBe(3);
+  expect(
+    (contexts[2].tasks as Array<{ id: string }>).map((task) => task.id),
+  ).toContain(contexts[2].lastTaskId as string);
   await expect(page.locator(".review-card")).toHaveCount(1);
+  await expect(page.locator(".review-card")).toContainText("6:00 PM");
   await thought.fill("I meant Ben, not Bill.");
   await understand.click();
   await expect(
@@ -247,11 +273,13 @@ test("keeps an unfinished reminder stable across clarification, correction, and 
   await expect(page.locator(".cancel-card")).toHaveCount(1);
   await expect(page.locator(".review-card")).toHaveCount(3);
   await expect.poll(() => contexts.length).toBe(6);
-  expect(contexts[1].knownTasks).toEqual(
-    expect.arrayContaining([expect.objectContaining({ id: billId })]),
+  expect(contexts[1].tasks as Array<{ id: string }>).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({ id: expect.any(String) }),
+    ]),
   );
-  expect(contexts[1].pendingClarifications).toEqual([
-    expect.objectContaining({ taskIds: [billId] }),
+  expect(contexts[1].pending as Array<{ taskIds: string[] }>).toEqual([
+    expect.objectContaining({ taskIds: [expect.any(String)] }),
   ]);
 });
 
@@ -277,10 +305,10 @@ test("reviews one explicit Sarah update at 9 PM without mutating the saved task"
   await page.addInitScript((store) => {
     localStorage.setItem("leadloop.phase1.v1", JSON.stringify(store));
   }, initialStore);
-  let context: { knownTasks: Array<{ id: string }> } | undefined;
+  let context: { tasks: Array<{ id: string }> } | undefined;
   await page.route("**/api/interpret", async (route) => {
     const request = JSON.parse(route.request().postData() ?? "{}") as {
-      context: { knownTasks: Array<{ id: string }> };
+      context: { tasks: Array<{ id: string }> };
     };
     context = request.context;
     await route.fulfill({
@@ -288,13 +316,20 @@ test("reviews one explicit Sarah update at 9 PM without mutating the saved task"
         transcript: "I wanna talk to her at 9 p.m.",
         result: {
           message: "I updated Sarah's reminder.",
-          operations: [
-            {
-              type: "update",
-              targetId: "sarah-1",
-              changes: { due: "2026-10-24T02:00:00.000Z" },
+          intent: {
+            kind: "update",
+            subject: "Sarah",
+            clarificationField: null,
+            question: null,
+            fields: {
+              title: null,
+              person: null,
+              date: null,
+              time: "21:00",
+              notes: null,
+              clearDue: false,
             },
-          ],
+          },
         },
       },
     });
@@ -318,7 +353,7 @@ test("reviews one explicit Sarah update at 9 PM without mutating the saved task"
   await expect(card).toContainText("Sarah");
   await expect(card).toContainText("9:00 PM");
   await expect(card).not.toContainText("bobby true");
-  expect(context?.knownTasks).toEqual(
+  expect(context?.tasks).toEqual(
     expect.arrayContaining([expect.objectContaining({ id: "sarah-1" })]),
   );
   const saved = await page.evaluate(() =>
@@ -375,34 +410,26 @@ test("Continue speaking sends the same pending draft context through voice", asy
       configurable: true,
     });
   });
-  let draftId = "";
   await page.route("**/api/interpret", async (route) => {
-    const request = JSON.parse(route.request().postData() ?? "{}") as {
-      context: { availableDraftIds: string[] };
-    };
-    draftId = request.context.availableDraftIds[0];
     await route.fulfill({
       json: {
         transcript: "Talk to Bill about the proposal",
         result: {
           message: "When should I remind you?",
-          operations: [
-            {
-              type: "create",
-              targetId: draftId,
-              task: {
-                title: "Talk to Bill about the proposal",
-                person: "Bill",
-                due: null,
-                notes: "",
-              },
+          intent: {
+            kind: "new_task",
+            subject: "Bill",
+            clarificationField: "due",
+            question: "When should I remind you?",
+            fields: {
+              title: "Talk to Bill about the proposal",
+              person: "Bill",
+              date: null,
+              time: null,
+              notes: "",
+              clearDue: false,
             },
-            {
-              type: "clarify",
-              question: "When should I remind you?",
-              targetIds: [draftId],
-            },
-          ],
+          },
         },
       },
     });
@@ -413,13 +440,20 @@ test("Continue speaking sends the same pending draft context through voice", asy
         transcript: "Next Friday at 5 PM.",
         result: {
           message: "Updated to next Friday at 5 PM.",
-          operations: [
-            {
-              type: "update",
-              targetId: draftId,
-              changes: { due: "2026-10-23T22:00:00.000Z" },
+          intent: {
+            kind: "follow_up",
+            subject: null,
+            clarificationField: null,
+            question: null,
+            fields: {
+              title: null,
+              person: null,
+              date: "2026-10-23",
+              time: "17:00",
+              notes: null,
+              clearDue: false,
             },
-          ],
+          },
         },
       },
     });
