@@ -26,6 +26,14 @@ test("drive-through reminder conversation speaks, corrects, confirms, starts ove
     ).__spoken = spoken;
   });
   let turn = 0;
+  const transcripts = [
+    "Talk to Bill about washing his clothes.",
+    "Tomorrow at 5 PM.",
+    "Actually, make that 6 PM.",
+    "Yes.",
+    "Remind me to call Sarah tomorrow at 9 AM.",
+    "Cancel.",
+  ];
   await page.route("**/api/interpret", async (route) => {
     turn += 1;
     const intents = [
@@ -57,7 +65,7 @@ test("drive-through reminder conversation speaks, corrects, confirms, starts ove
     ];
     await route.fulfill({
       json: {
-        transcript: `turn ${turn}`,
+        transcript: transcripts[turn - 1],
         result: { intent: intents[turn - 1] },
       },
     });
@@ -120,6 +128,102 @@ test("drive-through reminder conversation speaks, corrects, confirms, starts ove
   await expect(
     page.getByText(/canceled that unfinished reminder/),
   ).toBeVisible();
+});
+
+test("partial month and weekday details stay incomplete until an exact valid date and time", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (
+      window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+    ).__spoken = spoken;
+  });
+  const intents = [
+    {
+      kind: "new_task",
+      fields: {
+        ...blankFields,
+        title: "Set a reminder for",
+        date: "2027-07-01",
+        time: "12:00",
+      },
+    },
+    {
+      kind: "follow_up",
+      fields: {
+        ...blankFields,
+        title: "Call Brad about his project",
+        person: "Brad",
+      },
+    },
+    {
+      kind: "follow_up",
+      fields: { ...blankFields, date: "2027-07-01", time: "15:00" },
+    },
+    { kind: "confirm", fields: blankFields },
+  ];
+  const transcripts = [
+    "I want a reminder next July on a Saturday.",
+    "Call Brad about his project.",
+    "July 10 at 3 PM.",
+    "Yes.",
+  ];
+  let turn = 0;
+  await page.route("**/api/interpret", async (route) => {
+    const intent = intents[turn++];
+    await route.fulfill({
+      json: { transcript: transcripts[turn - 1], result: { intent } },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => {
+      const spoken = (
+        window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+      ).__spoken;
+      spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent);
+    });
+
+  await reply.fill("I want a reminder next July on a Saturday.");
+  await send.click();
+  await expect(
+    page.getByText("What would you like me to remind you about?"),
+  ).toBeVisible();
+  await expect(page.getByText("Listening for the task")).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("Call Brad about his project.");
+  await send.click();
+  await expect(
+    page.getByText(/Which Saturday in July, and what time/),
+  ).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("July 10 at 3 PM.");
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "Saturday, July 10, 2027 at 3:00 PM",
+  );
+  await finishSpeech();
+
+  await reply.fill("Yes.");
+  await send.click();
+  await expect(page.getByText("Reminder saved on this device.")).toBeVisible();
 });
 
 test("a rate-limited follow-up preserves the active reminder and shows retry timing", async ({

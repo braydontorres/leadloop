@@ -1740,18 +1740,6 @@ h1 > span {
 .compact {
   padding: 10px 12px;
 }
-.compact-toggle {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: -4px 0 14px;
-  font-size: 11px;
-  color: #526650;
-}
-.compact-toggle input {
-  width: auto;
-  accent-color: #2e6045;
-}
 .processing {
   display: flex;
   align-items: center;

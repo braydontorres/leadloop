@@ -63,14 +63,11 @@ import {
   advanceVoiceActivity,
   DEFAULT_VOICE_ACTIVITY_CONFIG,
   initialVoiceActivityState,
-  NOISE_RESISTANT_VOICE_ACTIVITY_CONFIG,
   rmsFromTimeDomain,
-  SENSITIVE_VOICE_ACTIVITY_CONFIG,
   type VoiceActivityConfig,
   type VoiceActivityState,
 } from "../lib/voice-activity";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
-type SpeechSensitivity = "standard" | "sensitive";
 const nav = [
   { name: "Home", icon: Home },
   { name: "Capture", icon: AudioLines },
@@ -118,9 +115,6 @@ export default function Page() {
     [sessionActive, setSessionActive] = useState(false),
     [speechDetected, setSpeechDetected] = useState(false),
     [microphoneStarting, setMicrophoneStarting] = useState(false),
-    [noiseResistant, setNoiseResistant] = useState(false),
-    [speechSensitivity, setSpeechSensitivity] =
-      useState<SpeechSensitivity>("standard"),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const discardRecordingRef = useRef(false);
@@ -337,6 +331,8 @@ export default function Page() {
           notes: draft.notes,
           pendingDate: conversation.activeReminder?.pendingDate ?? null,
           pendingTime: conversation.activeReminder?.pendingTime ?? null,
+          pendingDateConstraint:
+            conversation.activeReminder?.pendingDateConstraint ?? null,
         };
         if (!updatedReminder.title) throw new Error("Give your task a name.");
         const reply = updatedReminder.due
@@ -1007,11 +1003,7 @@ export default function Page() {
       }
       const recorder = new MediaRecorder(stream, { mimeType: supportedType });
       const voiceActivityConfig: VoiceActivityConfig = {
-        ...(noiseResistant
-          ? NOISE_RESISTANT_VOICE_ACTIVITY_CONFIG
-          : speechSensitivity === "sensitive"
-            ? SENSITIVE_VOICE_ACTIVITY_CONFIG
-            : DEFAULT_VOICE_ACTIVITY_CONFIG),
+        ...DEFAULT_VOICE_ACTIVITY_CONFIG,
         silenceMs: VOICE_SILENCE_MS,
       };
       recorderRef.current = recorder;
@@ -1044,10 +1036,7 @@ export default function Page() {
           ++nextMicrophoneRequestIdRef.current;
         const recordingReason = recordingEndReasonRef.current;
         const speechStarted = voiceActivityRef.current.speechStarted;
-        const lowSignalFallback =
-          !noiseResistant &&
-          voiceActivityRef.current.peakSignal >=
-            (speechSensitivity === "sensitive" ? 0.003 : 0.005);
+        const lowSignalFallback = voiceActivityRef.current.peakSignal >= 0.005;
         if (recordingReason === "no_speech" && sessionActiveRef.current) {
           if (audio.size && !voiceDetectionAvailableRef.current) {
             logVoiceTurn(turnId, "vad_unavailable_submission");
@@ -1709,37 +1698,6 @@ export default function Page() {
                     Recording stops before every reply, so it never records its
                     own voice.
                   </p>
-                  <label className="field compact-toggle">
-                    <input
-                      type="checkbox"
-                      checked={noiseResistant}
-                      onChange={(event) =>
-                        setNoiseResistant(event.target.checked)
-                      }
-                    />
-                    Noise-resistant mode for a TV or busy room
-                  </label>
-                  <label className="field">
-                    Speech detection
-                    <select
-                      value={speechSensitivity}
-                      onChange={(event) =>
-                        setSpeechSensitivity(
-                          event.target.value as SpeechSensitivity,
-                        )
-                      }
-                      disabled={noiseResistant}
-                    >
-                      <option value="standard">Standard</option>
-                      <option value="sensitive">
-                        Extra sensitive for quiet speech
-                      </option>
-                    </select>
-                    <span className="input-note">
-                      Noise-resistant mode uses stricter detection while it is
-                      on.
-                    </span>
-                  </label>
                   <div className="capture-help">
                     <ShieldCheck size={18} />
                     <span>
@@ -1819,7 +1777,9 @@ export default function Page() {
                             ? dateLabel(activeReminder.due, timezone)
                             : activeReminder.pendingDate
                               ? `${activeReminder.pendingDate} · waiting for time`
-                              : "Waiting for date and time"}
+                              : activeReminder.pendingDateConstraint
+                                ? "Waiting for the exact date"
+                                : "Waiting for date and time"}
                         </dd>
                       </div>
                     </dl>

@@ -74,3 +74,12 @@ test("keeps a clear imperative task when the model omits it", () => {
   assert.equal(fields?.title, "Talk to the plumber");
   assert.equal(fields?.date, "2026-10-20");
 });
+
+test("does not turn a partial scheduling request into a placeholder task", () => {
+  const fields = inferClearReminderRequest(
+    "I want a reminder next July on a Saturday.",
+    "America/Chicago",
+    new Date("2026-10-19T18:00:00Z"),
+  );
+  assert.equal(fields, null);
+});

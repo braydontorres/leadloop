@@ -1,4 +1,14 @@
 import { fromLocalInput, type Task } from "./tasks";
+import {
+  dateConstraintQuestion,
+  deriveDateConstraint,
+  deterministicDateFromText,
+  isMeaningfulReminderTitle,
+  matchesDateConstraint,
+  mentionsExplicitTime,
+  mentionsUnambiguousDate,
+  type DateConstraint,
+} from "./reminder-details";
 
 export type ConversationStage =
   | "idle"
@@ -17,6 +27,7 @@ export type ActiveReminder = Pick<
 > & {
   pendingDate: string | null;
   pendingTime: string | null;
+  pendingDateConstraint: DateConstraint | null;
 };
 
 export type IntentFields = {
@@ -100,6 +111,35 @@ function activeReminder(value: unknown): ActiveReminder | null {
       value.pendingTime === undefined || value.pendingTime === null
         ? null
         : text(value.pendingTime, "pending reminder time", 5),
+    pendingDateConstraint:
+      value.pendingDateConstraint === undefined ||
+      value.pendingDateConstraint === null
+        ? null
+        : dateConstraint(value.pendingDateConstraint),
+  };
+}
+
+function dateConstraint(value: unknown): DateConstraint {
+  if (!isRecord(value)) throw new Error("Invalid reminder date constraint.");
+  const part = (
+    name: "year" | "month" | "weekday",
+    minimum: number,
+    maximum: number,
+  ) => {
+    const current = value[name];
+    if (current === null) return null;
+    if (
+      !Number.isInteger(current) ||
+      (current as number) < minimum ||
+      (current as number) > maximum
+    )
+      throw new Error("Invalid reminder date constraint.");
+    return current as number;
+  };
+  return {
+    year: part("year", 2000, 9999),
+    month: part("month", 1, 12),
+    weekday: part("weekday", 0, 6),
   };
 }
 
@@ -207,10 +247,20 @@ function applyFields(
   current: ActiveReminder,
   fields: IntentFields,
   timeZone: string,
+  dateConstraint: DateConstraint | null,
 ) {
   let due = fields.clearDue ? "" : current.due;
   let pendingDate = fields.clearDue ? null : current.pendingDate;
   let pendingTime = fields.clearDue ? null : current.pendingTime;
+  let pendingDateConstraint = fields.clearDue
+    ? null
+    : current.pendingDateConstraint;
+  let invalidDateConstraint = false;
+  if (dateConstraint) {
+    pendingDateConstraint = dateConstraint;
+    pendingDate = null;
+    due = "";
+  }
   if (fields.date !== null || fields.time !== null) {
     const previous = due
       ? new Intl.DateTimeFormat("en-CA", {
@@ -227,13 +277,24 @@ function applyFields(
       previous.find((entry) => entry.type === name)?.value ?? "";
     const dueDate = `${part("year")}-${part("month")}-${part("day")}`;
     const dueTime = `${part("hour")}:${part("minute")}`;
-    pendingDate = fields.date ?? pendingDate ?? (due ? dueDate : null);
+    if (
+      fields.date !== null &&
+      !matchesDateConstraint(fields.date, pendingDateConstraint)
+    ) {
+      invalidDateConstraint = true;
+    } else if (fields.date !== null) {
+      pendingDate = fields.date;
+      pendingDateConstraint = null;
+    } else {
+      pendingDate = pendingDate ?? (due ? dueDate : null);
+    }
     pendingTime = fields.time ?? pendingTime ?? (due ? dueTime : null);
     if (pendingDate && pendingTime) {
       try {
         due = fromLocalInput(`${pendingDate}T${pendingTime}`, timeZone);
         pendingDate = null;
         pendingTime = null;
+        pendingDateConstraint = null;
       } catch {
         due = "";
       }
@@ -248,8 +309,9 @@ function applyFields(
       due,
       pendingDate,
       pendingTime,
+      pendingDateConstraint,
     },
-    needsTime: !due && !pendingTime,
+    invalidDateConstraint,
   };
 }
 
@@ -259,18 +321,32 @@ export function spokenReminder(reminder: ActiveReminder, timeZone: string) {
     weekday: "long",
     month: "long",
     day: "numeric",
+    year: "numeric",
     hour: "numeric",
     minute: "2-digit",
   }).format(new Date(reminder.due));
   return `Okay, I'll remind you to ${reminder.title} on ${when}. Is that correct?`;
 }
 
-function nextReply(reminder: ActiveReminder, timeZone: string) {
+function nextReply(
+  reminder: ActiveReminder,
+  timeZone: string,
+  invalidDateConstraint = false,
+) {
   if (!reminder.title.trim())
     return {
       stage: "awaiting_details" as const,
       reply: "What would you like me to remind you about?",
     };
+  if (!reminder.due && reminder.pendingDateConstraint) {
+    const dateQuestion = dateConstraintQuestion(reminder.pendingDateConstraint);
+    return {
+      stage: "awaiting_details" as const,
+      reply: invalidDateConstraint
+        ? `That date doesn't match ${dateQuestion.slice(6)}. ${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`
+        : `${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`,
+    };
+  }
   if (!reminder.due && reminder.pendingDate)
     return {
       stage: "awaiting_details" as const,
@@ -306,8 +382,9 @@ export function advanceConversation(args: {
   text: string;
   timeZone: string;
   createId: () => string;
+  now?: Date;
 }): ConversationTransition {
-  const { state, result, text: user, timeZone, createId } = args;
+  const { state, result, text: user, timeZone, createId, now } = args;
   const intent = result.intent;
   if (
     intent.kind === "end_conversation" &&
@@ -341,6 +418,7 @@ export function advanceConversation(args: {
       const {
         pendingDate: _pendingDate,
         pendingTime: _pendingTime,
+        pendingDateConstraint: _pendingDateConstraint,
         ...task
       } = state.activeReminder;
       const savedTask: Task = { ...task, completed: false };
@@ -386,7 +464,26 @@ export function advanceConversation(args: {
       { stage: state.activeReminder ? "awaiting_details" : "idle" },
     );
 
-  const reminder = applyFields(
+  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
+  const activeConstraint = state.activeReminder?.pendingDateConstraint ?? null;
+  const deterministicDate = deterministicDateFromText(
+    user,
+    timeZone,
+    activeConstraint ?? derivedConstraint,
+    now,
+  );
+  const fields: IntentFields = {
+    ...intent.fields,
+    title: isMeaningfulReminderTitle(intent.fields.title)
+      ? intent.fields.title
+      : null,
+    date: derivedConstraint
+      ? null
+      : (deterministicDate ??
+        (mentionsUnambiguousDate(user) ? intent.fields.date : null)),
+    time: mentionsExplicitTime(user) ? intent.fields.time : null,
+  };
+  const applied = applyFields(
     state.activeReminder ?? {
       id: createId(),
       title: "",
@@ -395,14 +492,20 @@ export function advanceConversation(args: {
       notes: "",
       pendingDate: null,
       pendingTime: null,
+      pendingDateConstraint: null,
     },
-    intent.fields,
+    fields,
     timeZone,
-  ).reminder;
-  const next = nextReply(reminder, timeZone);
+    derivedConstraint,
+  );
+  const next = nextReply(
+    applied.reminder,
+    timeZone,
+    applied.invalidDateConstraint,
+  );
   return withReply(state, user, next.reply, {
     stage: next.stage,
-    activeReminder: reminder,
+    activeReminder: applied.reminder,
   });
 }
 
