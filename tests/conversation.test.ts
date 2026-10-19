@@ -217,6 +217,27 @@ test("an ordinal follow-up resolves the established month and weekday without AI
   assert.match(timed.reply, /Thursday, July 22, 2027.*3:00 PM/);
 });
 
+test("fifth and last weekday replies resolve the active Saturday constraint instead of repeating it", () => {
+  const responses = [
+    { text: "The fifth Saturday.", expected: "2027-07-31" },
+    { text: "The fifth one.", expected: "2027-07-31" },
+    { text: "The last Saturday.", expected: "2027-07-31" },
+  ];
+  for (const { text, expected } of responses) {
+    ids = 0;
+    const initial = turn(
+      emptyConversationState(),
+      { kind: "new_task", fields: { ...fields, title: "order supplies" } },
+      "Remind me to order supplies on a Saturday next July.",
+    );
+    assert.match(initial.reply, /Which Saturday in July/);
+    const resolved = turn(initial.state, { kind: "none", fields }, text);
+    assert.equal(resolved.state.activeReminder?.pendingDate, expected);
+    assert.equal(resolved.state.activeReminder?.pendingDateConstraint, null);
+    assert.match(resolved.reply, /What time/);
+  }
+});
+
 test("a nonexistent ordinal weekday asks for clarification without substituting a date", () => {
   ids = 0;
   const invalid = turn(
