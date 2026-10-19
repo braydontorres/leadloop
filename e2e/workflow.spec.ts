@@ -679,3 +679,115 @@ test("speech playback failure keeps the reply visible and safely resumes listeni
     .poll(() => page.evaluate(() => (window as any).__recorders.length))
     .toBe(2);
 });
+
+test("ten consecutive voice turns submit once each without overlapping recordings", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    const recorders: Array<{
+      state: string;
+      stop: () => void;
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+    }> = [];
+    class TestRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      state = "inactive";
+      mimeType = "audio/webm;codecs=opus";
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+      constructor(
+        public stream: MediaStream,
+        options?: MediaRecorderOptions,
+      ) {
+        this.mimeType = options?.mimeType || this.mimeType;
+        recorders.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        if (this.state !== "recording") return;
+        this.state = "inactive";
+        this.ondataavailable?.({
+          data: new Blob(["voice"], { type: this.mimeType }),
+        });
+        this.onstop?.();
+      }
+    }
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop: () => {} }],
+        }),
+      },
+    });
+    Object.defineProperty(window, "MediaRecorder", {
+      configurable: true,
+      value: TestRecorder,
+    });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.assign(window, { __spoken: spoken, __recorders: recorders });
+  });
+  let requests = 0;
+  await page.route("**/api/voice", async (route) => {
+    const turn = requests++;
+    const taskNumber = Math.floor(turn / 2) + 1;
+    const intent =
+      turn % 2 === 0
+        ? {
+            kind: "new_task",
+            fields: {
+              ...blankFields,
+              title: `call person ${taskNumber}`,
+              person: `Person ${taskNumber}`,
+              date: "2026-10-20",
+              time: "09:00",
+            },
+          }
+        : { kind: "confirm", fields: blankFields };
+    await route.fulfill({
+      json: { transcript: `voice turn ${turn + 1}`, result: { intent } },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  for (let turn = 0; turn < 10; turn += 1) {
+    await expect
+      .poll(() => page.evaluate(() => (window as any).__recorders.length))
+      .toBe(turn + 1);
+    await page.evaluate(
+      (index) => (window as any).__recorders[index].stop(),
+      turn,
+    );
+    await expect.poll(() => requests).toBe(turn + 1);
+    if (turn < 9) {
+      await page.evaluate(() =>
+        (window as any).__spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent),
+      );
+    }
+  }
+  await page.waitForTimeout(150);
+  await expect.poll(() => requests).toBe(10);
+  await expect(
+    page.getByText("Conversation ended — microphone off."),
+  ).toHaveCount(0);
+});

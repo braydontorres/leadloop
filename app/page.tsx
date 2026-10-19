@@ -63,10 +63,14 @@ import {
   advanceVoiceActivity,
   DEFAULT_VOICE_ACTIVITY_CONFIG,
   initialVoiceActivityState,
+  NOISE_RESISTANT_VOICE_ACTIVITY_CONFIG,
   rmsFromTimeDomain,
+  SENSITIVE_VOICE_ACTIVITY_CONFIG,
+  type VoiceActivityConfig,
   type VoiceActivityState,
 } from "../lib/voice-activity";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
+type SpeechSensitivity = "standard" | "sensitive";
 const nav = [
   { name: "Home", icon: Home },
   { name: "Capture", icon: AudioLines },
@@ -115,6 +119,8 @@ export default function Page() {
     [speechDetected, setSpeechDetected] = useState(false),
     [microphoneStarting, setMicrophoneStarting] = useState(false),
     [noiseResistant, setNoiseResistant] = useState(false),
+    [speechSensitivity, setSpeechSensitivity] =
+      useState<SpeechSensitivity>("standard"),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const discardRecordingRef = useRef(false);
@@ -723,6 +729,7 @@ export default function Page() {
     logVoiceTurn(turnId, "recording_finalized", {
       reason,
       endOfSpeechSilenceMs: Math.round(voiceActivityRef.current.quietMs),
+      peakSignal: Math.round(voiceActivityRef.current.peakSignal * 10_000),
       recordingMs: turnTimingRef.current.recordingStartedAt
         ? Math.round(
             turnTimingRef.current.finalizedAt -
@@ -745,7 +752,11 @@ export default function Page() {
       setMicrophoneStarting(false);
     }
   };
-  const startVoiceActivityDetection = (stream: MediaStream, turnId: number) => {
+  const startVoiceActivityDetection = (
+    stream: MediaStream,
+    turnId: number,
+    config: VoiceActivityConfig,
+  ) => {
     const AudioContextConstructor =
       window.AudioContext ||
       (
@@ -771,6 +782,16 @@ export default function Page() {
       audioContextRef.current = context;
       analysisSourceRef.current = source;
       analysisFilterRef.current = filter;
+      if (context.state === "suspended") {
+        logVoiceTurn(turnId, "vad_resume_requested");
+        void context.resume().catch(() => {
+          if (activeTurnIdRef.current !== turnId) return;
+          voiceDetectionAvailableRef.current = false;
+          logVoiceTurn(turnId, "vad_unavailable", {
+            reason: "audio_context_suspended",
+          });
+        });
+      }
       voiceActivityRef.current = initialVoiceActivityState();
       voiceDetectionAvailableRef.current = true;
       let previousTime = performance.now();
@@ -787,16 +808,7 @@ export default function Page() {
           voiceActivityRef.current,
           rmsFromTimeDomain(samples),
           now - previousTime,
-          {
-            ...DEFAULT_VOICE_ACTIVITY_CONFIG,
-            silenceMs: VOICE_SILENCE_MS,
-            minimumSignal: noiseResistant
-              ? 0.022
-              : DEFAULT_VOICE_ACTIVITY_CONFIG.minimumSignal,
-            speechHoldMs: noiseResistant
-              ? 280
-              : DEFAULT_VOICE_ACTIVITY_CONFIG.speechHoldMs,
-          },
+          config,
         );
         previousTime = now;
         voiceActivityRef.current = update.state;
@@ -810,6 +822,7 @@ export default function Page() {
                     turnTimingRef.current.recordingStartedAt,
                 )
               : 0,
+            peakSignal: Math.round(update.state.peakSignal * 10_000),
           });
         }
         if (update.event === "speech_ended") {
@@ -993,6 +1006,14 @@ export default function Page() {
         return;
       }
       const recorder = new MediaRecorder(stream, { mimeType: supportedType });
+      const voiceActivityConfig: VoiceActivityConfig = {
+        ...(noiseResistant
+          ? NOISE_RESISTANT_VOICE_ACTIVITY_CONFIG
+          : speechSensitivity === "sensitive"
+            ? SENSITIVE_VOICE_ACTIVITY_CONFIG
+            : DEFAULT_VOICE_ACTIVITY_CONFIG),
+        silenceMs: VOICE_SILENCE_MS,
+      };
       recorderRef.current = recorder;
       const chunks: Blob[] = [];
       discardRecordingRef.current = false;
@@ -1001,8 +1022,6 @@ export default function Page() {
       voiceDetectionAvailableRef.current = false;
       turnTimingRef.current = { recordingStartedAt: performance.now() };
       setSpeechDetected(false);
-      microphoneStartingRef.current = false;
-      setMicrophoneStarting(false);
       recorder.ondataavailable = (event) => {
         if (activeTurnIdRef.current === turnId && event.data.size)
           chunks.push(event.data);
@@ -1025,7 +1044,26 @@ export default function Page() {
           ++nextMicrophoneRequestIdRef.current;
         const recordingReason = recordingEndReasonRef.current;
         const speechStarted = voiceActivityRef.current.speechStarted;
+        const lowSignalFallback =
+          !noiseResistant &&
+          voiceActivityRef.current.peakSignal >=
+            (speechSensitivity === "sensitive" ? 0.003 : 0.005);
         if (recordingReason === "no_speech" && sessionActiveRef.current) {
+          if (audio.size && !voiceDetectionAvailableRef.current) {
+            logVoiceTurn(turnId, "vad_unavailable_submission");
+            void submitAudio(audio, turnId, sessionId);
+            return;
+          }
+          if (audio.size && lowSignalFallback) {
+            setVoiceError("I heard a quiet response and am checking it now.");
+            logVoiceTurn(turnId, "low_signal_submission", {
+              peakSignal: Math.round(
+                voiceActivityRef.current.peakSignal * 10_000,
+              ),
+            });
+            void submitAudio(audio, turnId, sessionId);
+            return;
+          }
           const reply = "I didn't hear anything. Please try again.";
           setAssistantMessage(reply);
           speakReply(reply, false, true, turnId);
@@ -1067,10 +1105,22 @@ export default function Page() {
           scheduleAutoListen(performance.now(), turnId, sessionId);
         }
       };
+      let recorderStarted = false;
+      const markRecorderReady = () => {
+        if (recorderStarted || activeTurnIdRef.current !== turnId) return;
+        recorderStarted = true;
+        microphoneStartingRef.current = false;
+        setMicrophoneStarting(false);
+        setRecordingSeconds(0);
+        setIsRecording(true);
+        logVoiceTurn(turnId, "recording_started", { sessionId });
+      };
+      recorder.onstart = markRecorderReady;
       recorder.start(250);
-      logVoiceTurn(turnId, "recording_started", { sessionId });
-      setRecordingSeconds(0);
-      setIsRecording(true);
+      // MediaRecorder fires start asynchronously. If a browser omits that
+      // event but reports an active recorder, the fallback still makes the
+      // capture state visible without waiting for a user retry.
+      window.setTimeout(markRecorderReady, 0);
       recordingTimerRef.current = setInterval(
         () => setRecordingSeconds((seconds) => seconds + 1),
         1000,
@@ -1081,7 +1131,7 @@ export default function Page() {
         );
         finishRecording("limit", turnId);
       }, 90_000);
-      startVoiceActivityDetection(stream, turnId);
+      startVoiceActivityDetection(stream, turnId, voiceActivityConfig);
       resetInactivityTimer();
     } catch (error) {
       if (activeTurnIdRef.current !== turnId) return;
@@ -1668,6 +1718,27 @@ export default function Page() {
                       }
                     />
                     Noise-resistant mode for a TV or busy room
+                  </label>
+                  <label className="field">
+                    Speech detection
+                    <select
+                      value={speechSensitivity}
+                      onChange={(event) =>
+                        setSpeechSensitivity(
+                          event.target.value as SpeechSensitivity,
+                        )
+                      }
+                      disabled={noiseResistant}
+                    >
+                      <option value="standard">Standard</option>
+                      <option value="sensitive">
+                        Extra sensitive for quiet speech
+                      </option>
+                    </select>
+                    <span className="input-note">
+                      Noise-resistant mode uses stricter detection while it is
+                      on.
+                    </span>
                   </label>
                   <div className="capture-help">
                     <ShieldCheck size={18} />

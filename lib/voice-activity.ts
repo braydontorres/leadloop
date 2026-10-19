@@ -1,23 +1,49 @@
 export type VoiceActivityConfig = {
   minimumSignal: number;
   speechHoldMs: number;
+  speechGapMs: number;
   silenceMs: number;
   noSpeechMs: number;
+  noiseMultiplier: number;
+  noiseOffset: number;
 };
 
 export const DEFAULT_VOICE_ACTIVITY_CONFIG: VoiceActivityConfig = {
-  // RMS samples are normalized from -1..1. The adaptive noise floor handles
-  // quiet rooms while this lower bound rejects browser/microphone hiss.
-  minimumSignal: 0.012,
-  speechHoldMs: 160,
+  // RMS samples are normalized from -1..1. This accepts conversational and
+  // soft speech while still requiring it to rise above the learned room tone.
+  minimumSignal: 0.006,
+  speechHoldMs: 100,
+  speechGapMs: 100,
   silenceMs: 1_250,
   noSpeechMs: 12_000,
+  noiseMultiplier: 1.45,
+  noiseOffset: 0.0015,
+};
+
+export const SENSITIVE_VOICE_ACTIVITY_CONFIG: VoiceActivityConfig = {
+  ...DEFAULT_VOICE_ACTIVITY_CONFIG,
+  minimumSignal: 0.004,
+  speechHoldMs: 80,
+  speechGapMs: 140,
+  noiseMultiplier: 1.25,
+  noiseOffset: 0.001,
+};
+
+export const NOISE_RESISTANT_VOICE_ACTIVITY_CONFIG: VoiceActivityConfig = {
+  ...DEFAULT_VOICE_ACTIVITY_CONFIG,
+  minimumSignal: 0.022,
+  speechHoldMs: 280,
+  speechGapMs: 40,
+  noiseMultiplier: 2.8,
+  noiseOffset: 0.004,
 };
 
 export type VoiceActivityState = {
   elapsedMs: number;
   noiseFloor: number;
+  peakSignal: number;
   voicedMs: number;
+  candidateQuietMs: number;
   quietMs: number;
   speechStarted: boolean;
 };
@@ -29,7 +55,9 @@ export function initialVoiceActivityState(): VoiceActivityState {
   return {
     elapsedMs: 0,
     noiseFloor: 0,
+    peakSignal: 0,
     voicedMs: 0,
+    candidateQuietMs: 0,
     quietMs: 0,
     speechStarted: false,
   };
@@ -54,7 +82,7 @@ export function advanceVoiceActivity(
   const delta = Math.min(Math.max(elapsedMs, 0), 250);
   const threshold = Math.max(
     config.minimumSignal,
-    previous.noiseFloor * 2.8 + 0.004,
+    previous.noiseFloor * config.noiseMultiplier + config.noiseOffset,
   );
   const voiced = rms >= threshold;
   // Learn the room only from frames that were below the current speech
@@ -67,7 +95,18 @@ export function advanceVoiceActivity(
   const state: VoiceActivityState = {
     elapsedMs: previous.elapsedMs + delta,
     noiseFloor,
-    voicedMs: voiced ? previous.voicedMs + delta : 0,
+    peakSignal: Math.max(previous.peakSignal, rms),
+    // Brief unvoiced gaps occur inside short words such as "yes" and "no".
+    // Preserve the candidate until the gap is sustained.
+    voicedMs: voiced
+      ? previous.voicedMs + delta
+      : previous.speechStarted
+        ? 0
+        : previous.candidateQuietMs + delta > config.speechGapMs
+          ? 0
+          : previous.voicedMs,
+    candidateQuietMs:
+      previous.speechStarted || voiced ? 0 : previous.candidateQuietMs + delta,
     quietMs: previous.speechStarted
       ? voiced
         ? 0
