@@ -28,6 +28,7 @@ const responseSchema = {
             "confirm",
             "reject",
             "cancel",
+            "end_conversation",
             "none",
           ],
         },
@@ -122,7 +123,7 @@ function systemPrompt(timeZone: string, context: ConversationContext) {
 
 The user's configured time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Resolve relative dates to date as YYYY-MM-DD and time as HH:MM in that time zone. Do not return an ISO timestamp. Never invent dates, times, contacts, or task details. Use null for every unchanged or unknown field.
 
-Choose new_task for a new reminder, follow_up when the user supplies requested details, update for a correction, confirm for yes/correct/that's right, reject for no/not right, cancel for cancel/never mind, and none when no supported intent is clear. A confirmation does not include task fields. A correction such as “make it 6 PM” only includes time. The active reminder is the only reminder this turn may change.
+Choose new_task for a new reminder, follow_up when the user supplies requested details, update for a correction, confirm for yes/correct/that's right, reject for no/not right, cancel for cancel/never mind, end_conversation for a clear conversational goodbye such as “that's all”, “nothing else”, “we're done”, or “bye”, and none when no supported intent is clear. A confirmation does not include task fields. A correction such as “make it 6 PM” only includes time. The active reminder is the only reminder this turn may change. During awaiting_confirmation, interpret “no” as reject, never end_conversation.
 
 CONVERSATION STAGE:\n${JSON.stringify(context.stage)}\n\nACTIVE REMINDER:\n${JSON.stringify(context.activeReminder)}\n\nCONVERSATION HISTORY:\n${JSON.stringify(context.history)}`;
 }
@@ -150,6 +151,7 @@ function parseIntent(value: unknown): IntentResult {
     kind !== "confirm" &&
     kind !== "reject" &&
     kind !== "cancel" &&
+    kind !== "end_conversation" &&
     kind !== "none"
   )
     throw new Error("Invalid intent kind.");

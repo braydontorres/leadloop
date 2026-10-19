@@ -8,7 +8,8 @@ export type ConversationStage =
   | "reading_back"
   | "awaiting_confirmation"
   | "saved"
-  | "canceled";
+  | "canceled"
+  | "ended";
 
 export type ActiveReminder = Pick<
   Task,
@@ -32,6 +33,7 @@ export type AssistantIntent = {
     | "confirm"
     | "reject"
     | "cancel"
+    | "end_conversation"
     | "none";
   fields: IntentFields;
 };
@@ -114,6 +116,7 @@ export function parseConversationContext(value: unknown): ConversationContext {
     "awaiting_confirmation",
     "saved",
     "canceled",
+    "ended",
   ];
   if (
     value.stage !== undefined &&
@@ -139,6 +142,26 @@ export function emptyConversationState(): ConversationState {
     cancellationIds: [],
     phase: "idle",
   };
+}
+
+/** A fresh session is only started after an explicit user action. */
+export function startConversation(state: ConversationState): ConversationState {
+  return {
+    ...emptyConversationState(),
+    lastSavedReminder: state.lastSavedReminder,
+  };
+}
+
+export function isConversationEndingPhrase(
+  user: string,
+  stage: ConversationStage,
+) {
+  // "No" at a read-back means the reminder needs a correction, never goodbye.
+  if (stage === "awaiting_confirmation" || stage === "reading_back")
+    return false;
+  return /^(?:that'?s all|no,? i'?m good|nothing else|we'?re done|bye|yeah,? that'?s everything)\b/i.test(
+    user.trim(),
+  );
 }
 
 function withHistory(
@@ -262,6 +285,26 @@ export function advanceConversation(args: {
 }): ConversationTransition {
   const { state, result, text: user, timeZone, createId } = args;
   const intent = result.intent;
+  if (
+    intent.kind === "end_conversation" &&
+    (state.stage === "awaiting_confirmation" ||
+      state.stage === "reading_back") &&
+    /^no\b/i.test(user.trim())
+  )
+    return withReply(state, user, "No problem. What should I change?", {
+      stage: "awaiting_details",
+    });
+  if (
+    (intent.kind === "end_conversation" ||
+      isConversationEndingPhrase(user, state.stage)) &&
+    state.stage !== "awaiting_confirmation" &&
+    state.stage !== "reading_back"
+  )
+    return withReply(state, user, "Sounds good! Have a great day.", {
+      stage: "ended",
+      activeReminder: null,
+      phase: "ended",
+    });
   if (intent.kind === "cancel")
     return withReply(
       state,

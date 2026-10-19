@@ -51,7 +51,7 @@ import {
   conversationContext,
   emptyConversationState,
   finishSpeech,
-  setConversationStage,
+  startConversation,
   spokenReminder,
   type IntentResult,
 } from "../lib/conversation-machine";
@@ -67,6 +67,16 @@ const nav = [
   { name: "People", icon: Users },
   { name: "Settings", icon: Settings },
 ] as const;
+const configuredInactivityTimeout = Number(
+  process.env.NEXT_PUBLIC_CONVERSATION_IDLE_TIMEOUT_MS,
+);
+// Configurable at build time, with a bounded default for the browser MVP.
+const INACTIVITY_TIMEOUT_MS =
+  Number.isFinite(configuredInactivityTimeout) &&
+  configuredInactivityTimeout >= 10_000 &&
+  configuredInactivityTimeout <= 300_000
+    ? configuredInactivityTimeout
+    : 45_000;
 export default function Page() {
   const [store, setStore] = useState<Store | null>(null),
     [screen, setScreen] = useState<Screen>("Home"),
@@ -87,13 +97,25 @@ export default function Page() {
     [isSpeaking, setIsSpeaking] = useState(false),
     [muted, setMuted] = useState(false),
     [retryAfterSeconds, setRetryAfterSeconds] = useState(0),
+    [sessionActive, setSessionActive] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingLimitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoListenRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inactivityRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const submissionRef = useRef(false);
+  const sessionActiveRef = useRef(false);
+  const conversationRef = useRef(conversation);
+  const storeRef = useRef<Store | null>(store);
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
+  useEffect(() => {
+    storeRef.current = store;
+  }, [store]);
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -178,6 +200,8 @@ export default function Page() {
     return () => {
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
       if (recordingLimitRef.current) clearTimeout(recordingLimitRef.current);
+      if (autoListenRef.current) clearTimeout(autoListenRef.current);
+      if (inactivityRef.current) clearTimeout(inactivityRef.current);
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
@@ -249,7 +273,11 @@ export default function Page() {
         }));
         setDraft(null);
         setAssistantMessage(reply);
-        speakReply(reply, Boolean(updatedReminder.due));
+        speakReply(
+          reply,
+          Boolean(updatedReminder.due),
+          sessionActiveRef.current,
+        );
         return;
       }
       setStore({
@@ -263,10 +291,21 @@ export default function Page() {
       setNotice((e as Error).message);
     }
   };
-  const speakReply = (reply: string, readsBack: boolean) => {
+  const speakReply = (
+    reply: string,
+    readsBack: boolean,
+    resumeListening = false,
+  ) => {
     const complete = () => {
       setIsSpeaking(false);
-      if (readsBack) setConversation((current) => finishSpeech(current));
+      if (readsBack) {
+        setConversation((current) => {
+          const next = finishSpeech(current);
+          conversationRef.current = next;
+          return next;
+        });
+      }
+      if (resumeListening && sessionActiveRef.current) scheduleAutoListen();
     };
     if (muted || typeof window === "undefined" || !window.speechSynthesis) {
       complete();
@@ -282,26 +321,40 @@ export default function Page() {
   const handleAssistantResult = (transcript: string, result: IntentResult) => {
     try {
       const transition = advanceConversation({
-        state: conversation,
+        state: conversationRef.current,
         result,
         text: transcript,
         timeZone: timezone,
         createId: () => crypto.randomUUID(),
       });
-      if (transition.savedTask)
+      if (transition.savedTask && storeRef.current)
         setStore({
-          ...store,
-          tasks: saveTask(store.tasks, transition.savedTask),
+          ...storeRef.current,
+          tasks: saveTask(storeRef.current.tasks, transition.savedTask),
         });
+      conversationRef.current = transition.state;
       setConversation(transition.state);
       setAssistantMessage(transition.reply);
-      speakReply(transition.reply, transition.state.stage === "reading_back");
+      if (transition.state.stage === "ended") {
+        stopConversationSession();
+        speakReply(transition.reply, false, false);
+      } else {
+        speakReply(
+          transition.reply,
+          transition.state.stage === "reading_back",
+          sessionActiveRef.current,
+        );
+      }
       if (transition.savedTask) setNotice("Reminder saved on this device.");
     } catch (error) {
       setVoiceError((error as Error).message);
     }
   };
   const requestInterpretation = async (thought: string) => {
+    if (!sessionActiveRef.current) {
+      setVoiceError("Start a conversation before sending a reply.");
+      return;
+    }
     if (submissionRef.current) return;
     submissionRef.current = true;
     setVoiceBusy(true);
@@ -314,7 +367,7 @@ export default function Page() {
         body: JSON.stringify({
           text: thought,
           timeZone: timezone,
-          context: conversationContext(conversation),
+          context: conversationContext(conversationRef.current),
         }),
       });
       const payload = (await response.json()) as {
@@ -337,13 +390,8 @@ export default function Page() {
       handleAssistantResult(payload.transcript, payload.result);
       setRetryAfterSeconds(0);
     } catch (error) {
+      // A failed request must not discard the pending field or confirmation.
       setVoiceError((error as Error).message);
-      setConversation((current) =>
-        setConversationStage(
-          current,
-          current.activeReminder ? "awaiting_details" : "idle",
-        ),
-      );
     } finally {
       submissionRef.current = false;
       setVoiceBusy(false);
@@ -365,7 +413,10 @@ export default function Page() {
       const form = new FormData();
       form.append("audio", audio, `leadloop-${Date.now()}.${format.extension}`);
       form.append("timeZone", timezone);
-      form.append("context", JSON.stringify(conversationContext(conversation)));
+      form.append(
+        "context",
+        JSON.stringify(conversationContext(conversationRef.current)),
+      );
       const response = await fetch("/api/voice", {
         method: "POST",
         body: form,
@@ -391,13 +442,8 @@ export default function Page() {
       handleAssistantResult(payload.transcript, payload.result);
       setRetryAfterSeconds(0);
     } catch (error) {
+      // Keep the authoritative draft intact so the user can safely retry.
       setVoiceError((error as Error).message);
-      setConversation((current) =>
-        setConversationStage(
-          current,
-          current.activeReminder ? "awaiting_details" : "idle",
-        ),
-      );
     } finally {
       submissionRef.current = false;
       setVoiceBusy(false);
@@ -409,10 +455,73 @@ export default function Page() {
     recordingTimerRef.current = null;
     recordingLimitRef.current = null;
   };
+  const clearSessionTimers = () => {
+    if (autoListenRef.current) clearTimeout(autoListenRef.current);
+    if (inactivityRef.current) clearTimeout(inactivityRef.current);
+    autoListenRef.current = null;
+    inactivityRef.current = null;
+  };
+  const stopConversationSession = () => {
+    clearSessionTimers();
+    sessionActiveRef.current = false;
+    setSessionActive(false);
+    discardRecordingRef.current = true;
+    if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    else {
+      recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
+      recorderRef.current = null;
+      setIsRecording(false);
+    }
+  };
+  const resetInactivityTimer = () => {
+    if (inactivityRef.current) clearTimeout(inactivityRef.current);
+    if (!sessionActiveRef.current) return;
+    inactivityRef.current = setTimeout(() => {
+      if (!sessionActiveRef.current) return;
+      stopConversationSession();
+      setConversation((current) => {
+        const next = {
+          ...current,
+          stage: "ended" as const,
+          activeReminder: null,
+        };
+        conversationRef.current = next;
+        return next;
+      });
+      const reply =
+        "I haven't heard anything, so I'll end the conversation here.";
+      setAssistantMessage(reply);
+      speakReply(reply, false, false);
+    }, INACTIVITY_TIMEOUT_MS);
+  };
+  const scheduleAutoListen = () => {
+    if (autoListenRef.current) clearTimeout(autoListenRef.current);
+    if (!sessionActiveRef.current) return;
+    resetInactivityTimer();
+    autoListenRef.current = setTimeout(() => {
+      autoListenRef.current = null;
+      if (sessionActiveRef.current) void startRecording();
+    }, 200);
+  };
+  const startConversationSession = () => {
+    if (sessionActiveRef.current) return;
+    clearSessionTimers();
+    const next = startConversation(conversationRef.current);
+    conversationRef.current = next;
+    setConversation(next);
+    setAssistantMessage("I'm listening.");
+    setText("");
+    setVoiceError("");
+    sessionActiveRef.current = true;
+    setSessionActive(true);
+    resetInactivityTimer();
+    void startRecording();
+  };
   const startRecording = async () => {
     setVoiceError("");
     setDemoMode(false);
-    if (isSpeaking || submissionRef.current) return;
+    if (!sessionActiveRef.current || isSpeaking || submissionRef.current)
+      return;
     if (
       !navigator.mediaDevices?.getUserMedia ||
       typeof MediaRecorder === "undefined"
@@ -424,7 +533,10 @@ export default function Page() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      setConversation((current) => setConversationStage(current, "listening"));
+      if (!sessionActiveRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const supportedType = selectRecorderMimeType(
         MediaRecorder.isTypeSupported.bind(MediaRecorder),
       );
@@ -451,15 +563,16 @@ export default function Page() {
           recorder.mimeType;
         const audio = new Blob(chunksRef.current, { type: recordedMimeType });
         recorderRef.current = null;
-        if (!discardRecordingRef.current && audio.size) {
+        if (
+          !discardRecordingRef.current &&
+          audio.size &&
+          sessionActiveRef.current
+        ) {
           if (!supportedAudioFormat(audio.type)) {
             setVoiceError(
               "This browser returned an unsupported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
             );
           } else {
-            setConversation((current) =>
-              setConversationStage(current, "processing"),
-            );
             void submitAudio(audio);
           }
         }
@@ -477,6 +590,7 @@ export default function Page() {
         );
         recorder.stop();
       }, 90_000);
+      resetInactivityTimer();
     } catch (error) {
       const denied = (error as DOMException).name === "NotAllowedError";
       setVoiceError(
@@ -692,12 +806,13 @@ export default function Page() {
                   <button
                     className="mic-button"
                     aria-label={
-                      isRecording ? "Stop recording" : "Start voice recording"
+                      sessionActive
+                        ? "Open active conversation"
+                        : "Start conversation"
                     }
                     onClick={() => {
                       go("Capture");
-                      if (isRecording) stopRecording();
-                      else void startRecording();
+                      if (!sessionActive) startConversationSession();
                     }}
                   >
                     {isRecording ? (
@@ -708,13 +823,17 @@ export default function Page() {
                   </button>
                   <strong>
                     {isRecording
-                      ? "Recording… tap to stop"
-                      : "Capture a thought"}
+                      ? "Listening…"
+                      : sessionActive
+                        ? "Conversation active"
+                        : "Start a conversation"}
                   </strong>
                   <span>
                     {isRecording
                       ? `${recordingSeconds}s of 90s`
-                      : "Voice or text"}
+                      : sessionActive
+                        ? "LeadLoop takes the next turn"
+                        : "Voice or text"}
                   </span>
                   <div className="wave" aria-hidden="true">
                     {[8, 15, 23, 12, 31, 19, 37, 24, 16, 28, 12, 20, 8].map(
@@ -964,26 +1083,36 @@ export default function Page() {
                     </div>
                   </div>
                   <div className="recording-controls">
-                    <button
-                      className={`record-button ${isRecording ? "recording" : ""}`}
-                      type="button"
-                      aria-pressed={isRecording}
-                      disabled={voiceBusy || isSpeaking}
-                      onClick={() =>
-                        isRecording ? stopRecording() : void startRecording()
-                      }
-                    >
-                      {isRecording ? (
-                        <Square size={18} fill="currentColor" />
-                      ) : (
-                        <Mic size={19} />
-                      )}
-                      {isRecording
-                        ? `Stop recording · ${recordingSeconds}s`
-                        : isSpeaking
-                          ? "LeadLoop is speaking"
-                          : "Press to talk"}
-                    </button>
+                    {!sessionActive ? (
+                      <button
+                        className="record-button"
+                        type="button"
+                        onClick={startConversationSession}
+                      >
+                        <Mic size={19} /> Start Conversation
+                      </button>
+                    ) : (
+                      <button
+                        className={`record-button ${isRecording ? "recording" : ""}`}
+                        type="button"
+                        aria-pressed={isRecording}
+                        disabled={!isRecording}
+                        onClick={stopRecording}
+                      >
+                        {isRecording ? (
+                          <Square size={18} fill="currentColor" />
+                        ) : (
+                          <Mic size={19} />
+                        )}
+                        {isRecording
+                          ? `Stop speaking · ${recordingSeconds}s`
+                          : isSpeaking
+                            ? "LeadLoop is speaking"
+                            : voiceBusy
+                              ? "Understanding your thought…"
+                              : "Waiting for LeadLoop"}
+                      </button>
+                    )}
                     {isRecording && (
                       <button
                         className="button secondary compact"
@@ -1014,8 +1143,9 @@ export default function Page() {
                     />
                   </label>
                   <p className="input-note">
-                    Push to talk: recording stops before LeadLoop replies, so it
-                    never records its own voice.
+                    Start once, then LeadLoop alternates speaking and listening.
+                    Recording stops before every reply, so it never records its
+                    own voice.
                   </p>
                   <div className="capture-help">
                     <ShieldCheck size={18} />
@@ -1044,12 +1174,35 @@ export default function Page() {
                   )}
                   <button
                     className="button primary wide"
-                    disabled={!text.trim() || voiceBusy || isRecording}
+                    disabled={
+                      !text.trim() || !sessionActive || voiceBusy || isRecording
+                    }
                     onClick={() => void requestInterpretation(text.trim())}
                   >
                     {voiceBusy ? "Working…" : "Send reply"}{" "}
                     <ArrowRight size={17} />
                   </button>
+                  {sessionActive && (
+                    <button
+                      className="button secondary wide"
+                      type="button"
+                      onClick={() => {
+                        stopConversationSession();
+                        setConversation((current) => {
+                          const next = {
+                            ...current,
+                            stage: "ended" as const,
+                            activeReminder: null,
+                          };
+                          conversationRef.current = next;
+                          return next;
+                        });
+                        setAssistantMessage("Conversation ended.");
+                      }}
+                    >
+                      <Square size={15} /> End Conversation
+                    </button>
+                  )}
                 </section>
                 <aside className="capture-aside">
                   <span className="pill">
@@ -1105,9 +1258,13 @@ export default function Page() {
                         {assistantMessage || "I’m ready when you are."}
                       </strong>
                       <p>
-                        {isSpeaking
-                          ? "Speaking now — recording is paused."
-                          : "Press to talk when you’re ready for the next turn."}
+                        {conversation.stage === "ended"
+                          ? "Conversation ended — microphone off."
+                          : isSpeaking
+                            ? "Speaking now — recording is paused."
+                            : sessionActive
+                              ? "LeadLoop will listen again after this turn."
+                              : "Conversation ended — microphone off."}
                       </p>
                     </div>
                   </div>
@@ -1146,7 +1303,10 @@ export default function Page() {
                         ) {
                           window.speechSynthesis?.cancel();
                           setIsSpeaking(false);
-                          setConversation(emptyConversationState());
+                          stopConversationSession();
+                          const next = emptyConversationState();
+                          conversationRef.current = next;
+                          setConversation(next);
                           setAssistantMessage("");
                           setText("");
                         }
@@ -1253,17 +1413,15 @@ export default function Page() {
                       );
                     })}
                   </div>
-                  <button
-                    className="continue-speaking"
-                    onClick={() => {
-                      setText("");
-                      setVoiceError("");
-                      void startRecording();
-                    }}
-                    disabled={voiceBusy || isRecording}
-                  >
-                    <RotateCcw size={16} /> Continue speaking
-                  </button>
+                  {!sessionActive && (
+                    <button
+                      className="continue-speaking"
+                      onClick={startConversationSession}
+                      disabled={voiceBusy}
+                    >
+                      <RotateCcw size={16} /> Start Conversation
+                    </button>
+                  )}
                   <button
                     className="review-dismiss"
                     onClick={() => {
@@ -1272,7 +1430,10 @@ export default function Page() {
                           "Discard unfinished reminders and start a fresh capture session?",
                         )
                       ) {
-                        setConversation(emptyConversationState());
+                        stopConversationSession();
+                        const next = emptyConversationState();
+                        conversationRef.current = next;
+                        setConversation(next);
                         setAssistantMessage("");
                         setText("");
                       }

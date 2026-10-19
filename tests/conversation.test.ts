@@ -185,3 +185,39 @@ test("G: read-back waits for speech completion before accepting confirmation", (
   );
   assert.equal(afterSpeech.savedTask?.title, "call James");
 });
+
+test("a spoken goodbye ends a saved session, while no at confirmation asks for a correction", () => {
+  ids = 0;
+  const ready = turn(
+    emptyConversationState(),
+    {
+      kind: "new_task",
+      fields: {
+        ...fields,
+        title: "talk to Brad",
+        date: "2026-10-20",
+        time: "15:00",
+      },
+    },
+    "Remind me to talk to Brad tomorrow at 3 PM.",
+  );
+  const no = turn(
+    finishSpeech(ready.state),
+    { kind: "end_conversation", fields },
+    "No, I'm good.",
+  );
+  assert.equal(no.state.stage, "awaiting_details");
+  const saved = turn(
+    finishSpeech(ready.state),
+    { kind: "confirm", fields },
+    "Yes.",
+  );
+  const ended = turn(
+    saved.state,
+    { kind: "none", fields },
+    "Yeah, that's everything.",
+  );
+  assert.equal(ended.state.stage, "ended");
+  assert.equal(ended.state.activeReminder, null);
+  assert.match(ended.reply, /Have a great day/);
+});
