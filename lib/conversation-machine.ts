@@ -4,10 +4,13 @@ import {
   deriveDateConstraint,
   deterministicDateFromText,
   isMeaningfulReminderTitle,
+  mergeDateConstraints,
   matchesDateConstraint,
   mentionsExplicitTime,
   mentionsUnambiguousDate,
+  resolveDateConstraint,
   type DateConstraint,
+  type WeekdayOccurrence,
 } from "./reminder-details";
 
 export type ConversationStage =
@@ -140,7 +143,23 @@ function dateConstraint(value: unknown): DateConstraint {
     year: part("year", 2000, 9999),
     month: part("month", 1, 12),
     weekday: part("weekday", 0, 6),
+    occurrence: dateConstraintOccurrence(value.occurrence),
   };
+}
+
+function dateConstraintOccurrence(value: unknown): WeekdayOccurrence | null {
+  if (value === undefined || value === null) return null;
+  if (
+    value === 1 ||
+    value === 2 ||
+    value === 3 ||
+    value === 4 ||
+    value === 5 ||
+    value === "last" ||
+    value === "second_to_last"
+  )
+    return value;
+  throw new Error("Invalid reminder date constraint.");
 }
 
 export function parseConversationContext(value: unknown): ConversationContext {
@@ -255,11 +274,35 @@ function applyFields(
   let pendingDateConstraint = fields.clearDue
     ? null
     : current.pendingDateConstraint;
-  let invalidDateConstraint = false;
+  let dateConstraintError: string | null = null;
   if (dateConstraint) {
-    pendingDateConstraint = dateConstraint;
+    const mergedConstraint = mergeDateConstraints(
+      pendingDateConstraint,
+      dateConstraint,
+    );
+    if (!mergedConstraint) throw new Error("Invalid reminder date constraint.");
+    pendingDateConstraint = mergedConstraint;
     pendingDate = null;
     due = "";
+    const resolution = resolveDateConstraint(mergedConstraint);
+    if (resolution.status === "resolved") {
+      pendingDate = resolution.date;
+      pendingDateConstraint = null;
+    } else if (resolution.status === "unavailable") {
+      const weekday = new Intl.DateTimeFormat("en-US", {
+        weekday: "long",
+        timeZone: "UTC",
+      }).format(new Date(Date.UTC(2023, 0, 1 + mergedConstraint.weekday!)));
+      const countWord =
+        ["zero", "one", "two", "three", "four", "five"][
+          resolution.occurrenceCount
+        ] ?? String(resolution.occurrenceCount);
+      const ordinalWord =
+        ["zeroth", "first", "second", "third", "fourth", "fifth"][
+          resolution.occurrenceCount
+        ] ?? `${resolution.occurrenceCount}th`;
+      dateConstraintError = `That month only has ${countWord} ${weekday}s. Would you like the ${ordinalWord} ${weekday} instead?`;
+    }
   }
   if (fields.date !== null || fields.time !== null) {
     const previous = due
@@ -281,7 +324,8 @@ function applyFields(
       fields.date !== null &&
       !matchesDateConstraint(fields.date, pendingDateConstraint)
     ) {
-      invalidDateConstraint = true;
+      const question = dateConstraintQuestion(pendingDateConstraint!);
+      dateConstraintError = `That date doesn't match ${question.slice(6)}. ${question}?`;
     } else if (fields.date !== null) {
       pendingDate = fields.date;
       pendingDateConstraint = null;
@@ -311,7 +355,7 @@ function applyFields(
       pendingTime,
       pendingDateConstraint,
     },
-    invalidDateConstraint,
+    dateConstraintError,
   };
 }
 
@@ -331,8 +375,10 @@ export function spokenReminder(reminder: ActiveReminder, timeZone: string) {
 function nextReply(
   reminder: ActiveReminder,
   timeZone: string,
-  invalidDateConstraint = false,
+  dateConstraintError: string | null = null,
 ) {
+  if (dateConstraintError)
+    return { stage: "awaiting_details" as const, reply: dateConstraintError };
   if (!reminder.title.trim())
     return {
       stage: "awaiting_details" as const,
@@ -342,8 +388,8 @@ function nextReply(
     const dateQuestion = dateConstraintQuestion(reminder.pendingDateConstraint);
     return {
       stage: "awaiting_details" as const,
-      reply: invalidDateConstraint
-        ? `That date doesn't match ${dateQuestion.slice(6)}. ${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`
+      reply: dateConstraintError
+        ? `${dateConstraintError} ${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`
         : `${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`,
     };
   }
@@ -385,7 +431,7 @@ export function advanceConversation(args: {
   now?: Date;
 }): ConversationTransition {
   const { state, result, text: user, timeZone, createId, now } = args;
-  const intent = result.intent;
+  let intent = result.intent;
   if (
     intent.kind === "end_conversation" &&
     (state.stage === "awaiting_confirmation" ||
@@ -454,6 +500,26 @@ export function advanceConversation(args: {
       stage: "awaiting_details",
     });
   }
+  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
+  if (
+    intent.kind === "none" &&
+    derivedConstraint &&
+    (state.activeReminder ||
+      derivedConstraint.month !== null ||
+      derivedConstraint.weekday !== null)
+  ) {
+    intent = {
+      kind: "follow_up",
+      fields: {
+        title: null,
+        person: null,
+        date: null,
+        time: null,
+        notes: null,
+        clearDue: false,
+      },
+    };
+  }
   if (intent.kind === "none")
     return withReply(
       state,
@@ -464,7 +530,6 @@ export function advanceConversation(args: {
       { stage: state.activeReminder ? "awaiting_details" : "idle" },
     );
 
-  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
   const activeConstraint = state.activeReminder?.pendingDateConstraint ?? null;
   const deterministicDate = deterministicDateFromText(
     user,
@@ -501,7 +566,7 @@ export function advanceConversation(args: {
   const next = nextReply(
     applied.reminder,
     timeZone,
-    applied.invalidDateConstraint,
+    applied.dateConstraintError,
   );
   return withReply(state, user, next.reply, {
     stage: next.stage,

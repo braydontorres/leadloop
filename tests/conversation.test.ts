@@ -56,6 +56,7 @@ test("partial month and weekday never invent a title, date, or time", () => {
     year: 2027,
     month: 7,
     weekday: 6,
+    occurrence: null,
   });
   assert.match(partial.reply, /What would you like me to remind you about/);
 });
@@ -87,6 +88,7 @@ test("partial date constraints survive task details and validate the exact day",
     year: 2027,
     month: 7,
     weekday: 6,
+    occurrence: null,
   });
   assert.match(task.reply, /Which Saturday in July, and what time/);
 
@@ -175,8 +177,62 @@ test("an impossible date for a pending weekday asks for clarification", () => {
     year: 2027,
     month: 7,
     weekday: 6,
+    occurrence: null,
   });
   assert.match(invalid.reply, /doesn't match Saturday in July/);
+});
+
+test("an ordinal follow-up resolves the established month and weekday without AI date guessing", () => {
+  ids = 0;
+  const initial = turn(
+    emptyConversationState(),
+    { kind: "new_task", fields: { ...fields, title: "Call Brad" } },
+    "I want a reminder to call Brad on a Thursday next July.",
+  );
+  assert.match(initial.reply, /Which Thursday in July/);
+  assert.deepEqual(initial.state.activeReminder?.pendingDateConstraint, {
+    year: 2027,
+    month: 7,
+    weekday: 4,
+    occurrence: null,
+  });
+
+  const fourth = turn(
+    initial.state,
+    {
+      kind: "none",
+      fields,
+    },
+    "The fourth one.",
+  );
+  assert.equal(fourth.state.activeReminder?.pendingDate, "2027-07-22");
+  assert.equal(fourth.state.activeReminder?.pendingDateConstraint, null);
+  assert.match(fourth.reply, /What time/);
+
+  const timed = turn(
+    fourth.state,
+    { kind: "follow_up", fields: { ...fields, time: "15:00" } },
+    "3 PM.",
+  );
+  assert.match(timed.reply, /Thursday, July 22, 2027.*3:00 PM/);
+});
+
+test("a nonexistent ordinal weekday asks for clarification without substituting a date", () => {
+  ids = 0;
+  const invalid = turn(
+    emptyConversationState(),
+    { kind: "new_task", fields: { ...fields, title: "Call Brad" } },
+    "Remind me to call Brad on the fifth Monday in February 2027.",
+  );
+  assert.equal(invalid.state.activeReminder?.due, "");
+  assert.equal(invalid.state.activeReminder?.pendingDate, null);
+  assert.deepEqual(invalid.state.activeReminder?.pendingDateConstraint, {
+    year: 2027,
+    month: 2,
+    weekday: 1,
+    occurrence: 5,
+  });
+  assert.match(invalid.reply, /only has four Mondays.*fourth Monday/i);
 });
 
 test("A: missing time asks once, reads back, then saves exactly one task", () => {
