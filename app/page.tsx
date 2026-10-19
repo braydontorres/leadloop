@@ -113,10 +113,10 @@ export default function Page() {
     [retryAfterSeconds, setRetryAfterSeconds] = useState(0),
     [sessionActive, setSessionActive] = useState(false),
     [speechDetected, setSpeechDetected] = useState(false),
+    [microphoneStarting, setMicrophoneStarting] = useState(false),
     [noiseResistant, setNoiseResistant] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingLimitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -137,6 +137,17 @@ export default function Page() {
   const submissionRef = useRef(false);
   const isSpeakingRef = useRef(false);
   const voiceBusyRef = useRef(false);
+  const microphoneStartingRef = useRef(false);
+  const nextTurnIdRef = useRef(0);
+  const activeTurnIdRef = useRef<number | null>(null);
+  const nextMicrophoneRequestIdRef = useRef(0);
+  const activeMicrophoneRequestIdRef = useRef(0);
+  const nextSessionIdRef = useRef(0);
+  const activeSessionIdRef = useRef(0);
+  const speechPlaybackIdRef = useRef(0);
+  const nextRequestIdRef = useRef(0);
+  const activeRequestIdRef = useRef(0);
+  const requestAbortRef = useRef<AbortController | null>(null);
   const turnTimingRef = useRef<{
     recordingStartedAt?: number;
     speechDetectedAt?: number;
@@ -239,6 +250,7 @@ export default function Page() {
       if (recordingLimitRef.current) clearTimeout(recordingLimitRef.current);
       if (autoListenRef.current) clearTimeout(autoListenRef.current);
       if (inactivityRef.current) clearTimeout(inactivityRef.current);
+      requestAbortRef.current?.abort();
       if (analysisFrameRef.current)
         cancelAnimationFrame(analysisFrameRef.current);
       analysisSourceRef.current?.disconnect();
@@ -355,20 +367,42 @@ export default function Page() {
       JSON.stringify({ event, ...values }),
     );
   };
+  const logVoiceTurn = (
+    turnId: number | null,
+    stage: string,
+    values: Record<string, number | string> = {},
+  ) => {
+    console.info(
+      "[LeadLoop voice turn]",
+      JSON.stringify({ turnId: turnId ?? "text", stage, ...values }),
+    );
+  };
+  const cancelSpeechPlayback = () => {
+    speechPlaybackIdRef.current += 1;
+    window.speechSynthesis?.cancel();
+    isSpeakingRef.current = false;
+    setIsSpeaking(false);
+  };
   const speakReply = (
     reply: string,
     readsBack: boolean,
     resumeListening = false,
+    turnId: number | null = null,
   ) => {
     const preparedAt = performance.now();
+    const playbackId = ++speechPlaybackIdRef.current;
     let completed = false;
-    const complete = () => {
-      if (completed) return;
+    let speechStarted = false;
+    let playbackWatchdog: ReturnType<typeof setTimeout> | null = null;
+    const complete = (reason = "finished") => {
+      if (completed || playbackId !== speechPlaybackIdRef.current) return;
       completed = true;
+      if (playbackWatchdog) clearTimeout(playbackWatchdog);
       const completedAt = performance.now();
       isSpeakingRef.current = false;
       setIsSpeaking(false);
-      logVoiceTiming("speech_complete", {
+      logVoiceTurn(turnId, "speech_playback_finished", {
+        reason,
         playbackMs: Math.round(completedAt - preparedAt),
       });
       if (readsBack) {
@@ -379,25 +413,54 @@ export default function Page() {
         });
       }
       if (resumeListening && sessionActiveRef.current)
-        scheduleAutoListen(completedAt);
+        scheduleAutoListen(completedAt, turnId);
     };
     if (muted || typeof window === "undefined" || !window.speechSynthesis) {
-      complete();
+      complete(muted ? "muted" : "unavailable");
       return;
     }
+    // Invalidate callbacks from a previous utterance before canceling it. A
+    // canceled utterance may still fire onerror asynchronously.
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(reply);
-    utterance.onend = complete;
-    utterance.onerror = complete;
+    utterance.onstart = () => {
+      if (playbackId !== speechPlaybackIdRef.current) return;
+      speechStarted = true;
+      logVoiceTurn(turnId, "speech_playback_started", {
+        preparationMs: Math.round(performance.now() - preparedAt),
+      });
+    };
+    utterance.onend = () => complete("finished");
+    utterance.onerror = () => {
+      if (playbackId !== speechPlaybackIdRef.current) return;
+      setVoiceError(
+        "LeadLoop couldn't play that response aloud. The response is shown below; you can replay it or continue speaking.",
+      );
+      complete("error");
+    };
     isSpeakingRef.current = true;
     setIsSpeaking(true);
-    logVoiceTiming("speech_started", {
-      preparationMs: Math.round(performance.now() - preparedAt),
-      replyLength: reply.length,
-    });
-    window.speechSynthesis.speak(utterance);
+    playbackWatchdog = setTimeout(() => {
+      if (speechStarted || playbackId !== speechPlaybackIdRef.current) return;
+      setVoiceError(
+        "LeadLoop couldn't start audio playback. The response is shown below; you can replay it or continue speaking.",
+      );
+      complete("not_started");
+    }, 1_500);
+    try {
+      window.speechSynthesis.speak(utterance);
+    } catch {
+      setVoiceError(
+        "LeadLoop couldn't start audio playback. The response is shown below; you can replay it or continue speaking.",
+      );
+      complete("exception");
+    }
   };
-  const handleAssistantResult = (transcript: string, result: IntentResult) => {
+  const handleAssistantResult = (
+    transcript: string,
+    result: IntentResult,
+    turnId: number | null = null,
+  ) => {
     try {
       const transition = advanceConversation({
         state: conversationRef.current,
@@ -414,14 +477,16 @@ export default function Page() {
       conversationRef.current = transition.state;
       setConversation(transition.state);
       setAssistantMessage(transition.reply);
+      logVoiceTurn(turnId, "conversation_updated");
       if (transition.state.stage === "ended") {
         stopConversationSession();
-        speakReply(transition.reply, false, false);
+        speakReply(transition.reply, false, false, turnId);
       } else {
         speakReply(
           transition.reply,
           transition.state.stage === "reading_back",
           sessionActiveRef.current,
+          turnId,
         );
       }
       if (transition.savedTask) setNotice("Reminder saved on this device.");
@@ -434,7 +499,15 @@ export default function Page() {
       setVoiceError("Start a conversation before sending a reply.");
       return;
     }
-    if (submissionRef.current) return;
+    if (submissionRef.current) {
+      setVoiceError("LeadLoop is still processing the previous turn.");
+      return;
+    }
+    const sessionId = activeSessionIdRef.current;
+    const requestId = ++nextRequestIdRef.current;
+    activeRequestIdRef.current = requestId;
+    const abortController = new AbortController();
+    requestAbortRef.current = abortController;
     submissionRef.current = true;
     voiceBusyRef.current = true;
     setVoiceBusy(true);
@@ -451,6 +524,7 @@ export default function Page() {
           timeZone: timezone,
           context: conversationContext(conversationRef.current),
         }),
+        signal: abortController.signal,
       });
       const payload = (await response.json()) as {
         transcript?: string;
@@ -459,6 +533,16 @@ export default function Page() {
         demoMode?: boolean;
         retryAfterSeconds?: number;
       };
+      if (
+        !sessionActiveRef.current ||
+        activeSessionIdRef.current !== sessionId ||
+        activeRequestIdRef.current !== requestId
+      ) {
+        logVoiceTurn(null, "interpretation_discarded", {
+          reason: "session_changed",
+        });
+        return;
+      }
       if (!response.ok || !payload.result || !payload.transcript) {
         setDemoMode(Boolean(payload.demoMode));
         if (payload.retryAfterSeconds)
@@ -470,6 +554,12 @@ export default function Page() {
         );
       }
       handleAssistantResult(payload.transcript, payload.result);
+      logVoiceTurn(null, "interpretation_complete", {
+        requestMs: Math.round(
+          performance.now() -
+            (turnTimingRef.current.requestStartedAt ?? performance.now()),
+        ),
+      });
       logVoiceTiming("text_interpretation_complete", {
         requestMs: Math.round(
           performance.now() -
@@ -479,17 +569,38 @@ export default function Page() {
       setRetryAfterSeconds(0);
     } catch (error) {
       // A failed request must not discard the pending field or confirmation.
-      setVoiceError((error as Error).message);
-      resumeAfterFailure = sessionActiveRef.current;
+      if (
+        activeSessionIdRef.current === sessionId &&
+        activeRequestIdRef.current === requestId
+      ) {
+        setVoiceError((error as Error).message);
+        resumeAfterFailure = sessionActiveRef.current;
+      }
     } finally {
+      if (activeRequestIdRef.current !== requestId) return;
+      requestAbortRef.current = null;
       submissionRef.current = false;
       voiceBusyRef.current = false;
       setVoiceBusy(false);
       if (resumeAfterFailure) scheduleAutoListen(performance.now());
     }
   };
-  const submitAudio = async (audio: Blob) => {
-    if (submissionRef.current) return;
+  const submitAudio = async (
+    audio: Blob,
+    turnId: number,
+    sessionId: number,
+  ) => {
+    if (submissionRef.current) {
+      logVoiceTurn(turnId, "submission_rejected", { reason: "busy" });
+      setVoiceError(
+        "LeadLoop is still processing the previous turn. Please try again.",
+      );
+      return;
+    }
+    const requestId = ++nextRequestIdRef.current;
+    activeRequestIdRef.current = requestId;
+    const abortController = new AbortController();
+    requestAbortRef.current = abortController;
     submissionRef.current = true;
     voiceBusyRef.current = true;
     setVoiceBusy(true);
@@ -514,6 +625,7 @@ export default function Page() {
       const response = await fetch("/api/voice", {
         method: "POST",
         body: form,
+        signal: abortController.signal,
       });
       const payload = (await response.json()) as {
         transcript?: string;
@@ -522,6 +634,16 @@ export default function Page() {
         demoMode?: boolean;
         retryAfterSeconds?: number;
       };
+      if (
+        !sessionActiveRef.current ||
+        activeSessionIdRef.current !== sessionId ||
+        activeRequestIdRef.current !== requestId
+      ) {
+        logVoiceTurn(turnId, "response_discarded", {
+          reason: "session_changed",
+        });
+        return;
+      }
       if (!response.ok || !payload.result || !payload.transcript) {
         setDemoMode(Boolean(payload.demoMode));
         if (payload.retryAfterSeconds)
@@ -533,7 +655,19 @@ export default function Page() {
         );
       }
       setText(payload.transcript);
-      handleAssistantResult(payload.transcript, payload.result);
+      logVoiceTurn(turnId, "transcription_complete", {
+        requestMs: Math.round(
+          performance.now() -
+            (turnTimingRef.current.requestStartedAt ?? performance.now()),
+        ),
+      });
+      handleAssistantResult(payload.transcript, payload.result, turnId);
+      logVoiceTurn(turnId, "interpretation_complete", {
+        requestMs: Math.round(
+          performance.now() -
+            (turnTimingRef.current.requestStartedAt ?? performance.now()),
+        ),
+      });
       logVoiceTiming("voice_request_complete", {
         uploadAndAiMs: Math.round(
           performance.now() -
@@ -543,9 +677,16 @@ export default function Page() {
       setRetryAfterSeconds(0);
     } catch (error) {
       // Keep the authoritative draft intact so the user can safely retry.
-      setVoiceError((error as Error).message);
-      resumeAfterFailure = sessionActiveRef.current;
+      if (
+        activeSessionIdRef.current === sessionId &&
+        activeRequestIdRef.current === requestId
+      ) {
+        setVoiceError((error as Error).message);
+        resumeAfterFailure = sessionActiveRef.current;
+      }
     } finally {
+      if (activeRequestIdRef.current !== requestId) return;
+      requestAbortRef.current = null;
       submissionRef.current = false;
       voiceBusyRef.current = false;
       setVoiceBusy(false);
@@ -572,12 +713,15 @@ export default function Page() {
   };
   const finishRecording = (
     reason: "manual" | "silence" | "no_speech" | "limit" | "cancel",
+    turnId = activeTurnIdRef.current,
   ) => {
+    if (turnId === null || activeTurnIdRef.current !== turnId) return;
     if (recordingFinalizedRef.current) return;
     recordingFinalizedRef.current = true;
     recordingEndReasonRef.current = reason;
     turnTimingRef.current.finalizedAt = performance.now();
-    logVoiceTiming("recording_finalized", {
+    logVoiceTurn(turnId, "recording_finalized", {
+      reason,
       endOfSpeechSilenceMs: Math.round(voiceActivityRef.current.quietMs),
       recordingMs: turnTimingRef.current.recordingStartedAt
         ? Math.round(
@@ -591,8 +735,17 @@ export default function Page() {
     if (reason === "cancel" || reason === "no_speech")
       discardRecordingRef.current = true;
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
+    else {
+      // getUserMedia may still be resolving. Invalidating this id makes its
+      // late result release its stream instead of starting a stale recorder.
+      activeTurnIdRef.current = null;
+      activeMicrophoneRequestIdRef.current =
+        ++nextMicrophoneRequestIdRef.current;
+      microphoneStartingRef.current = false;
+      setMicrophoneStarting(false);
+    }
   };
-  const startVoiceActivityDetection = (stream: MediaStream) => {
+  const startVoiceActivityDetection = (stream: MediaStream, turnId: number) => {
     const AudioContextConstructor =
       window.AudioContext ||
       (
@@ -623,7 +776,12 @@ export default function Page() {
       let previousTime = performance.now();
       const samples = new Uint8Array(analyser.fftSize);
       const tick = (now: number) => {
-        if (!sessionActiveRef.current || recordingFinalizedRef.current) return;
+        if (
+          !sessionActiveRef.current ||
+          activeTurnIdRef.current !== turnId ||
+          recordingFinalizedRef.current
+        )
+          return;
         analyser.getByteTimeDomainData(samples);
         const update = advanceVoiceActivity(
           voiceActivityRef.current,
@@ -645,7 +803,7 @@ export default function Page() {
         if (update.event === "speech_started") {
           turnTimingRef.current.speechDetectedAt = performance.now();
           setSpeechDetected(true);
-          logVoiceTiming("speech_detected", {
+          logVoiceTurn(turnId, "speech_detected", {
             waitForSpeechMs: turnTimingRef.current.recordingStartedAt
               ? Math.round(
                   turnTimingRef.current.speechDetectedAt -
@@ -655,14 +813,14 @@ export default function Page() {
           });
         }
         if (update.event === "speech_ended") {
-          finishRecording("silence");
+          finishRecording("silence", turnId);
           return;
         }
         if (update.event === "no_speech") {
           setVoiceError(
             "I didn't hear speech. I'll keep listening after this.",
           );
-          finishRecording("no_speech");
+          finishRecording("no_speech", turnId);
           return;
         }
         analysisFrameRef.current = requestAnimationFrame(tick);
@@ -682,13 +840,25 @@ export default function Page() {
   const stopConversationSession = () => {
     clearSessionTimers();
     sessionActiveRef.current = false;
+    activeSessionIdRef.current = ++nextSessionIdRef.current;
     setSessionActive(false);
-    window.speechSynthesis?.cancel();
-    isSpeakingRef.current = false;
-    setIsSpeaking(false);
+    requestAbortRef.current?.abort();
+    requestAbortRef.current = null;
+    activeRequestIdRef.current = 0;
+    submissionRef.current = false;
+    voiceBusyRef.current = false;
+    setVoiceBusy(false);
+    cancelSpeechPlayback();
     discardRecordingRef.current = true;
-    if (recorderRef.current?.state === "recording") finishRecording("cancel");
+    const turnId = activeTurnIdRef.current;
+    if (recorderRef.current?.state === "recording")
+      finishRecording("cancel", turnId);
     else {
+      activeTurnIdRef.current = null;
+      activeMicrophoneRequestIdRef.current =
+        ++nextMicrophoneRequestIdRef.current;
+      microphoneStartingRef.current = false;
+      setMicrophoneStarting(false);
       stopVoiceActivityDetection();
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
       recorderRef.current = null;
@@ -716,21 +886,27 @@ export default function Page() {
       speakReply(reply, false, false);
     }, INACTIVITY_TIMEOUT_MS);
   };
-  const scheduleAutoListen = (replyCompletedAt = performance.now()) => {
+  const scheduleAutoListen = (
+    replyCompletedAt = performance.now(),
+    turnId: number | null = null,
+    sessionId = activeSessionIdRef.current,
+  ) => {
     if (autoListenRef.current) clearTimeout(autoListenRef.current);
-    if (!sessionActiveRef.current) return;
+    if (!sessionActiveRef.current || activeSessionIdRef.current !== sessionId)
+      return;
     resetInactivityTimer();
     autoListenRef.current = setTimeout(() => {
       autoListenRef.current = null;
-      if (!sessionActiveRef.current) return;
+      if (!sessionActiveRef.current || activeSessionIdRef.current !== sessionId)
+        return;
       if (isSpeakingRef.current || voiceBusyRef.current) {
-        scheduleAutoListen(replyCompletedAt);
+        scheduleAutoListen(replyCompletedAt, turnId, sessionId);
         return;
       }
-      logVoiceTiming("microphone_resume", {
+      logVoiceTurn(turnId, "listening_resumed", {
         afterReplyMs: Math.round(performance.now() - replyCompletedAt),
       });
-      void startRecording();
+      void startRecording(sessionId);
     }, 50);
   };
   const startConversationSession = () => {
@@ -743,18 +919,21 @@ export default function Page() {
     setText("");
     setVoiceError("");
     sessionActiveRef.current = true;
+    activeSessionIdRef.current = ++nextSessionIdRef.current;
     setSessionActive(true);
     resetInactivityTimer();
-    void startRecording();
+    void startRecording(activeSessionIdRef.current);
   };
-  const startRecording = async () => {
+  const startRecording = async (sessionId = activeSessionIdRef.current) => {
     setVoiceError("");
     setDemoMode(false);
     if (
       !sessionActiveRef.current ||
+      activeSessionIdRef.current !== sessionId ||
       isSpeakingRef.current ||
       voiceBusyRef.current ||
       submissionRef.current ||
+      microphoneStartingRef.current ||
       recorderRef.current?.state === "recording"
     )
       return;
@@ -767,6 +946,13 @@ export default function Page() {
       );
       return;
     }
+    const turnId = ++nextTurnIdRef.current;
+    const microphoneRequestId = ++nextMicrophoneRequestIdRef.current;
+    activeTurnIdRef.current = turnId;
+    activeMicrophoneRequestIdRef.current = microphoneRequestId;
+    microphoneStartingRef.current = true;
+    setMicrophoneStarting(true);
+    logVoiceTurn(turnId, "microphone_request_started", { sessionId });
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -777,8 +963,18 @@ export default function Page() {
           autoGainControl: false,
         },
       });
-      if (!sessionActiveRef.current) {
+      if (
+        !sessionActiveRef.current ||
+        activeSessionIdRef.current !== sessionId ||
+        activeTurnIdRef.current !== turnId ||
+        activeMicrophoneRequestIdRef.current !== microphoneRequestId ||
+        isSpeakingRef.current ||
+        voiceBusyRef.current
+      ) {
         stream.getTracks().forEach((track) => track.stop());
+        logVoiceTurn(turnId, "microphone_request_discarded", {
+          reason: "turn_or_session_changed",
+        });
         return;
       }
       const supportedType = selectRecorderMimeType(
@@ -786,6 +982,11 @@ export default function Page() {
       );
       if (!supportedType) {
         stream.getTracks().forEach((track) => track.stop());
+        activeTurnIdRef.current = null;
+        activeMicrophoneRequestIdRef.current =
+          ++nextMicrophoneRequestIdRef.current;
+        microphoneStartingRef.current = false;
+        setMicrophoneStarting(false);
         setVoiceError(
           "This browser cannot record a LeadLoop-supported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
         );
@@ -793,58 +994,81 @@ export default function Page() {
       }
       const recorder = new MediaRecorder(stream, { mimeType: supportedType });
       recorderRef.current = recorder;
-      chunksRef.current = [];
+      const chunks: Blob[] = [];
       discardRecordingRef.current = false;
       recordingFinalizedRef.current = false;
       recordingEndReasonRef.current = "manual";
       voiceDetectionAvailableRef.current = false;
       turnTimingRef.current = { recordingStartedAt: performance.now() };
       setSpeechDetected(false);
+      microphoneStartingRef.current = false;
+      setMicrophoneStarting(false);
       recorder.ondataavailable = (event) => {
-        if (event.data.size) chunksRef.current.push(event.data);
+        if (activeTurnIdRef.current === turnId && event.data.size)
+          chunks.push(event.data);
       };
       recorder.onstop = () => {
+        if (activeTurnIdRef.current !== turnId) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
         clearRecordingTimers();
         stopVoiceActivityDetection();
         setIsRecording(false);
         stream.getTracks().forEach((track) => track.stop());
         const recordedMimeType =
-          chunksRef.current.find((chunk) => chunk.type)?.type ||
-          recorder.mimeType;
-        const audio = new Blob(chunksRef.current, { type: recordedMimeType });
+          chunks.find((chunk) => chunk.type)?.type || recorder.mimeType;
+        const audio = new Blob(chunks, { type: recordedMimeType });
         recorderRef.current = null;
-        if (
-          recordingEndReasonRef.current === "no_speech" &&
-          sessionActiveRef.current
-        ) {
+        activeTurnIdRef.current = null;
+        activeMicrophoneRequestIdRef.current =
+          ++nextMicrophoneRequestIdRef.current;
+        const recordingReason = recordingEndReasonRef.current;
+        const speechStarted = voiceActivityRef.current.speechStarted;
+        if (recordingReason === "no_speech" && sessionActiveRef.current) {
           const reply = "I didn't hear anything. Please try again.";
           setAssistantMessage(reply);
-          speakReply(reply, false, true);
+          speakReply(reply, false, true, turnId);
           return;
         }
         if (
           !discardRecordingRef.current &&
           audio.size &&
           sessionActiveRef.current &&
-          (!voiceDetectionAvailableRef.current ||
-            voiceActivityRef.current.speechStarted)
+          (!voiceDetectionAvailableRef.current || speechStarted)
         ) {
           if (!supportedAudioFormat(audio.type)) {
             setVoiceError(
               "This browser returned an unsupported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
             );
+            logVoiceTurn(turnId, "recording_rejected", {
+              reason: "unsupported_format",
+            });
+            scheduleAutoListen(performance.now(), turnId, sessionId);
           } else {
-            void submitAudio(audio);
+            void submitAudio(audio, turnId, sessionId);
           }
         } else if (
           !discardRecordingRef.current &&
           voiceDetectionAvailableRef.current &&
-          !voiceActivityRef.current.speechStarted
+          !speechStarted
         ) {
           setVoiceError("I didn't hear speech. Please try again.");
+          logVoiceTurn(turnId, "recording_rejected", { reason: "no_speech" });
+          if (sessionActiveRef.current)
+            scheduleAutoListen(performance.now(), turnId, sessionId);
+        } else if (!discardRecordingRef.current && sessionActiveRef.current) {
+          setVoiceError(
+            "LeadLoop couldn't keep that recording. Please try again.",
+          );
+          logVoiceTurn(turnId, "recording_rejected", {
+            reason: audio.size ? "session_changed" : "empty_audio",
+          });
+          scheduleAutoListen(performance.now(), turnId, sessionId);
         }
       };
       recorder.start(250);
+      logVoiceTurn(turnId, "recording_started", { sessionId });
       setRecordingSeconds(0);
       setIsRecording(true);
       recordingTimerRef.current = setInterval(
@@ -855,11 +1079,17 @@ export default function Page() {
         setVoiceError(
           "Voice notes are limited to 90 seconds. We stopped this recording.",
         );
-        finishRecording("limit");
+        finishRecording("limit", turnId);
       }, 90_000);
-      startVoiceActivityDetection(stream);
+      startVoiceActivityDetection(stream, turnId);
       resetInactivityTimer();
     } catch (error) {
+      if (activeTurnIdRef.current !== turnId) return;
+      activeTurnIdRef.current = null;
+      activeMicrophoneRequestIdRef.current =
+        ++nextMicrophoneRequestIdRef.current;
+      microphoneStartingRef.current = false;
+      setMicrophoneStarting(false);
       const denied = (error as DOMException).name === "NotAllowedError";
       setVoiceError(
         denied
@@ -869,11 +1099,19 @@ export default function Page() {
     }
   };
   const stopRecording = () => {
-    finishRecording("manual");
+    finishRecording("manual", activeTurnIdRef.current);
   };
   const cancelRecording = () => {
-    if (recorderRef.current?.state === "recording") finishRecording("cancel");
-    else setIsRecording(false);
+    if (recorderRef.current?.state === "recording")
+      finishRecording("cancel", activeTurnIdRef.current);
+    else {
+      activeTurnIdRef.current = null;
+      activeMicrophoneRequestIdRef.current =
+        ++nextMicrophoneRequestIdRef.current;
+      microphoneStartingRef.current = false;
+      setMicrophoneStarting(false);
+      setIsRecording(false);
+    }
   };
   const openReminderEditor = () => {
     if (!activeReminder) return;
@@ -1363,7 +1601,7 @@ export default function Page() {
                         className={`record-button ${isRecording ? "recording" : ""}`}
                         type="button"
                         aria-pressed={isRecording}
-                        disabled={voiceBusy || isSpeaking}
+                        disabled={voiceBusy || isSpeaking || microphoneStarting}
                         onClick={() => {
                           if (isRecording) stopRecording();
                           else void startRecording();
@@ -1382,7 +1620,9 @@ export default function Page() {
                             ? "LeadLoop is speaking"
                             : voiceBusy
                               ? "Thinking…"
-                              : "Resume listening"}
+                              : microphoneStarting
+                                ? "Starting microphone…"
+                                : "Resume listening"}
                       </button>
                     )}
                     {isRecording && (
@@ -1550,9 +1790,11 @@ export default function Page() {
                                 ? speechDetected
                                   ? "Hearing you now."
                                   : "Listening for your voice."
-                                : sessionActive
-                                  ? "Paused — use Resume listening when you are ready."
-                                  : "Conversation ended — microphone off."}
+                                : microphoneStarting
+                                  ? "Starting your microphone. Speak once Listening appears."
+                                  : sessionActive
+                                    ? "Paused — use Resume listening when you are ready."
+                                    : "Conversation ended — microphone off."}
                       </p>
                     </div>
                   </div>
@@ -1573,8 +1815,7 @@ export default function Page() {
                       className="button secondary"
                       onClick={() => {
                         setMuted((value) => !value);
-                        window.speechSynthesis?.cancel();
-                        setIsSpeaking(false);
+                        cancelSpeechPlayback();
                       }}
                     >
                       {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
@@ -1589,8 +1830,7 @@ export default function Page() {
                             "Discard the unfinished reminder and start over?",
                           )
                         ) {
-                          window.speechSynthesis?.cancel();
-                          setIsSpeaking(false);
+                          cancelSpeechPlayback();
                           stopConversationSession();
                           const next = emptyConversationState();
                           conversationRef.current = next;

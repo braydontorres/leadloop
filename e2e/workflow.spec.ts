@@ -328,11 +328,17 @@ test("a single manual start alternates speech and recording, then a goodbye rele
     { kind: "confirm", fields: blankFields },
     { kind: "end_conversation", fields: blankFields },
   ];
+  const transcripts = [
+    "Remind me to talk to Brad tomorrow.",
+    "3 PM.",
+    "Yes.",
+    "No, that's all.",
+  ];
   let turn = 0;
   await page.route("**/api/voice", async (route) => {
     const intent = intents[turn++];
     await route.fulfill({
-      json: { transcript: `voice turn ${turn}`, result: { intent } },
+      json: { transcript: transcripts[turn - 1], result: { intent } },
     });
   });
   await page.goto("/");
@@ -374,4 +380,302 @@ test("a single manual start alternates speech and recording, then a goodbye rele
   await expect
     .poll(() => page.evaluate(() => (window as any).__stoppedTracks()))
     .toBeGreaterThanOrEqual(4);
+});
+
+test("the first and next hands-free turns submit exactly once", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    const recorders: Array<{
+      state: string;
+      stop: () => void;
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+    }> = [];
+    class TestRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      state = "inactive";
+      mimeType = "audio/webm;codecs=opus";
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+      constructor(
+        public stream: MediaStream,
+        options?: MediaRecorderOptions,
+      ) {
+        this.mimeType = options?.mimeType || this.mimeType;
+        recorders.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        if (this.state !== "recording") return;
+        this.state = "inactive";
+        this.ondataavailable?.({
+          data: new Blob(["voice"], { type: this.mimeType }),
+        });
+        this.onstop?.();
+      }
+    }
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop: () => {} }],
+        }),
+      },
+    });
+    Object.defineProperty(window, "MediaRecorder", {
+      configurable: true,
+      value: TestRecorder,
+    });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.assign(window, { __spoken: spoken, __recorders: recorders });
+  });
+  const intents = [
+    {
+      kind: "new_task",
+      fields: {
+        ...blankFields,
+        title: "talk to Brad",
+        person: "Brad",
+        date: "2026-10-20",
+      },
+    },
+    {
+      kind: "follow_up",
+      fields: { ...blankFields, time: "05:00" },
+    },
+  ];
+  let requests = 0;
+  await page.route("**/api/voice", async (route) => {
+    const index = requests++;
+    await route.fulfill({
+      json: {
+        transcript:
+          index === 0 ? "Talk to Brad tomorrow" : "Five in the morning",
+        result: { intent: intents[index] },
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(1);
+  await page.evaluate(() => (window as any).__recorders[0].stop());
+  await expect(page.getByText(/What time should I remind you/)).toBeVisible();
+  await expect.poll(() => requests).toBe(1);
+  await page.waitForTimeout(150);
+  await expect.poll(() => requests).toBe(1);
+
+  await page.evaluate(() =>
+    (window as any).__spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent),
+  );
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(2);
+  await page.evaluate(() => (window as any).__recorders[1].stop());
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "5:00 AM",
+  );
+  await expect(page.getByLabel("Or type your reply")).toHaveValue(
+    "Five in the morning",
+  );
+  await expect.poll(() => requests).toBe(2);
+  await page.waitForTimeout(150);
+  await expect.poll(() => requests).toBe(2);
+});
+
+test("a stale microphone request cannot capture a new session", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const recorders: unknown[] = [];
+    const resolvers: Array<(stream: MediaStream) => void> = [];
+    class TestRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      state = "inactive";
+      mimeType = "audio/webm;codecs=opus";
+      constructor(_stream: MediaStream) {
+        recorders.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        this.state = "inactive";
+      }
+    }
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: () =>
+          new Promise<MediaStream>((resolve) => resolvers.push(resolve)),
+      },
+    });
+    Object.defineProperty(window, "MediaRecorder", {
+      configurable: true,
+      value: TestRecorder,
+    });
+    Object.assign(window, {
+      __recorders: recorders,
+      __microphoneRequests: () => resolvers.length,
+      __resolveStream: (index: number) =>
+        resolvers[index]?.({
+          getTracks: () => [{ stop: () => {} }],
+        } as unknown as MediaStream),
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page
+    .getByRole("button", { name: "Start Conversation" })
+    .first()
+    .click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__microphoneRequests()))
+    .toBe(1);
+  await page.getByRole("button", { name: "End Conversation" }).click();
+  await page
+    .getByRole("button", { name: "Start Conversation" })
+    .first()
+    .click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__microphoneRequests()))
+    .toBe(2);
+  await page.evaluate(() => (window as any).__resolveStream(0));
+  await page.waitForTimeout(100);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(0);
+  await page.evaluate(() => (window as any).__resolveStream(1));
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(1);
+});
+
+test("speech playback failure keeps the reply visible and safely resumes listening", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const recorders: Array<{
+      state: string;
+      stop: () => void;
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+    }> = [];
+    class TestRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      state = "inactive";
+      mimeType = "audio/webm;codecs=opus";
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+      constructor(
+        public stream: MediaStream,
+        options?: MediaRecorderOptions,
+      ) {
+        this.mimeType = options?.mimeType || this.mimeType;
+        recorders.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        if (this.state !== "recording") return;
+        this.state = "inactive";
+        this.ondataavailable?.({
+          data: new Blob(["voice"], { type: this.mimeType }),
+        });
+        this.onstop?.();
+      }
+    }
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) =>
+          queueMicrotask(() =>
+            utterance.onerror?.({} as SpeechSynthesisErrorEvent),
+          ),
+        cancel: () => {},
+      },
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({
+          getTracks: () => [{ stop: () => {} }],
+        }),
+      },
+    });
+    Object.defineProperty(window, "MediaRecorder", {
+      configurable: true,
+      value: TestRecorder,
+    });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.assign(window, { __recorders: recorders });
+  });
+  await page.route("**/api/voice", async (route) => {
+    await route.fulfill({
+      json: {
+        transcript: "Call Sam tomorrow at 9 AM",
+        result: {
+          intent: {
+            kind: "new_task",
+            fields: {
+              ...blankFields,
+              title: "call Sam",
+              person: "Sam",
+              date: "2026-10-20",
+              time: "09:00",
+            },
+          },
+        },
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(1);
+  await page.evaluate(() => (window as any).__recorders[0].stop());
+  await expect(page.getByText(/Is that correct/)).toBeVisible();
+  await expect(page.locator(".voice-alert")).toContainText(
+    "couldn't play that response aloud",
+  );
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(2);
 });
