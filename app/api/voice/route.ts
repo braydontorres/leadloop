@@ -18,6 +18,7 @@ const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 
 export async function POST(request: Request) {
   let permit: RequestPermit | undefined;
+  const startedAt = performance.now();
   try {
     const form = await request.formData();
     const audio = form.get("audio");
@@ -49,6 +50,7 @@ export async function POST(request: Request) {
       context,
     });
     permit = limitRequest(clientId(request.headers));
+    const transcriptionStartedAt = performance.now();
     const transcript = await transcribeAudio(audio);
     console.info(
       "[LeadLoop voice]",
@@ -59,10 +61,23 @@ export async function POST(request: Request) {
         hasActiveReminder: Boolean(valid.context.activeReminder),
       }),
     );
+    const interpretationStartedAt = performance.now();
     const result = await interpretThought(
       transcript,
       valid.timeZone,
       valid.context,
+    );
+    console.info(
+      "[LeadLoop voice timing]",
+      JSON.stringify({
+        transcriptionMs: Math.round(
+          interpretationStartedAt - transcriptionStartedAt,
+        ),
+        interpretationMs: Math.round(
+          performance.now() - interpretationStartedAt,
+        ),
+        totalMs: Math.round(performance.now() - startedAt),
+      }),
     );
     return NextResponse.json({ transcript, result });
   } catch (error) {
@@ -83,6 +98,7 @@ export async function POST(request: Request) {
         requestId: known.requestId,
         rateLimitSource: known.status === 429 ? known.source : undefined,
         retryAfterSeconds: known.retryAfterSeconds,
+        totalMs: Math.round(performance.now() - startedAt),
       }),
     );
     const headers = new Headers();

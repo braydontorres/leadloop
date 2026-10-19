@@ -170,6 +170,47 @@ test("a rate-limited follow-up preserves the active reminder and shows retry tim
   await expect(page.getByText("talk to Bill", { exact: true })).toBeVisible();
 });
 
+test("a delayed interpretation reports Thinking instead of a false listening state", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: { speak: () => {}, cancel: () => {} },
+    });
+  });
+  await page.route("**/api/interpret", async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    await route.fulfill({
+      json: {
+        transcript: "Call Sam tomorrow at 9 AM",
+        result: {
+          intent: {
+            kind: "new_task",
+            fields: {
+              ...blankFields,
+              title: "call Sam",
+              person: "Sam",
+              date: "2026-10-20",
+              time: "09:00",
+            },
+          },
+        },
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  await page.getByLabel("Or type your reply").fill("Call Sam tomorrow at 9 AM");
+  await page.getByRole("button", { name: /Send reply/ }).click();
+  await expect(page.getByText("Thinking", { exact: true })).toBeVisible();
+  await expect(page.getByText("call Sam", { exact: true })).toBeVisible();
+});
+
 test("a single manual start alternates speech and recording, then a goodbye releases the microphone", async ({
   page,
 }) => {
@@ -314,6 +355,9 @@ test("a single manual start alternates speech and recording, then a goodbye rele
     .poll(() => page.evaluate(() => (window as any).__recorders.length))
     .toBe(1);
   await expect(page.getByText(/What time should I remind you/)).toBeVisible();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(1);
   await finishLatestReply();
   await expect(page.getByText(/Is that correct/)).toBeVisible();
   await finishLatestReply();

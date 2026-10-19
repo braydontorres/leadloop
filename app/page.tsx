@@ -113,6 +113,7 @@ export default function Page() {
     [retryAfterSeconds, setRetryAfterSeconds] = useState(0),
     [sessionActive, setSessionActive] = useState(false),
     [speechDetected, setSpeechDetected] = useState(false),
+    [noiseResistant, setNoiseResistant] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -134,6 +135,15 @@ export default function Page() {
     "manual" | "silence" | "no_speech" | "limit" | "cancel"
   >("manual");
   const submissionRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const voiceBusyRef = useRef(false);
+  const turnTimingRef = useRef<{
+    recordingStartedAt?: number;
+    speechDetectedAt?: number;
+    finalizedAt?: number;
+    requestStartedAt?: number;
+    replyStartedAt?: number;
+  }>({});
   const sessionActiveRef = useRef(false);
   const conversationRef = useRef(conversation);
   const storeRef = useRef<Store | null>(store);
@@ -257,6 +267,20 @@ export default function Page() {
       )
       .sort((a, b) => (a.due || "z").localeCompare(b.due || "z"));
   const activeReminder = conversation.activeReminder;
+  const voicePhase =
+    conversation.stage === "ended"
+      ? "Ended"
+      : !sessionActive
+        ? "Paused"
+        : isSpeaking
+          ? "Speaking"
+          : voiceBusy
+            ? "Thinking"
+            : isRecording
+              ? speechDetected
+                ? "Hearing you"
+                : "Listening"
+              : "Paused";
   // The former review-card collections are deliberately empty: the active
   // conversation above is now the only authoritative reminder surface.
   const reviewItems: any[] = [];
@@ -325,13 +349,28 @@ export default function Page() {
       setNotice((e as Error).message);
     }
   };
+  const logVoiceTiming = (event: string, values: Record<string, number>) => {
+    console.info(
+      "[LeadLoop voice timing]",
+      JSON.stringify({ event, ...values }),
+    );
+  };
   const speakReply = (
     reply: string,
     readsBack: boolean,
     resumeListening = false,
   ) => {
+    const preparedAt = performance.now();
+    let completed = false;
     const complete = () => {
+      if (completed) return;
+      completed = true;
+      const completedAt = performance.now();
+      isSpeakingRef.current = false;
       setIsSpeaking(false);
+      logVoiceTiming("speech_complete", {
+        playbackMs: Math.round(completedAt - preparedAt),
+      });
       if (readsBack) {
         setConversation((current) => {
           const next = finishSpeech(current);
@@ -339,7 +378,8 @@ export default function Page() {
           return next;
         });
       }
-      if (resumeListening && sessionActiveRef.current) scheduleAutoListen();
+      if (resumeListening && sessionActiveRef.current)
+        scheduleAutoListen(completedAt);
     };
     if (muted || typeof window === "undefined" || !window.speechSynthesis) {
       complete();
@@ -349,7 +389,12 @@ export default function Page() {
     const utterance = new SpeechSynthesisUtterance(reply);
     utterance.onend = complete;
     utterance.onerror = complete;
+    isSpeakingRef.current = true;
     setIsSpeaking(true);
+    logVoiceTiming("speech_started", {
+      preparationMs: Math.round(performance.now() - preparedAt),
+      replyLength: reply.length,
+    });
     window.speechSynthesis.speak(utterance);
   };
   const handleAssistantResult = (transcript: string, result: IntentResult) => {
@@ -391,10 +436,13 @@ export default function Page() {
     }
     if (submissionRef.current) return;
     submissionRef.current = true;
+    voiceBusyRef.current = true;
     setVoiceBusy(true);
     setVoiceError("");
     setDemoMode(false);
+    let resumeAfterFailure = false;
     try {
+      turnTimingRef.current.requestStartedAt = performance.now();
       const response = await fetch("/api/interpret", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -422,22 +470,34 @@ export default function Page() {
         );
       }
       handleAssistantResult(payload.transcript, payload.result);
+      logVoiceTiming("text_interpretation_complete", {
+        requestMs: Math.round(
+          performance.now() -
+            (turnTimingRef.current.requestStartedAt ?? performance.now()),
+        ),
+      });
       setRetryAfterSeconds(0);
     } catch (error) {
       // A failed request must not discard the pending field or confirmation.
       setVoiceError((error as Error).message);
+      resumeAfterFailure = sessionActiveRef.current;
     } finally {
       submissionRef.current = false;
+      voiceBusyRef.current = false;
       setVoiceBusy(false);
+      if (resumeAfterFailure) scheduleAutoListen(performance.now());
     }
   };
   const submitAudio = async (audio: Blob) => {
     if (submissionRef.current) return;
     submissionRef.current = true;
+    voiceBusyRef.current = true;
     setVoiceBusy(true);
     setVoiceError("");
     setDemoMode(false);
+    let resumeAfterFailure = false;
     try {
+      turnTimingRef.current.requestStartedAt = performance.now();
       const format = supportedAudioFormat(audio.type);
       if (!format) {
         throw new Error(
@@ -474,13 +534,22 @@ export default function Page() {
       }
       setText(payload.transcript);
       handleAssistantResult(payload.transcript, payload.result);
+      logVoiceTiming("voice_request_complete", {
+        uploadAndAiMs: Math.round(
+          performance.now() -
+            (turnTimingRef.current.requestStartedAt ?? performance.now()),
+        ),
+      });
       setRetryAfterSeconds(0);
     } catch (error) {
       // Keep the authoritative draft intact so the user can safely retry.
       setVoiceError((error as Error).message);
+      resumeAfterFailure = sessionActiveRef.current;
     } finally {
       submissionRef.current = false;
+      voiceBusyRef.current = false;
       setVoiceBusy(false);
+      if (resumeAfterFailure) scheduleAutoListen(performance.now());
     }
   };
   const clearRecordingTimers = () => {
@@ -507,6 +576,16 @@ export default function Page() {
     if (recordingFinalizedRef.current) return;
     recordingFinalizedRef.current = true;
     recordingEndReasonRef.current = reason;
+    turnTimingRef.current.finalizedAt = performance.now();
+    logVoiceTiming("recording_finalized", {
+      endOfSpeechSilenceMs: Math.round(voiceActivityRef.current.quietMs),
+      recordingMs: turnTimingRef.current.recordingStartedAt
+        ? Math.round(
+            turnTimingRef.current.finalizedAt -
+              turnTimingRef.current.recordingStartedAt,
+          )
+        : 0,
+    });
     clearRecordingTimers();
     stopVoiceActivityDetection();
     if (reason === "cancel" || reason === "no_speech")
@@ -550,11 +629,31 @@ export default function Page() {
           voiceActivityRef.current,
           rmsFromTimeDomain(samples),
           now - previousTime,
-          { ...DEFAULT_VOICE_ACTIVITY_CONFIG, silenceMs: VOICE_SILENCE_MS },
+          {
+            ...DEFAULT_VOICE_ACTIVITY_CONFIG,
+            silenceMs: VOICE_SILENCE_MS,
+            minimumSignal: noiseResistant
+              ? 0.022
+              : DEFAULT_VOICE_ACTIVITY_CONFIG.minimumSignal,
+            speechHoldMs: noiseResistant
+              ? 280
+              : DEFAULT_VOICE_ACTIVITY_CONFIG.speechHoldMs,
+          },
         );
         previousTime = now;
         voiceActivityRef.current = update.state;
-        if (update.event === "speech_started") setSpeechDetected(true);
+        if (update.event === "speech_started") {
+          turnTimingRef.current.speechDetectedAt = performance.now();
+          setSpeechDetected(true);
+          logVoiceTiming("speech_detected", {
+            waitForSpeechMs: turnTimingRef.current.recordingStartedAt
+              ? Math.round(
+                  turnTimingRef.current.speechDetectedAt -
+                    turnTimingRef.current.recordingStartedAt,
+                )
+              : 0,
+          });
+        }
         if (update.event === "speech_ended") {
           finishRecording("silence");
           return;
@@ -584,6 +683,9 @@ export default function Page() {
     clearSessionTimers();
     sessionActiveRef.current = false;
     setSessionActive(false);
+    window.speechSynthesis?.cancel();
+    isSpeakingRef.current = false;
+    setIsSpeaking(false);
     discardRecordingRef.current = true;
     if (recorderRef.current?.state === "recording") finishRecording("cancel");
     else {
@@ -614,14 +716,22 @@ export default function Page() {
       speakReply(reply, false, false);
     }, INACTIVITY_TIMEOUT_MS);
   };
-  const scheduleAutoListen = () => {
+  const scheduleAutoListen = (replyCompletedAt = performance.now()) => {
     if (autoListenRef.current) clearTimeout(autoListenRef.current);
     if (!sessionActiveRef.current) return;
     resetInactivityTimer();
     autoListenRef.current = setTimeout(() => {
       autoListenRef.current = null;
-      if (sessionActiveRef.current) void startRecording();
-    }, 200);
+      if (!sessionActiveRef.current) return;
+      if (isSpeakingRef.current || voiceBusyRef.current) {
+        scheduleAutoListen(replyCompletedAt);
+        return;
+      }
+      logVoiceTiming("microphone_resume", {
+        afterReplyMs: Math.round(performance.now() - replyCompletedAt),
+      });
+      void startRecording();
+    }, 50);
   };
   const startConversationSession = () => {
     if (sessionActiveRef.current) return;
@@ -629,7 +739,7 @@ export default function Page() {
     const next = startConversation(conversationRef.current);
     conversationRef.current = next;
     setConversation(next);
-    setAssistantMessage("I'm listening.");
+    setAssistantMessage("Starting microphone…");
     setText("");
     setVoiceError("");
     sessionActiveRef.current = true;
@@ -642,7 +752,8 @@ export default function Page() {
     setDemoMode(false);
     if (
       !sessionActiveRef.current ||
-      isSpeaking ||
+      isSpeakingRef.current ||
+      voiceBusyRef.current ||
       submissionRef.current ||
       recorderRef.current?.state === "recording"
     )
@@ -657,7 +768,15 @@ export default function Page() {
       return;
     }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          // Avoid raising distant TV speech in a quiet room.
+          autoGainControl: false,
+        },
+      });
       if (!sessionActiveRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -679,6 +798,7 @@ export default function Page() {
       recordingFinalizedRef.current = false;
       recordingEndReasonRef.current = "manual";
       voiceDetectionAvailableRef.current = false;
+      turnTimingRef.current = { recordingStartedAt: performance.now() };
       setSpeechDetected(false);
       recorder.ondataavailable = (event) => {
         if (event.data.size) chunksRef.current.push(event.data);
@@ -1243,8 +1363,11 @@ export default function Page() {
                         className={`record-button ${isRecording ? "recording" : ""}`}
                         type="button"
                         aria-pressed={isRecording}
-                        disabled={!isRecording}
-                        onClick={stopRecording}
+                        disabled={voiceBusy || isSpeaking}
+                        onClick={() => {
+                          if (isRecording) stopRecording();
+                          else void startRecording();
+                        }}
                       >
                         {isRecording ? (
                           <Square size={18} fill="currentColor" />
@@ -1258,8 +1381,8 @@ export default function Page() {
                           : isSpeaking
                             ? "LeadLoop is speaking"
                             : voiceBusy
-                              ? "Understanding your thought…"
-                              : "Waiting for LeadLoop"}
+                              ? "Thinking…"
+                              : "Resume listening"}
                       </button>
                     )}
                     {isRecording && (
@@ -1296,6 +1419,16 @@ export default function Page() {
                     Recording stops before every reply, so it never records its
                     own voice.
                   </p>
+                  <label className="field compact-toggle">
+                    <input
+                      type="checkbox"
+                      checked={noiseResistant}
+                      onChange={(event) =>
+                        setNoiseResistant(event.target.checked)
+                      }
+                    />
+                    Noise-resistant mode for a TV or busy room
+                  </label>
                   <div className="capture-help">
                     <ShieldCheck size={18} />
                     <span>
@@ -1354,9 +1487,7 @@ export default function Page() {
                   )}
                 </section>
                 <aside className="capture-aside">
-                  <span className="pill">
-                    {conversation.stage.replaceAll("_", " ")}
-                  </span>
+                  <span className="pill">{voicePhase}</span>
                   <h2>LeadLoop’s current order</h2>
                   {activeReminder ? (
                     <dl className="conversation-reminder">
@@ -1413,9 +1544,15 @@ export default function Page() {
                           ? "Conversation ended — microphone off."
                           : isSpeaking
                             ? "Speaking now — recording is paused."
-                            : sessionActive
-                              ? "LeadLoop will listen again after this turn."
-                              : "Conversation ended — microphone off."}
+                            : voiceBusy
+                              ? "Thinking about your last turn."
+                              : isRecording
+                                ? speechDetected
+                                  ? "Hearing you now."
+                                  : "Listening for your voice."
+                                : sessionActive
+                                  ? "Paused — use Resume listening when you are ready."
+                                  : "Conversation ended — microphone off."}
                       </p>
                     </div>
                   </div>

@@ -15,6 +15,7 @@ export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   let permit: RequestPermit | undefined;
+  const startedAt = performance.now();
   try {
     const input = validateInterpretationInput(await request.json());
     permit = limitRequest(clientId(request.headers));
@@ -22,6 +23,10 @@ export async function POST(request: Request) {
       input.text,
       input.timeZone,
       input.context,
+    );
+    console.info(
+      "[LeadLoop interpretation timing]",
+      JSON.stringify({ totalMs: Math.round(performance.now() - startedAt) }),
     );
     return NextResponse.json({ transcript: input.text, result });
   } catch (error) {
@@ -43,6 +48,7 @@ export async function POST(request: Request) {
           rateLimitSource: known.source,
           retryAfterSeconds: known.retryAfterSeconds,
           requestId: known.requestId,
+          totalMs: Math.round(performance.now() - startedAt),
         }),
       );
     const headers = new Headers();
