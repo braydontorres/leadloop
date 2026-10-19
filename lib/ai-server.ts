@@ -55,6 +55,8 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     public requestId?: string,
+    public retryAfterSeconds?: number,
+    public source: "internal" | "openai" = "openai",
   ) {
     super(message);
   }

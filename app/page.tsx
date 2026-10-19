@@ -86,12 +86,14 @@ export default function Page() {
     [assistantMessage, setAssistantMessage] = useState(""),
     [isSpeaking, setIsSpeaking] = useState(false),
     [muted, setMuted] = useState(false),
+    [retryAfterSeconds, setRetryAfterSeconds] = useState(0),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordingLimitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const submissionRef = useRef(false);
   useEffect(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -124,6 +126,14 @@ export default function Page() {
     const t = setTimeout(() => setNotice(""), 4500);
     return () => clearTimeout(t);
   }, [notice]);
+  useEffect(() => {
+    if (!retryAfterSeconds) return;
+    const timer = setInterval(
+      () => setRetryAfterSeconds((seconds) => Math.max(0, seconds - 1)),
+      1000,
+    );
+    return () => clearInterval(timer);
+  }, [retryAfterSeconds]);
   useEffect(() => {
     function key(e: KeyboardEvent) {
       if (e.key === "Escape") {
@@ -292,6 +302,8 @@ export default function Page() {
     }
   };
   const requestInterpretation = async (thought: string) => {
+    if (submissionRef.current) return;
+    submissionRef.current = true;
     setVoiceBusy(true);
     setVoiceError("");
     setDemoMode(false);
@@ -310,21 +322,36 @@ export default function Page() {
         result?: IntentResult;
         error?: string;
         demoMode?: boolean;
+        retryAfterSeconds?: number;
       };
       if (!response.ok || !payload.result || !payload.transcript) {
         setDemoMode(Boolean(payload.demoMode));
+        if (payload.retryAfterSeconds)
+          setRetryAfterSeconds(payload.retryAfterSeconds);
         throw new Error(
-          payload.error || "LeadLoop couldn't understand that thought.",
+          payload.retryAfterSeconds
+            ? `${payload.error} Try again in ${payload.retryAfterSeconds}s.`
+            : payload.error || "LeadLoop couldn't understand that thought.",
         );
       }
       handleAssistantResult(payload.transcript, payload.result);
+      setRetryAfterSeconds(0);
     } catch (error) {
       setVoiceError((error as Error).message);
+      setConversation((current) =>
+        setConversationStage(
+          current,
+          current.activeReminder ? "awaiting_details" : "idle",
+        ),
+      );
     } finally {
+      submissionRef.current = false;
       setVoiceBusy(false);
     }
   };
   const submitAudio = async (audio: Blob) => {
+    if (submissionRef.current) return;
+    submissionRef.current = true;
     setVoiceBusy(true);
     setVoiceError("");
     setDemoMode(false);
@@ -348,18 +375,31 @@ export default function Page() {
         result?: IntentResult;
         error?: string;
         demoMode?: boolean;
+        retryAfterSeconds?: number;
       };
       if (!response.ok || !payload.result || !payload.transcript) {
         setDemoMode(Boolean(payload.demoMode));
+        if (payload.retryAfterSeconds)
+          setRetryAfterSeconds(payload.retryAfterSeconds);
         throw new Error(
-          payload.error || "LeadLoop couldn't process that recording.",
+          payload.retryAfterSeconds
+            ? `${payload.error} Try again in ${payload.retryAfterSeconds}s.`
+            : payload.error || "LeadLoop couldn't process that recording.",
         );
       }
       setText(payload.transcript);
       handleAssistantResult(payload.transcript, payload.result);
+      setRetryAfterSeconds(0);
     } catch (error) {
       setVoiceError((error as Error).message);
+      setConversation((current) =>
+        setConversationStage(
+          current,
+          current.activeReminder ? "awaiting_details" : "idle",
+        ),
+      );
     } finally {
+      submissionRef.current = false;
       setVoiceBusy(false);
     }
   };
@@ -372,7 +412,7 @@ export default function Page() {
   const startRecording = async () => {
     setVoiceError("");
     setDemoMode(false);
-    if (isSpeaking) return;
+    if (isSpeaking || submissionRef.current) return;
     if (
       !navigator.mediaDevices?.getUserMedia ||
       typeof MediaRecorder === "undefined"
@@ -989,6 +1029,12 @@ export default function Page() {
                       <AlertCircle size={17} />
                       <span>{voiceError}</span>
                     </div>
+                  )}
+                  {retryAfterSeconds > 0 && (
+                    <p className="input-note" role="status">
+                      You can retry in {retryAfterSeconds}s. Your unfinished
+                      reminder is still here.
+                    </p>
                   )}
                   {demoMode && (
                     <div className="demo-ai-note">

@@ -120,3 +120,50 @@ test("drive-through reminder conversation speaks, corrects, confirms, starts ove
     page.getByText(/canceled that unfinished reminder/),
   ).toBeVisible();
 });
+
+test("a rate-limited follow-up preserves the active reminder and shows retry timing", async ({
+  page,
+}) => {
+  let calls = 0;
+  await page.route("**/api/interpret", async (route) => {
+    calls += 1;
+    if (calls === 1) {
+      await route.fulfill({
+        json: {
+          transcript: "Talk to Bill",
+          result: {
+            intent: {
+              kind: "new_task",
+              fields: { ...blankFields, title: "talk to Bill", person: "Bill" },
+            },
+          },
+        },
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 429,
+      json: {
+        error:
+          "LeadLoop is receiving too many requests. Please try again shortly.",
+        code: "LOCAL_RATE_LIMIT",
+        retryAfterSeconds: 3,
+        rateLimitSource: "internal",
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  await reply.fill("Talk to Bill");
+  await send.click();
+  await expect(page.getByText("talk to Bill", { exact: true })).toBeVisible();
+  await reply.fill("Tomorrow at 5 PM");
+  await send.click();
+  await expect(page.getByText(/retry in 3s/)).toBeVisible();
+  await expect(page.getByText("talk to Bill", { exact: true })).toBeVisible();
+});

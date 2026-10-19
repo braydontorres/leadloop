@@ -6,14 +6,19 @@ import {
   validateInterpretationInput,
 } from "../../../lib/ai-server";
 import { supportedAudioFormat } from "../../../lib/audio-format";
-import { clientId, limitRequest } from "../../../lib/request-limit";
+import {
+  clientId,
+  limitRequest,
+  releaseRequest,
+  type RequestPermit,
+} from "../../../lib/request-limit";
 
 export const runtime = "nodejs";
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 
 export async function POST(request: Request) {
+  let permit: RequestPermit | undefined;
   try {
-    limitRequest(clientId(request.headers));
     const form = await request.formData();
     const audio = form.get("audio");
     if (!(audio instanceof File) || audio.size === 0)
@@ -43,6 +48,7 @@ export async function POST(request: Request) {
       timeZone,
       context,
     });
+    permit = limitRequest(clientId(request.headers));
     const transcript = await transcribeAudio(audio);
     const result = await interpretThought(
       transcript,
@@ -59,21 +65,29 @@ export async function POST(request: Request) {
             500,
             "UNEXPECTED_ERROR",
           );
+    if (permit && known.code !== "LOCAL_RATE_LIMIT") releaseRequest(permit);
     console.error(
       "[LeadLoop voice]",
       JSON.stringify({
         errorType: known.code,
         httpStatus: known.status,
         requestId: known.requestId,
+        rateLimitSource: known.status === 429 ? known.source : undefined,
+        retryAfterSeconds: known.retryAfterSeconds,
       }),
     );
+    const headers = new Headers();
+    if (known.retryAfterSeconds)
+      headers.set("Retry-After", String(known.retryAfterSeconds));
     return NextResponse.json(
       {
         error: known.message,
         code: known.code,
+        retryAfterSeconds: known.retryAfterSeconds,
+        rateLimitSource: known.status === 429 ? known.source : undefined,
         demoMode: known.code === "AI_NOT_CONFIGURED",
       },
-      { status: known.status },
+      { status: known.status, headers },
     );
   }
 }
