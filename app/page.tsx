@@ -30,6 +30,9 @@ import {
   Square,
   RotateCcw,
   MessageCircle,
+  Volume2,
+  VolumeX,
+  RotateCw,
 } from "lucide-react";
 import {
   Task,
@@ -44,10 +47,12 @@ import {
   toLocalInput,
 } from "../lib/tasks";
 import {
-  applyAssistantIntent,
+  advanceConversation,
   conversationContext,
   emptyConversationState,
-  type ConversationDraft,
+  finishSpeech,
+  setConversationStage,
+  spokenReminder,
   type IntentResult,
 } from "../lib/conversation-machine";
 import {
@@ -79,6 +84,8 @@ export default function Page() {
     [voiceError, setVoiceError] = useState(""),
     [demoMode, setDemoMode] = useState(false),
     [assistantMessage, setAssistantMessage] = useState(""),
+    [isSpeaking, setIsSpeaking] = useState(false),
+    [muted, setMuted] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -183,9 +190,12 @@ export default function Page() {
           !isToday(t.due, timezone) && (!t.due || new Date(t.due) > new Date()),
       )
       .sort((a, b) => (a.due || "z").localeCompare(b.due || "z"));
-  const reviewItems = conversation.drafts,
-    pendingClarifications = conversation.pending,
-    cancelIds = conversation.cancellationIds;
+  const activeReminder = conversation.activeReminder;
+  // The former review-card collections are deliberately empty: the active
+  // conversation above is now the only authoritative reminder surface.
+  const reviewItems: any[] = [];
+  const pendingClarifications: any[] = [];
+  const cancelIds: string[] = [];
   const go = (s: Screen) => {
     setScreen(s);
     setSearch("");
@@ -210,41 +220,73 @@ export default function Page() {
   const commit = () => {
     if (!draft) return;
     try {
+      if (conversation.activeReminder?.id === draft.id) {
+        const updatedReminder = {
+          id: draft.id,
+          title: draft.title.trim(),
+          person: draft.person,
+          due: draft.due,
+          notes: draft.notes,
+        };
+        if (!updatedReminder.title) throw new Error("Give your task a name.");
+        const reply = updatedReminder.due
+          ? spokenReminder(updatedReminder, timezone)
+          : "Sure! When would you like me to remind you?";
+        setConversation((current) => ({
+          ...current,
+          activeReminder: updatedReminder,
+          stage: updatedReminder.due ? "reading_back" : "awaiting_details",
+        }));
+        setDraft(null);
+        setAssistantMessage(reply);
+        speakReply(reply, Boolean(updatedReminder.due));
+        return;
+      }
       setStore({
         ...store,
         tasks: saveTask(store.tasks, { ...draft, title: draft.title.trim() }),
       });
       setDraft(null);
-      setConversation((current) => ({
-        ...current,
-        drafts: current.drafts.filter((item) => item.id !== draft.id),
-        pending: current.pending.filter(
-          (item) => !item.taskIds.includes(draft.id),
-        ),
-        cancellationIds: current.cancellationIds.filter(
-          (item) => item !== draft.id,
-        ),
-        phase: "confirmed",
-      }));
       setText("");
       setNotice("Task saved on this device.");
     } catch (e) {
       setNotice((e as Error).message);
     }
   };
+  const speakReply = (reply: string, readsBack: boolean) => {
+    const complete = () => {
+      setIsSpeaking(false);
+      if (readsBack) setConversation((current) => finishSpeech(current));
+    };
+    if (muted || typeof window === "undefined" || !window.speechSynthesis) {
+      complete();
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(reply);
+    utterance.onend = complete;
+    utterance.onerror = complete;
+    setIsSpeaking(true);
+    window.speechSynthesis.speak(utterance);
+  };
   const handleAssistantResult = (transcript: string, result: IntentResult) => {
     try {
-      setConversation((current) =>
-        applyAssistantIntent({
-          state: current,
-          savedTasks: store.tasks,
-          result,
-          text: transcript,
-          timeZone: timezone,
-          createId: () => crypto.randomUUID(),
-        }),
-      );
-      setAssistantMessage(result.intent.question ?? result.message);
+      const transition = advanceConversation({
+        state: conversation,
+        result,
+        text: transcript,
+        timeZone: timezone,
+        createId: () => crypto.randomUUID(),
+      });
+      if (transition.savedTask)
+        setStore({
+          ...store,
+          tasks: saveTask(store.tasks, transition.savedTask),
+        });
+      setConversation(transition.state);
+      setAssistantMessage(transition.reply);
+      speakReply(transition.reply, transition.state.stage === "reading_back");
+      if (transition.savedTask) setNotice("Reminder saved on this device.");
     } catch (error) {
       setVoiceError((error as Error).message);
     }
@@ -260,7 +302,7 @@ export default function Page() {
         body: JSON.stringify({
           text: thought,
           timeZone: timezone,
-          context: conversationContext(conversation, store.tasks),
+          context: conversationContext(conversation),
         }),
       });
       const payload = (await response.json()) as {
@@ -296,10 +338,7 @@ export default function Page() {
       const form = new FormData();
       form.append("audio", audio, `leadloop-${Date.now()}.${format.extension}`);
       form.append("timeZone", timezone);
-      form.append(
-        "context",
-        JSON.stringify(conversationContext(conversation, store.tasks)),
-      );
+      form.append("context", JSON.stringify(conversationContext(conversation)));
       const response = await fetch("/api/voice", {
         method: "POST",
         body: form,
@@ -333,6 +372,7 @@ export default function Page() {
   const startRecording = async () => {
     setVoiceError("");
     setDemoMode(false);
+    if (isSpeaking) return;
     if (
       !navigator.mediaDevices?.getUserMedia ||
       typeof MediaRecorder === "undefined"
@@ -344,6 +384,7 @@ export default function Page() {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setConversation((current) => setConversationStage(current, "listening"));
       const supportedType = selectRecorderMimeType(
         MediaRecorder.isTypeSupported.bind(MediaRecorder),
       );
@@ -375,7 +416,12 @@ export default function Page() {
             setVoiceError(
               "This browser returned an unsupported audio format. Try a current version of Chrome or Safari, or type your thought instead.",
             );
-          } else void submitAudio(audio);
+          } else {
+            setConversation((current) =>
+              setConversationStage(current, "processing"),
+            );
+            void submitAudio(audio);
+          }
         }
       };
       recorder.start(250);
@@ -408,30 +454,20 @@ export default function Page() {
     if (recorderRef.current?.state === "recording") recorderRef.current.stop();
     else setIsRecording(false);
   };
-  const openReviewItem = (item: ConversationDraft) => {
-    const saved = store.tasks.find((task) => task.id === item.id);
+  const openReminderEditor = () => {
+    if (!activeReminder) return;
+    const saved = store.tasks.find((task) => task.id === activeReminder.id);
     setDraft({
-      id: item.id,
-      title: item.title,
-      person: item.person,
-      due: item.due ?? "",
-      notes: item.notes,
+      id: activeReminder.id,
+      title: activeReminder.title,
+      person: activeReminder.person,
+      due: activeReminder.due,
+      notes: activeReminder.notes,
       completed: saved?.completed ?? false,
     });
   };
-  const confirmCancellation = (id: string) => {
-    setStore({ ...store, tasks: store.tasks.filter((task) => task.id !== id) });
-    setConversation((current) => ({
-      ...current,
-      drafts: current.drafts.filter((item) => item.id !== id),
-      pending: current.pending.filter((item) => !item.taskIds.includes(id)),
-      cancellationIds: current.cancellationIds.filter(
-        (cancelId) => cancelId !== id,
-      ),
-      phase: "confirmed",
-    }));
-    setNotice("Task cancellation confirmed.");
-  };
+  const openReviewItem = (_item: any) => openReminderEditor();
+  const confirmCancellation = (_id: string) => {};
   const taskRow = (t: Task) => (
     <div className={"task-row " + (t.completed ? "done" : "")} key={t.id}>
       <button
@@ -883,8 +919,8 @@ export default function Page() {
                       <Mic size={21} />
                     </span>
                     <div>
-                      <h2>Start with a thought</h2>
-                      <p>Speak naturally or type it out</p>
+                      <h2>Your reminder conversation</h2>
+                      <p>One reminder at a time, confirmed out loud.</p>
                     </div>
                   </div>
                   <div className="recording-controls">
@@ -892,7 +928,7 @@ export default function Page() {
                       className={`record-button ${isRecording ? "recording" : ""}`}
                       type="button"
                       aria-pressed={isRecording}
-                      disabled={voiceBusy}
+                      disabled={voiceBusy || isSpeaking}
                       onClick={() =>
                         isRecording ? stopRecording() : void startRecording()
                       }
@@ -904,7 +940,9 @@ export default function Page() {
                       )}
                       {isRecording
                         ? `Stop recording · ${recordingSeconds}s`
-                        : "Start recording"}
+                        : isSpeaking
+                          ? "LeadLoop is speaking"
+                          : "Press to talk"}
                     </button>
                     {isRecording && (
                       <button
@@ -920,26 +958,30 @@ export default function Page() {
                         <LoaderCircle size={16} /> Understanding your thought…
                       </span>
                     )}
+                    {isSpeaking && (
+                      <span className="processing">
+                        <Volume2 size={16} /> LeadLoop is speaking…
+                      </span>
+                    )}
                   </div>
                   <label className="field">
-                    What do you need to remember?
+                    Or type your reply
                     <textarea
                       value={text}
                       onChange={(e) => setText(e.target.value)}
-                      placeholder="e.g. Call Sarah about the new project, or your transcript will appear here"
-                      rows={6}
+                      placeholder="Say or type what you want LeadLoop to hear"
+                      rows={3}
                     />
                   </label>
                   <p className="input-note">
-                    Recording stops after 90 seconds and is sent only when you
-                    press stop. LeadLoop does not keep raw audio.
+                    Push to talk: recording stops before LeadLoop replies, so it
+                    never records its own voice.
                   </p>
                   <div className="capture-help">
                     <ShieldCheck size={18} />
                     <span>
-                      Your voice and text are sent to OpenAI only when you ask
-                      LeadLoop to understand them. Nothing is saved until you
-                      confirm a review card.
+                      Nothing is saved until you say yes to LeadLoop’s
+                      read-back.
                     </span>
                   </div>
                   {voiceError && (
@@ -951,8 +993,7 @@ export default function Page() {
                   {demoMode && (
                     <div className="demo-ai-note">
                       <strong>Demo mode</strong> — add a server-side OpenAI key
-                      to transcribe and understand speech. You can still review
-                      typed text manually.
+                      to use spoken or typed AI understanding.
                     </div>
                   )}
                   <button
@@ -960,66 +1001,113 @@ export default function Page() {
                     disabled={!text.trim() || voiceBusy || isRecording}
                     onClick={() => void requestInterpretation(text.trim())}
                   >
-                    {voiceBusy ? "Working…" : "Understand with LeadLoop"}{" "}
+                    {voiceBusy ? "Working…" : "Send reply"}{" "}
                     <ArrowRight size={17} />
-                  </button>
-                  <button
-                    className="manual-review-link"
-                    disabled={!text.trim() || voiceBusy || isRecording}
-                    onClick={() =>
-                      setDraft({
-                        id: crypto.randomUUID(),
-                        title: text.trim(),
-                        person: "",
-                        due: "",
-                        completed: false,
-                        notes: "",
-                      })
-                    }
-                  >
-                    <Keyboard size={15} /> Review manually instead
                   </button>
                 </section>
                 <aside className="capture-aside">
-                  <span className="pill">LESS FRICTION. MORE FOCUS.</span>
-                  <h2>
-                    From a thought
-                    <br />
-                    to a little more clarity.
-                  </h2>
-                  {[
-                    "Press the microphone and speak",
-                    "LeadLoop transcribes and understands",
-                    "Clarify or correct with another thought",
-                    "Review and confirm before saving",
-                  ].map((s, i) => (
-                    <div className="step" key={s}>
-                      <span>{i + 1}</span>
-                      {s}
-                    </div>
-                  ))}
-                  <p>
-                    Keep talking in this capture session. LeadLoop keeps a small
-                    conversation context so corrections update the same task.
-                  </p>
+                  <span className="pill">
+                    {conversation.stage.replaceAll("_", " ")}
+                  </span>
+                  <h2>LeadLoop’s current order</h2>
+                  {activeReminder ? (
+                    <dl className="conversation-reminder">
+                      <div>
+                        <dt>Reminder</dt>
+                        <dd>
+                          {activeReminder.title || "Listening for the task"}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Contact</dt>
+                        <dd>{activeReminder.person || "Not specified"}</dd>
+                      </div>
+                      <div>
+                        <dt>When</dt>
+                        <dd>
+                          {activeReminder.due
+                            ? dateLabel(activeReminder.due, timezone)
+                            : "Waiting for date and time"}
+                        </dd>
+                      </div>
+                    </dl>
+                  ) : (
+                    <p>
+                      Tell LeadLoop what you need to remember. It will ask only
+                      for what is missing.
+                    </p>
+                  )}
+                  {activeReminder && (
+                    <button
+                      className="manual-review-link"
+                      onClick={openReminderEditor}
+                    >
+                      <Pencil size={15} /> Edit reminder details
+                    </button>
+                  )}
                 </aside>
               </div>
               {(assistantMessage ||
-                reviewItems.length > 0 ||
-                pendingClarifications.length > 0 ||
-                cancelIds.length > 0) && (
+                activeReminder ||
+                conversation.lastSavedReminder) && (
                 <section className="assistant-review" aria-live="polite">
                   <div className="assistant-message">
                     <MessageCircle size={20} />
                     <div>
                       <span className="eyebrow">LEADLOOP</span>
                       <strong>
-                        {assistantMessage || "Here’s what I heard."}
+                        {assistantMessage || "I’m ready when you are."}
                       </strong>
                       <p>
-                        Review every change before it reaches your task list.
+                        {isSpeaking
+                          ? "Speaking now — recording is paused."
+                          : "Press to talk when you’re ready for the next turn."}
                       </p>
                     </div>
+                  </div>
+                  <div className="conversation-actions">
+                    <button
+                      className="button secondary"
+                      onClick={() =>
+                        speakReply(
+                          assistantMessage,
+                          conversation.stage === "reading_back",
+                        )
+                      }
+                      disabled={!assistantMessage || isSpeaking}
+                    >
+                      <RotateCw size={15} /> Replay response
+                    </button>
+                    <button
+                      className="button secondary"
+                      onClick={() => {
+                        setMuted((value) => !value);
+                        window.speechSynthesis?.cancel();
+                        setIsSpeaking(false);
+                      }}
+                    >
+                      {muted ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                      {muted ? "Unmute" : "Mute"}
+                    </button>
+                    <button
+                      className="review-dismiss"
+                      onClick={() => {
+                        if (
+                          !activeReminder ||
+                          window.confirm(
+                            "Discard the unfinished reminder and start over?",
+                          )
+                        ) {
+                          window.speechSynthesis?.cancel();
+                          setIsSpeaking(false);
+                          setConversation(emptyConversationState());
+                          setAssistantMessage("");
+                          setText("");
+                        }
+                      }}
+                    >
+                      <X size={15} /> Cancel or start over
+                    </button>
                   </div>
                   <div className="review-grid">
                     {reviewItems.map((item) => {

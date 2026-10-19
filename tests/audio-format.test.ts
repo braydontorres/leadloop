@@ -240,17 +240,8 @@ test("classifies a fetch failure as a network error without logging audio data",
 
 const interpretationContext = {
   history: [],
-  tasks: [
-    {
-      id: "task-1",
-      title: "Call Sarah",
-      person: "Sarah",
-      due: "2026-10-23T22:00:00.000Z",
-      notes: "",
-    },
-  ],
-  pending: [],
-  lastTaskId: "task-1",
+  activeReminder: null,
+  stage: "idle" as const,
 };
 
 test("classifies a rejected interpretation schema without calling it a transcription error", async () => {
@@ -306,12 +297,8 @@ test("sends an intent-only strict schema and parses a time-only update", async (
             {
               message: {
                 content: JSON.stringify({
-                  message: "Updated to 6 PM.",
                   intent: {
                     kind: "update",
-                    subject: "Sarah",
-                    clarificationField: null,
-                    question: null,
                     fields: {
                       title: null,
                       person: null,
@@ -374,12 +361,8 @@ test("returns a safe clarification for an invalid local date-time without exposi
             {
               message: {
                 content: JSON.stringify({
-                  message: "I added the Sarah reminder.",
                   intent: {
                     kind: "new_task",
-                    subject: "Sarah",
-                    clarificationField: null,
-                    question: null,
                     fields: {
                       title: "Talk to Sarah",
                       person: "Sarah",
@@ -403,7 +386,6 @@ test("returns a safe clarification for an invalid local date-time without exposi
         interpretationContext,
       );
       assert.equal(result.intent.kind, "follow_up");
-      assert.equal(result.intent.clarificationField, "due");
       assert.match(diagnostics.join("\n"), /LOCAL_DATE_TIME/);
       assert.doesNotMatch(diagnostics.join("\n"), /Talk to Sarah/);
     },
@@ -419,12 +401,8 @@ test("logs the failed validation rule without logging task content", async () =>
             {
               message: {
                 content: JSON.stringify({
-                  message: "Sarah should be updated.",
                   intent: {
                     kind: "update",
-                    subject: "Sarah",
-                    clarificationField: null,
-                    question: null,
                     fields: {
                       title: null,
                       person: null,
@@ -447,7 +425,7 @@ test("logs the failed validation rule without logging task content", async () =>
         "America/Chicago",
         interpretationContext,
       );
-      assert.equal(result.intent.clarificationField, "due");
+      assert.equal(result.intent.kind, "follow_up");
       assert.match(diagnostics.join("\n"), /LOCAL_DATE_TIME/);
       assert.match(diagnostics.join("\n"), /intent\.fields\.(date|time)/);
       assert.doesNotMatch(diagnostics.join("\n"), /Sarah should be updated/);

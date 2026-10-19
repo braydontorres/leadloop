@@ -4,7 +4,6 @@ import {
   type AssistantIntent,
   type ConversationContext,
   type IntentResult,
-  type PendingField,
 } from "./conversation-machine";
 
 const OPENAI_API_URL = "https://api.openai.com/v1";
@@ -13,13 +12,12 @@ const MAX_TEXT_LENGTH = 3000;
 const responseSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["message", "intent"],
+  required: ["intent"],
   properties: {
-    message: { type: "string" },
     intent: {
       type: "object",
       additionalProperties: false,
-      required: ["kind", "subject", "fields", "clarificationField", "question"],
+      required: ["kind", "fields"],
       properties: {
         kind: {
           type: "string",
@@ -27,17 +25,12 @@ const responseSchema = {
             "new_task",
             "follow_up",
             "update",
+            "confirm",
+            "reject",
             "cancel",
-            "clarify",
             "none",
           ],
         },
-        subject: { type: ["string", "null"] },
-        clarificationField: {
-          type: ["string", "null"],
-          enum: ["due", "title", "task_choice", null],
-        },
-        question: { type: ["string", "null"] },
         fields: {
           type: "object",
           additionalProperties: false,
@@ -123,13 +116,13 @@ export function validateInterpretationInput(input: unknown) {
 }
 
 function systemPrompt(timeZone: string, context: ConversationContext) {
-  return `You are LeadLoop's language interpreter. Return only JSON matching the schema. The application owns every task ID, lifecycle state, pending question, date conversion, and mutation. Never return a task ID or an executable operation.
+  return `You are LeadLoop's language interpreter for one active reminder conversation. Return only JSON matching the schema. The application owns task IDs, dialogue stage, missing-field questions, read-back wording, confirmation, and saving. Never return an ID, a question, an executable operation, or a claim that a reminder was saved.
 
-The user's configured time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Resolve relative dates to date as YYYY-MM-DD and time as HH:MM in that time zone. Do not return an ISO timestamp. Never invent dates, times, contacts, or task details.
+The user's configured time zone is ${timeZone}. The current local date and time is ${localDateTimeContext(timeZone)}. Resolve relative dates to date as YYYY-MM-DD and time as HH:MM in that time zone. Do not return an ISO timestamp. Never invent dates, times, contacts, or task details. Use null for every unchanged or unknown field.
 
-Choose new_task only when the user clearly starts a separate reminder, including “also remind me”. Choose follow_up when the user answers the one pending question. Choose update or cancel for an existing reminder and put a short identifying subject in subject when the user names one. Choose clarify with clarificationField task_choice when more than one reminder could match. For corrections such as “actually make it 5 PM”, choose follow_up or update and include only changed fields. Use null for every unchanged field. If a task is missing a reminder date or time, choose clarify with clarificationField due and a concise question. A user must confirm before anything is saved.
+Choose new_task for a new reminder, follow_up when the user supplies requested details, update for a correction, confirm for yes/correct/that's right, reject for no/not right, cancel for cancel/never mind, and none when no supported intent is clear. A confirmation does not include task fields. A correction such as “make it 6 PM” only includes time. The active reminder is the only reminder this turn may change.
 
-CONVERSATION HISTORY:\n${JSON.stringify(context.history)}\n\nTASKS:\n${JSON.stringify(context.tasks)}\n\nPENDING CLARIFICATIONS:\n${JSON.stringify(context.pending)}\n\nLAST ACTIVE TASK ID (context only; never return it):\n${JSON.stringify(context.lastTaskId ?? null)}`;
+CONVERSATION STAGE:\n${JSON.stringify(context.stage)}\n\nACTIVE REMINDER:\n${JSON.stringify(context.activeReminder)}\n\nCONVERSATION HISTORY:\n${JSON.stringify(context.history)}`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -152,8 +145,9 @@ function parseIntent(value: unknown): IntentResult {
     kind !== "new_task" &&
     kind !== "follow_up" &&
     kind !== "update" &&
+    kind !== "confirm" &&
+    kind !== "reject" &&
     kind !== "cancel" &&
-    kind !== "clarify" &&
     kind !== "none"
   )
     throw new Error("Invalid intent kind.");
@@ -165,23 +159,11 @@ function parseIntent(value: unknown): IntentResult {
     throw new Error("Invalid local date.");
   if (time !== null && !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time))
     throw new Error("Invalid local time.");
-  const clarificationField = intent.clarificationField;
-  if (
-    clarificationField !== null &&
-    clarificationField !== "due" &&
-    clarificationField !== "title" &&
-    clarificationField !== "task_choice"
-  )
-    throw new Error("Invalid clarification field.");
   if (typeof fields.clearDue !== "boolean")
     throw new Error("Invalid clear reminder flag.");
   return {
-    message:
-      nullableText(value.message, "assistant message", 500) ||
-      "I’m ready when you are.",
     intent: {
       kind,
-      subject: nullableText(intent.subject, "task subject", 240),
       fields: {
         title: nullableText(fields.title, "task title", 240),
         person: nullableText(fields.person, "person", 160),
@@ -190,8 +172,6 @@ function parseIntent(value: unknown): IntentResult {
         notes: nullableText(fields.notes, "notes", 1000),
         clearDue: fields.clearDue,
       },
-      clarificationField: clarificationField as PendingField | null,
-      question: nullableText(intent.question, "clarification", 400),
     } as AssistantIntent,
   };
 }
@@ -458,10 +438,8 @@ export async function interpretThought(
       message === "Invalid local time."
     ) {
       return {
-        message: "I need a valid date and time for that reminder.",
         intent: {
           kind: "follow_up",
-          subject: null,
           fields: {
             title: null,
             person: null,
@@ -470,8 +448,6 @@ export async function interpretThought(
             notes: null,
             clearDue: false,
           },
-          clarificationField: "due",
-          question: "What date and time would you like?",
         },
       };
     }

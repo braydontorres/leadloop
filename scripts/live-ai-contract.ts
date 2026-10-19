@@ -27,7 +27,7 @@ if (!process.env.OPENAI_API_KEY) {
 const result = await interpretThought(
   "Remind me to review the test contract tomorrow at 9 AM.",
   "America/Chicago",
-  { history: [], tasks: [], pending: [] },
+  { history: [], activeReminder: null, stage: "idle" },
 );
 
 if (

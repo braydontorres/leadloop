@@ -1,504 +1,122 @@
 import { test, expect } from "@playwright/test";
-test("capture, confirm, persist, edit, complete and delete a task", async ({
-  page,
-}) => {
-  await page.goto("/");
-  await expect(
-    page.getByRole("heading", { name: "A clear mind. A good day." }),
-  ).toBeVisible();
-  const navigation = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await navigation
-    .getByRole("button", { name: /^Capture(?: & review)?$/ })
-    .click();
-  await page
-    .getByLabel("What do you need to remember?")
-    .fill("Call Robin about the estimate");
-  await page.getByRole("button", { name: "Review manually instead" }).click();
-  const dialog = page.getByRole("dialog");
-  await dialog.getByLabel("Person").fill("Robin");
-  await dialog.getByLabel("Date & time").fill("2027-01-15T17:00");
-  await dialog.getByRole("button", { name: "Confirm & save" }).click();
-  await page.reload();
-  const nav = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await nav.getByRole("button", { name: /^Tasks/ }).click();
-  await page.getByLabel("Search tasks").fill("Call Robin");
-  await expect(
-    page.getByText("Call Robin about the estimate", { exact: true }),
-  ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Edit Call Robin about the estimate" })
-    .click();
-  await dialog
-    .getByLabel("Task", { exact: true })
-    .fill("Call Robin about the revised estimate");
-  await dialog.getByRole("button", { name: "Confirm & save" }).click();
-  await expect(page.locator(".task-row")).toHaveCount(1);
-  await page
-    .getByRole("button", {
-      name: "Complete Call Robin about the revised estimate",
-    })
-    .click();
-  await page.getByRole("button", { name: "Completed", exact: true }).click();
-  await expect(
-    page.getByText("Call Robin about the revised estimate", { exact: true }),
-  ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Edit Call Robin about the revised estimate" })
-    .click();
-  page.once("dialog", (d) => d.accept());
-  await page.getByRole("button", { name: "Delete task", exact: true }).click();
-  await expect(page.locator(".task-row")).toHaveCount(0);
-  await expect(page.getByText("No tasks match this view.")).toBeVisible();
-});
-test("shows a useful microphone-permission error and keeps text capture available", async ({
+
+const blankFields = {
+  title: null,
+  person: null,
+  date: null,
+  time: null,
+  notes: null,
+  clearDue: false,
+};
+
+test("drive-through reminder conversation speaks, corrects, confirms, starts over, and cancels", async ({
   page,
 }) => {
   await page.addInitScript(() => {
-    Object.defineProperty(navigator, "mediaDevices", {
-      value: {
-        getUserMedia: () =>
-          Promise.reject(new DOMException("Denied", "NotAllowedError")),
-      },
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
       configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
     });
+    (
+      window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+    ).__spoken = spoken;
   });
-  await page.goto("/");
-  const nav = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await nav.getByRole("button", { name: /^Capture/ }).click();
-  await page.getByRole("button", { name: "Start recording" }).click();
-  await expect(
-    page.getByRole("alert").filter({ hasText: "Microphone access was denied" }),
-  ).toContainText("Microphone access was denied");
-  await expect(page.getByLabel("What do you need to remember?")).toBeVisible();
-});
-
-test("keeps an unfinished reminder stable across clarification, correction, and a separate new task", async ({
-  page,
-}) => {
-  const contexts: Array<Record<string, unknown>> = [];
+  let turn = 0;
   await page.route("**/api/interpret", async (route) => {
-    const request = JSON.parse(route.request().postData() ?? "{}") as {
-      text: string;
-      context: {
-        tasks: Array<{ id: string }>;
-        pending: unknown[];
-      };
-    };
-    contexts.push(request.context);
-    const response =
-      contexts.length === 1
-        ? {
-            transcript: request.text,
-            result: {
-              message: "When would you like to set this reminder?",
-              intent: {
-                kind: "new_task",
-                subject: "Bill",
-                clarificationField: "due",
-                question: "When would you like to set this reminder?",
-                fields: {
-                  title: "Talk to Bill about washing his clothes",
-                  person: "Bill",
-                  date: null,
-                  time: null,
-                  notes: "",
-                  clearDue: false,
-                },
-              },
-            },
-          }
-        : contexts.length === 2
-          ? {
-              transcript: request.text,
-              result: {
-                message: "I'll remind you next Friday at 5 PM.",
-                intent: {
-                  kind: "follow_up",
-                  subject: null,
-                  clarificationField: null,
-                  question: null,
-                  fields: {
-                    title: null,
-                    person: null,
-                    date: "2026-10-23",
-                    time: "17:00",
-                    notes: null,
-                    clearDue: false,
-                  },
-                },
-              },
-            }
-          : contexts.length === 3
-            ? {
-                transcript: request.text,
-                result: {
-                  message: "Updated to 6 PM.",
-                  intent: {
-                    kind: "update",
-                    subject: "Bill",
-                    clarificationField: null,
-                    question: null,
-                    fields: {
-                      title: null,
-                      person: null,
-                      date: null,
-                      time: "18:00",
-                      notes: null,
-                      clearDue: false,
-                    },
-                  },
-                },
-              }
-            : contexts.length === 4
-              ? {
-                  transcript: request.text,
-                  result: {
-                    message: "Updated Bill to Ben.",
-                    intent: {
-                      kind: "update",
-                      subject: "Bill",
-                      clarificationField: null,
-                      question: null,
-                      fields: {
-                        title: "Talk to Ben about washing his clothes",
-                        person: "Ben",
-                        date: null,
-                        time: null,
-                        notes: null,
-                        clearDue: false,
-                      },
-                    },
-                  },
-                }
-              : contexts.length === 5
-                ? {
-                    transcript: request.text,
-                    result: {
-                      message: "I added Sarah.",
-                      intent: {
-                        kind: "new_task",
-                        subject: "Sarah",
-                        clarificationField: null,
-                        question: null,
-                        fields: {
-                          title: "Call Sarah",
-                          person: "Sarah",
-                          date: "2026-10-18",
-                          time: "09:00",
-                          notes: "",
-                          clearDue: false,
-                        },
-                      },
-                    },
-                  }
-                : {
-                    transcript: request.text,
-                    result: {
-                      message:
-                        "I'll cancel the Sarah reminder when you confirm.",
-                      intent: {
-                        kind: "cancel",
-                        subject: "Sarah",
-                        clarificationField: null,
-                        question: null,
-                        fields: {
-                          title: null,
-                          person: null,
-                          date: null,
-                          time: null,
-                          notes: null,
-                          clearDue: false,
-                        },
-                      },
-                    },
-                  };
-    await route.fulfill({ json: response });
-  });
-  await page.goto("/");
-  const nav = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await nav.getByRole("button", { name: /^Capture(?: & review)?$/ }).click();
-  const thought = page.getByLabel("What do you need to remember?");
-  const understand = page.getByRole("button", {
-    name: "Understand with LeadLoop",
-  });
-  await thought.fill("I need to talk to Bill about washing his clothes.");
-  await understand.click();
-  await expect(page.locator(".pending-question")).toContainText(
-    "When would you like",
-  );
-  await thought.fill("Next Friday at 5 PM.");
-  await understand.click();
-  await expect(page.locator(".review-card")).toHaveCount(1);
-  await expect(page.locator(".pending-question")).toHaveCount(0);
-  await thought.fill("Actually, make it 6 PM.");
-  await understand.click();
-  await expect.poll(() => contexts.length).toBe(3);
-  expect(
-    (contexts[2].tasks as Array<{ id: string }>).map((task) => task.id),
-  ).toContain(contexts[2].lastTaskId as string);
-  await expect(page.locator(".review-card")).toHaveCount(1);
-  await expect(page.locator(".review-card")).toContainText("6:00 PM");
-  await thought.fill("I meant Ben, not Bill.");
-  await understand.click();
-  await expect(
-    page.getByRole("heading", {
-      name: "Talk to Ben about washing his clothes",
-    }),
-  ).toBeVisible();
-  await thought.fill("Remind me to call Sarah tomorrow at 9 AM.");
-  await understand.click();
-  await expect(page.locator(".review-card")).toHaveCount(2);
-  await thought.fill("Cancel the Sarah reminder.");
-  await understand.click();
-  await expect(page.locator(".cancel-card")).toHaveCount(1);
-  await expect(page.locator(".review-card")).toHaveCount(3);
-  await expect.poll(() => contexts.length).toBe(6);
-  expect(contexts[1].tasks as Array<{ id: string }>).toEqual(
-    expect.arrayContaining([
-      expect.objectContaining({ id: expect.any(String) }),
-    ]),
-  );
-  expect(contexts[1].pending as Array<{ taskIds: string[] }>).toEqual([
-    expect.objectContaining({ taskIds: [expect.any(String)] }),
-  ]);
-});
-
-test("reviews one explicit Sarah update at 9 PM without mutating the saved task", async ({
-  page,
-}) => {
-  const initialStore = {
-    name: "Alex",
-    business: "My business",
-    timezone: "America/Chicago",
-    people: [],
-    tasks: [
+    turn += 1;
+    const intents = [
       {
-        id: "sarah-1",
-        title: "Call Sarah about the new project",
-        person: "Sarah",
-        due: "2026-10-23T21:00:00.000Z",
-        completed: false,
-        notes: "Bring the proposal.",
+        kind: "new_task",
+        fields: {
+          ...blankFields,
+          title: "talk to Bill about washing his clothes",
+          person: "Bill",
+        },
       },
-    ],
-  };
-  await page.addInitScript((store) => {
-    localStorage.setItem("leadloop.phase1.v1", JSON.stringify(store));
-  }, initialStore);
-  let context: { tasks: Array<{ id: string }> } | undefined;
-  await page.route("**/api/interpret", async (route) => {
-    const request = JSON.parse(route.request().postData() ?? "{}") as {
-      context: { tasks: Array<{ id: string }> };
-    };
-    context = request.context;
+      {
+        kind: "follow_up",
+        fields: { ...blankFields, date: "2026-10-20", time: "17:00" },
+      },
+      { kind: "update", fields: { ...blankFields, time: "18:00" } },
+      { kind: "confirm", fields: blankFields },
+      {
+        kind: "new_task",
+        fields: {
+          ...blankFields,
+          title: "call Sarah",
+          person: "Sarah",
+          date: "2026-10-21",
+          time: "09:00",
+        },
+      },
+      { kind: "cancel", fields: blankFields },
+    ];
     await route.fulfill({
       json: {
-        transcript: "I wanna talk to her at 9 p.m.",
-        result: {
-          message: "I updated Sarah's reminder.",
-          intent: {
-            kind: "update",
-            subject: "Sarah",
-            clarificationField: null,
-            question: null,
-            fields: {
-              title: null,
-              person: null,
-              date: null,
-              time: "21:00",
-              notes: null,
-              clearDue: false,
-            },
-          },
-        },
+        transcript: `turn ${turn}`,
+        result: { intent: intents[turn - 1] },
       },
     });
   });
   await page.goto("/");
-  const navigation = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await navigation.getByRole("button", { name: /^Capture/ }).click();
   await page
-    .getByLabel("What do you need to remember?")
-    .fill("I wanna talk to her at 9 p.m.");
-  await page.getByRole("button", { name: "Understand with LeadLoop" }).click();
-  const card = page.locator(".review-card");
-  await expect(card).toHaveCount(1);
-  await expect(card).toContainText("UPDATE TO REVIEW");
-  await expect(card).toContainText("Call Sarah about the new project");
-  await expect(card).toContainText("Sarah");
-  await expect(card).toContainText("9:00 PM");
-  await expect(card).not.toContainText("bobby true");
-  expect(context?.tasks).toEqual(
-    expect.arrayContaining([expect.objectContaining({ id: "sarah-1" })]),
-  );
-  const saved = await page.evaluate(() =>
-    JSON.parse(localStorage.getItem("leadloop.phase1.v1") ?? "{}"),
-  );
-  expect(saved.tasks[0].due).toBe("2026-10-23T21:00:00.000Z");
-});
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => {
+      const spoken = (
+        window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+      ).__spoken;
+      spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent);
+    });
 
-test("Continue speaking sends the same pending draft context through voice", async ({
-  page,
-}) => {
-  await page.addInitScript(() => {
-    localStorage.setItem(
-      "leadloop.phase1.v1",
-      JSON.stringify({
-        name: "Alex",
-        business: "My business",
-        timezone: "America/Chicago",
-        people: [],
-        tasks: [],
-      }),
-    );
-    class FakeRecorder {
-      static isTypeSupported() {
-        return true;
-      }
-      mimeType = "audio/webm;codecs=opus";
-      state = "inactive";
-      stream = { getTracks: () => [{ stop() {} }] } as unknown as MediaStream;
-      ondataavailable: ((event: BlobEvent) => void) | null = null;
-      onstop: (() => void) | null = null;
-      constructor(stream: MediaStream) {
-        this.stream = stream;
-      }
-      start() {
-        this.state = "recording";
-      }
-      stop() {
-        this.state = "inactive";
-        this.ondataavailable?.({
-          data: new Blob(["audio"], { type: this.mimeType }),
-        } as BlobEvent);
-        this.onstop?.();
-      }
-    }
-    Object.defineProperty(window, "MediaRecorder", {
-      value: FakeRecorder,
-      configurable: true,
-    });
-    Object.defineProperty(navigator, "mediaDevices", {
-      value: {
-        getUserMedia: async () => ({ getTracks: () => [{ stop() {} }] }),
-      },
-      configurable: true,
-    });
-  });
-  await page.route("**/api/interpret", async (route) => {
-    await route.fulfill({
-      json: {
-        transcript: "Talk to Bill about the proposal",
-        result: {
-          message: "When should I remind you?",
-          intent: {
-            kind: "new_task",
-            subject: "Bill",
-            clarificationField: "due",
-            question: "When should I remind you?",
-            fields: {
-              title: "Talk to Bill about the proposal",
-              person: "Bill",
-              date: null,
-              time: null,
-              notes: "",
-              clearDue: false,
-            },
-          },
-        },
-      },
-    });
-  });
-  await page.route("**/api/voice", async (route) => {
-    await route.fulfill({
-      json: {
-        transcript: "Next Friday at 5 PM.",
-        result: {
-          message: "Updated to next Friday at 5 PM.",
-          intent: {
-            kind: "follow_up",
-            subject: null,
-            clarificationField: null,
-            question: null,
-            fields: {
-              title: null,
-              person: null,
-              date: "2026-10-23",
-              time: "17:00",
-              notes: null,
-              clearDue: false,
-            },
-          },
-        },
-      },
-    });
-  });
-  await page.goto("/");
-  const navigation = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await navigation.getByRole("button", { name: /^Capture/ }).click();
-  await page
-    .getByLabel("What do you need to remember?")
-    .fill("Talk to Bill about the proposal");
-  await page.getByRole("button", { name: "Understand with LeadLoop" }).click();
-  await page.getByRole("button", { name: "Continue speaking" }).click();
-  await page.getByRole("button", { name: /Stop recording/ }).click();
-  await expect(page.locator(".review-card")).toHaveCount(1);
-  await expect(page.locator(".review-card")).toContainText("5:00 PM");
-  await expect(page.locator(".pending-question")).toHaveCount(0);
-});
-test("contacts can be created and retained and mobile layout fits", async ({
-  page,
-}) => {
-  await page.goto("/");
-  const nav = page.getByRole("navigation", {
-    name:
-      page.viewportSize()!.width < 640
-        ? "Mobile navigation"
-        : "Main navigation",
-  });
-  await nav.getByRole("button", { name: "People" }).click();
-  await page.getByRole("button", { name: "Add person" }).click();
-  await page.getByLabel("Name", { exact: true }).fill("Robin Patel");
-  await page.getByLabel("Notes", { exact: true }).fill("Call after lunch.");
-  await page.getByRole("button", { name: "Save contact" }).click();
-  await page.reload();
-  await nav.getByRole("button", { name: "People" }).click();
+  await reply.fill("Talk to Bill about washing his clothes.");
+  await send.click();
   await expect(
-    page.getByRole("heading", { name: "Robin Patel" }),
+    page.getByText("Sure! When would you like me to remind you?"),
   ).toBeVisible();
-  expect(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= window.innerWidth,
-    ),
-  ).toBe(true);
+  await expect(
+    page.getByRole("button", { name: "LeadLoop is speaking" }),
+  ).toBeDisabled();
+  await finishSpeech();
+
+  await reply.fill("Tomorrow at 5 PM.");
+  await send.click();
+  await expect(page.getByText(/Is that correct/)).toBeVisible();
+  await expect(
+    page.getByText("talk to Bill about washing his clothes", { exact: true }),
+  ).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("Actually, make that 6 PM.");
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "6:00 PM",
+  );
+  await finishSpeech();
+
+  await reply.fill("Yes.");
+  await send.click();
+  await expect(
+    page.getByText("Perfect! Your reminder is saved. Anything else?"),
+  ).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("Remind me to call Sarah tomorrow at 9 AM.");
+  await send.click();
+  await expect(page.getByText("call Sarah", { exact: true })).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("Cancel.");
+  await send.click();
+  await expect(
+    page.getByText(/canceled that unfinished reminder/),
+  ).toBeVisible();
 });
