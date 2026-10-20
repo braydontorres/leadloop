@@ -435,17 +435,17 @@ export function naturalTimeFromText(text: string) {
           : hour;
     return `${String(converted).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   };
-  const meridiem = String.raw`([ap])\\s*\\.?\\s*m\\.?`;
+  const meridiem = String.raw`([ap])\s*\.?\s*m\.?`;
   const hour = String.raw`(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|0?[1-9])`;
 
-  if (/\\bnoon\\b/i.test(text)) return { time: "12:00", ambiguous: false };
-  if (/\\bmidnight\\b/i.test(text)) return { time: "00:00", ambiguous: false };
+  if (/\bnoon\b/i.test(text)) return { time: "12:00", ambiguous: false };
+  if (/\bmidnight\b/i.test(text)) return { time: "00:00", ambiguous: false };
 
   // Match complete spoken-clock expressions before generic numeric clocks.
   // Otherwise "a quarter to 5 p.m." is prematurely consumed as "5 p.m.".
   const named = text.match(
     new RegExp(
-      String.raw`\\b(?:a\\s+)?(half past|quarter past|quarter to)\\s+${hour}(?:\\s*${meridiem})?(?=\\s|[,.!?;:]|$)`,
+      String.raw`\b(?:a\s+)?(half past|quarter past|quarter to)\s+${hour}(?:\s*${meridiem})?(?=\s|[,.!?;:]|$)`,
       "i",
     ),
   );
@@ -475,7 +475,7 @@ export function naturalTimeFromText(text: string) {
 
   const spoken = text.match(
     new RegExp(
-      String.raw`\\b(?:at\\s+)?${hour}\\s+(fifteen|thirty|forty[- ]five)\\s*${meridiem}(?=\\s|[,.!?;:]|$)`,
+      String.raw`\b(?:at\s+)?${hour}\s+(fifteen|thirty|forty[- ]five)\s*${meridiem}(?=\s|[,.!?;:]|$)`,
       "i",
     ),
   );
@@ -493,7 +493,7 @@ export function naturalTimeFromText(text: string) {
 
   const clock = text.match(
     new RegExp(
-      String.raw`\\b(?:at\\s*)?(1[0-2]|0?[1-9])(?::([0-5]\\d))?\\s*${meridiem}(?=\\s|[,.!?;:]|$)`,
+      String.raw`\b(?:at\s*)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*${meridiem}(?=\s|[,.!?;:]|$)`,
       "i",
     ),
   );
@@ -504,7 +504,7 @@ export function naturalTimeFromText(text: string) {
     };
 
   const daypart = text.match(
-    /\\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\\s+(?:in\\s+the\\s+)?(morning|afternoon|evening|night)\\b/i,
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(?:in\s+the\s+)?(morning|afternoon|evening|night)\b/i,
   );
   if (daypart) {
     let daypartHour = toHour(daypart[1]);
@@ -519,7 +519,7 @@ export function naturalTimeFromText(text: string) {
   }
 
   const ambiguousClock = new RegExp(
-    String.raw`\\b(?:(?:a\\s+)?(?:half past|quarter past|quarter to)\\s+${hour}|${hour}\\s+(?:fifteen|thirty|forty[- ]five))\\b`,
+    String.raw`\b(?:(?:a\s+)?(?:half past|quarter past|quarter to)\s+${hour}|${hour}\s+(?:fifteen|thirty|forty[- ]five))\b`,
     "i",
   ).test(text);
   return { time: null, ambiguous: ambiguousClock };

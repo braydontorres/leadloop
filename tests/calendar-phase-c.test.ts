@@ -141,6 +141,29 @@ test("Phase C understands safe spoken clocks and keeps ambiguous clocks unanswer
   });
 });
 
+test("Phase C spoken-time patterns use regex tokens rather than literal backslashes", () => {
+  const expressions = [
+    ["noon", "12:00"],
+    ["midnight", "00:00"],
+    ["five in the morning", "05:00"],
+    ["at 8:15 PM", "20:15"],
+    ["half past three PM", "15:30"],
+  ] as const;
+  for (const [text, expected] of expressions) {
+    assert.deepEqual(naturalTimeFromText(text), {
+      time: expected,
+      ambiguous: false,
+    });
+  }
+
+  // A doubled backslash in a String.raw pattern would match this literal
+  // sequence. Real regex boundaries must not.
+  assert.deepEqual(naturalTimeFromText(String.raw`\bnoon\b`), {
+    time: null,
+    ambiguous: false,
+  });
+});
+
 test("Phase C spoken clocks prefer complete expressions over overlapping clock substrings", () => {
   const required = [
     ["Quarter to five PM", "16:45"],
@@ -175,14 +198,25 @@ test("Phase C spoken clocks prefer complete expressions over overlapping clock s
   for (let hour = 1; hour <= 12; hour += 1) {
     const word = words[hour % 12];
     for (const marker of ["AM", "PM"] as const) {
-      const base = marker === "PM" ? (hour === 12 ? 12 : hour + 12) : hour === 12 ? 0 : hour;
+      const base =
+        marker === "PM"
+          ? hour === 12
+            ? 12
+            : hour + 12
+          : hour === 12
+            ? 0
+            : hour;
       for (const sourceHour of [String(hour), word]) {
         assert.equal(
-          naturalTimeFromText(`Please make it half past ${sourceHour} ${marker}.`).time,
+          naturalTimeFromText(
+            `Please make it half past ${sourceHour} ${marker}.`,
+          ).time,
           `${String(base).padStart(2, "0")}:30`,
         );
         assert.equal(
-          naturalTimeFromText(`Set it for quarter past ${sourceHour} ${marker}, please.`).time,
+          naturalTimeFromText(
+            `Set it for quarter past ${sourceHour} ${marker}, please.`,
+          ).time,
           `${String(base).padStart(2, "0")}:15`,
         );
       }
