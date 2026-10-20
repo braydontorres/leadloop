@@ -16,6 +16,7 @@
     "test:calendar": "tsx --test tests/calendar-reliability-audit.test.ts tests/calendar-api-audit.test.ts tests/calendar-phase-c.test.ts tests/interpret-route.test.ts"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.118.0",
     "lucide-react": "^0.468.0",
     "next": "^16.4.2",
     "react": "^19.1.0",

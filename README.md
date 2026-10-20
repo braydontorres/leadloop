@@ -94,3 +94,12 @@ Spent by this implementation: **$0**. Current local development has no recurring
 For a small pilot, `gpt-4o-mini-transcribe` and `gpt-4o-mini` are selected for low cost. A rough planning estimate is around $0.01–$0.03 for a one-minute recording plus one short interpretation, depending on current OpenAI pricing, audio duration, and token use. Set a low OpenAI project budget and usage alerts before testing with real customers. A capped $5–15/month AI trial budget remains sensible; confirm current provider pricing before spending.
 
 Never put secret keys in `NEXT_PUBLIC_*` variables or committed files. Future credentials belong in server-side hosting/environment settings, never chat. No secrets are required or consumed by this version.
+
+## Phase 3A.1 cloud foundation
+
+The optional cloud foundation is available on `feat/cloud-foundation-phase-3a`.
+It adds a Supabase schema, workspace RLS design, typed browser data-access
+boundary, and an explicit non-destructive local import design. It does **not**
+connect this local prototype to a live Supabase project automatically. See
+[cloud setup and migration details](docs/cloud-foundation.md) and the
+[iPhone/Expo architecture](docs/mobile-architecture.md).
