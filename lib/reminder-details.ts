@@ -329,6 +329,16 @@ export function deterministicDateFromText(
   const monthDay = explicitMonthDay(text, constraint);
   if (monthDay && constraint?.year !== null) return monthDay;
   const local = localParts(now, timeZone);
+  if (/\bday after tomorrow\b/i.test(text)) {
+    const dayAfterTomorrow = new Date(
+      Date.UTC(local.year, local.month - 1, local.day + 2),
+    );
+    return dateString(
+      dayAfterTomorrow.getUTCFullYear(),
+      dayAfterTomorrow.getUTCMonth() + 1,
+      dayAfterTomorrow.getUTCDate(),
+    );
+  }
   if (/\btoday\b/i.test(text))
     return dateString(local.year, local.month, local.day);
   if (/\btomorrow\b/i.test(text)) {
