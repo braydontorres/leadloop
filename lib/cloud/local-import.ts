@@ -1,6 +1,8 @@
 import { STORAGE_KEY, migrateStore, type Store } from "../tasks";
 import type {
+  CloudImportConflicts,
   CloudImportCounts,
+  CloudImportPreparation,
   CloudImportPreview,
   CloudImportResult,
   LocalCloudSnapshot,
@@ -8,43 +10,68 @@ import type {
 
 const BACKUP_SUFFIX = ".cloud-import-backup.v1";
 const JOURNAL_SUFFIX = ".cloud-import-journal.v1";
-
 type StorageLike = Pick<Storage, "getItem" | "setItem">;
 
 export type LocalImportGateway = {
-  importSnapshot(input: {
+  prepareImport(input: {
     workspaceId: string;
-    sourceFingerprint: string;
-    snapshot: LocalCloudSnapshot;
+    sourceDigest: string;
+    snapshotJson: string;
+  }): Promise<CloudImportPreparation>;
+  importPreparedSnapshot(input: {
+    workspaceId: string;
+    importId: string;
+    sourceDigest: string;
+    snapshotJson: string;
   }): Promise<CloudImportResult>;
+  markRolledBack(input: {
+    workspaceId: string;
+    importId: string;
+    reason: string;
+  }): Promise<void>;
 };
 
 export type ImportJournal = {
   workspaceId: string;
-  sourceFingerprint: string;
+  sourceDigest: string;
+  importId: string | null;
   startedAt: string;
 };
 
-function stable(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+export class LocalImportConflictError extends Error {
+  constructor(readonly conflicts: CloudImportConflicts) {
+    super(
+      "Cloud import found existing records with matching IDs. Resolve the conflict before importing.",
+    );
+  }
+}
+
+/** Canonical JSON avoids digest differences caused only by object key order. */
+export function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
     return `{${Object.keys(record)
       .sort()
-      .map((key) => `${JSON.stringify(key)}:${stable(record[key])}`)
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
       .join(",")}}`;
   }
   return JSON.stringify(value);
 }
 
-/** Deterministic source identity; the server also stores it under a unique workspace constraint. */
-export function localSnapshotFingerprint(snapshot: LocalCloudSnapshot) {
-  let hash = 2166136261;
-  for (const char of stable(snapshot)) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
+function hex(bytes: ArrayBuffer) {
+  return Array.from(new Uint8Array(bytes), (value) =>
+    value.toString(16).padStart(2, "0"),
+  ).join("");
+}
+
+/** Collision-resistant digest used by both the client and PostgreSQL RPC. */
+export async function snapshotDigest(snapshotJson: string) {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("This browser cannot securely prepare a cloud import.");
   }
-  return `leadloop-local-v1-${(hash >>> 0).toString(16)}`;
+  const bytes = new TextEncoder().encode(snapshotJson);
+  return `sha256:${hex(await globalThis.crypto.subtle.digest("SHA-256", bytes))}`;
 }
 
 function snapshotFrom(store: Store): LocalCloudSnapshot {
@@ -75,9 +102,12 @@ export function importCounts(snapshot: LocalCloudSnapshot): CloudImportCounts {
   };
 }
 
-/** Validate relations before anything is uploaded; no local data is changed. */
-export function previewLocalCloudImport(store: Store): CloudImportPreview {
+/** Validate local relationships before anything is sent to a cloud provider. */
+export async function previewLocalCloudImport(
+  store: Store,
+): Promise<CloudImportPreview> {
   const snapshot = snapshotFrom(store);
+  const snapshotJson = canonicalJson(snapshot);
   const customerIds = new Set(snapshot.people.map((person) => person.id));
   const quoteIds = new Set(snapshot.quotes.map((quote) => quote.id));
   const warnings: string[] = [];
@@ -98,28 +128,24 @@ export function previewLocalCloudImport(store: Store): CloudImportPreview {
     snapshot.tasks.map((task) => task.id),
     "task",
   );
-
   for (const quote of snapshot.quotes) {
-    if (!customerIds.has(quote.customerId)) {
+    if (!customerIds.has(quote.customerId))
       errors.push(`Quote ${quote.id} references a missing customer.`);
-    }
   }
   for (const task of snapshot.tasks) {
-    if (task.personId && !customerIds.has(task.personId)) {
+    if (task.personId && !customerIds.has(task.personId))
       errors.push(`Task ${task.id} references a missing customer.`);
-    }
-    if (task.quoteId && !quoteIds.has(task.quoteId)) {
+    if (task.quoteId && !quoteIds.has(task.quoteId))
       errors.push(`Task ${task.id} references a missing quote.`);
-    }
-    if (!task.personId && task.person) {
+    if (!task.personId && task.person)
       warnings.push(
         `Task ${task.id} retains its legacy name-only customer link.`,
       );
-    }
   }
   return {
     sourceStorageKey: STORAGE_KEY,
-    sourceFingerprint: localSnapshotFingerprint(snapshot),
+    sourceDigest: await snapshotDigest(snapshotJson),
+    snapshotJson,
     counts: importCounts(snapshot),
     warnings,
     errors,
@@ -127,10 +153,20 @@ export function previewLocalCloudImport(store: Store): CloudImportPreview {
   };
 }
 
+function hasConflicts(conflicts: CloudImportConflicts) {
+  return Object.values(conflicts).some((ids) => ids.length > 0);
+}
+
+function safeFailureReason(error: unknown) {
+  if (error instanceof Error && /^[\w .,:;()/-]{1,300}$/.test(error.message))
+    return error.message;
+  return "The cloud transaction was rejected.";
+}
+
 /**
- * Explicitly approved, retry-safe import. A local backup and small journal are
- * written first; browser data is never deleted. The gateway must be atomic and
- * idempotent by (workspaceId, sourceFingerprint).
+ * Explicitly approved and retry-safe. A network interruption leaves a
+ * `prepared` journal entry for retry; a confirmed transaction rejection is
+ * recorded as `rolled_back`. Local browser data is never deleted.
  */
 export async function importApprovedLocalWorkspace(args: {
   storage: StorageLike;
@@ -142,32 +178,69 @@ export async function importApprovedLocalWorkspace(args: {
 }) {
   if (!args.approved)
     throw new Error("Review and approve the local-data import first.");
-  const preview = previewLocalCloudImport(args.store);
+  const preview = await previewLocalCloudImport(args.store);
   if (preview.errors.length) throw new Error(preview.errors.join(" "));
   const raw = args.storage.getItem(STORAGE_KEY) ?? JSON.stringify(args.store);
   const backupKey = `${STORAGE_KEY}${BACKUP_SUFFIX}`;
   if (!args.storage.getItem(backupKey)) args.storage.setItem(backupKey, raw);
+  const preparation = await args.gateway.prepareImport({
+    workspaceId: args.workspaceId,
+    sourceDigest: preview.sourceDigest,
+    snapshotJson: preview.snapshotJson,
+  });
+  if (!preparation.ready || hasConflicts(preparation.conflicts)) {
+    throw new LocalImportConflictError(preparation.conflicts);
+  }
+  if (!preparation.importId)
+    throw new Error("Cloud import preparation did not return an import ID.");
   const journal: ImportJournal = {
     workspaceId: args.workspaceId,
-    sourceFingerprint: preview.sourceFingerprint,
+    sourceDigest: preview.sourceDigest,
+    importId: preparation.importId,
     startedAt: (args.now ?? (() => new Date().toISOString()))(),
   };
   args.storage.setItem(
     `${STORAGE_KEY}${JOURNAL_SUFFIX}`,
     JSON.stringify(journal),
   );
-  const result = await args.gateway.importSnapshot({
-    workspaceId: args.workspaceId,
-    sourceFingerprint: preview.sourceFingerprint,
-    snapshot: preview.snapshot,
-  });
-  if (JSON.stringify(result.counts) !== JSON.stringify(preview.counts)) {
-    throw new Error(
-      "Cloud import count verification failed. Your local backup is still available.",
-    );
+  if (preparation.duplicate)
+    return {
+      preview,
+      result: {
+        importId: preparation.importId,
+        duplicate: true,
+        counts: preview.counts,
+      },
+    };
+  try {
+    const result = await args.gateway.importPreparedSnapshot({
+      workspaceId: args.workspaceId,
+      importId: preparation.importId,
+      sourceDigest: preview.sourceDigest,
+      snapshotJson: preview.snapshotJson,
+    });
+    if (JSON.stringify(result.counts) !== JSON.stringify(preview.counts)) {
+      throw new Error(
+        "Cloud import count verification failed. Your local backup is still available.",
+      );
+    }
+    return { preview, result };
+  } catch (error) {
+    // A gateway only throws a typed provider/database error after a response.
+    // Transport failures intentionally remain prepared because their outcome is unknown.
+    if (error instanceof ConfirmedCloudTransactionError) {
+      await args.gateway.markRolledBack({
+        workspaceId: args.workspaceId,
+        importId: preparation.importId,
+        reason: safeFailureReason(error),
+      });
+    }
+    throw error;
   }
-  return { preview, result };
 }
+
+/** An RPC response proves the database rolled back; a network failure does not. */
+export class ConfirmedCloudTransactionError extends Error {}
 
 /** Safely validates an old browser payload through the existing compatibility migration. */
 export function restoreLegacyLocalSnapshot(value: unknown, now?: string) {

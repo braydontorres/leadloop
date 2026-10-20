@@ -28,13 +28,29 @@ export type CloudImportCounts = {
   tasks: number;
 };
 
+export type CloudImportConflicts = {
+  customers: string[];
+  interactions: string[];
+  quotes: string[];
+  quoteStatusChanges: string[];
+  tasks: string[];
+};
+
 export type CloudImportPreview = {
   sourceStorageKey: string;
-  sourceFingerprint: string;
+  sourceDigest: string;
+  snapshotJson: string;
   counts: CloudImportCounts;
   warnings: string[];
   errors: string[];
   snapshot: LocalCloudSnapshot;
+};
+
+export type CloudImportPreparation = {
+  importId: string | null;
+  duplicate: boolean;
+  ready: boolean;
+  conflicts: CloudImportConflicts;
 };
 
 export type CloudImportResult = {

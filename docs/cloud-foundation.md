@@ -52,12 +52,11 @@ the security authority. Attach auth UI only after a project is configured.
 4. Save a local, non-destructive backup at
    `leadloop.phase1.v1.cloud-import-backup.v1` and a retry journal.
 5. Send one idempotent `import_local_workspace` RPC keyed by workspace and a
-   deterministic source fingerprint.
+   cryptographic source digest.
 6. Verify server-returned customer, interaction, quote, quote-history, and task
    counts before reporting success.
 
-The SQL RPC is one transaction. A connection drop can be retried with the same
-fingerprint without duplicate records. Browser data is never deleted. The UI
+A connection drop remains prepared and can be retried with the same digest without duplicate records. A confirmed database rejection is recorded separately as rolled back. Browser data is never deleted. The UI
 for review/approval will be enabled only after configured authentication; this
 prevents silently uploading customer data from a local prototype.
 

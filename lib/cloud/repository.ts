@@ -1,30 +1,31 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  ConfirmedCloudTransactionError,
+  type LocalImportGateway,
+} from "./local-import";
 import type {
   CloudCustomer,
-  CloudImportCounts,
+  CloudImportPreparation,
   CloudImportResult,
   CloudQuote,
   CloudTask,
-  LocalCloudSnapshot,
 } from "./types";
 
-/**
- * Typed boundary used by the web app today and React Native later. Every query
- * carries workspace_id; database RLS still enforces the same boundary.
- */
+/** Every web/native query carries workspace_id; PostgreSQL RLS remains authoritative. */
 export type WorkspaceRepository = {
   listCustomers(workspaceId: string): Promise<CloudCustomer[]>;
   listQuotes(workspaceId: string): Promise<CloudQuote[]>;
   listTasks(workspaceId: string): Promise<CloudTask[]>;
-  importSnapshot(input: {
-    workspaceId: string;
-    sourceFingerprint: string;
-    snapshot: LocalCloudSnapshot;
-  }): Promise<CloudImportResult>;
-};
+} & LocalImportGateway;
 
-function fail(error: { message?: string } | null) {
-  if (error) throw new Error(error.message || "Cloud request failed.");
+function fail(error: { message?: string; code?: string } | null) {
+  if (!error) return;
+  const failure = new ConfirmedCloudTransactionError(
+    error.code
+      ? `${error.code}: ${error.message || "Cloud request failed."}`
+      : error.message || "Cloud request failed.",
+  );
+  throw failure;
 }
 
 export function createSupabaseWorkspaceRepository(
@@ -97,25 +98,57 @@ export function createSupabaseWorkspaceRepository(
         notes: row.notes ?? "",
       }));
     },
-    async importSnapshot({ workspaceId, sourceFingerprint, snapshot }) {
-      // RPC performs a single transaction, records the source fingerprint, and
-      // is idempotent when a previous interrupted browser request is retried.
+    async prepareImport({ workspaceId, sourceDigest, snapshotJson }) {
+      const { data, error } = await client.rpc("prepare_local_import", {
+        p_workspace_id: workspaceId,
+        p_source_digest: sourceDigest,
+        p_snapshot_json: snapshotJson,
+      });
+      fail(error);
+      const result = data as {
+        import_id: string | null;
+        duplicate: boolean;
+        ready: boolean;
+        conflicts: CloudImportPreparation["conflicts"];
+      };
+      return {
+        importId: result.import_id,
+        duplicate: result.duplicate,
+        ready: result.ready,
+        conflicts: result.conflicts,
+      };
+    },
+    async importPreparedSnapshot({
+      workspaceId,
+      importId,
+      sourceDigest,
+      snapshotJson,
+    }) {
       const { data, error } = await client.rpc("import_local_workspace", {
         p_workspace_id: workspaceId,
-        p_source_fingerprint: sourceFingerprint,
-        p_snapshot: snapshot,
+        p_import_id: importId,
+        p_source_digest: sourceDigest,
+        p_snapshot_json: snapshotJson,
       });
       fail(error);
       const result = data as {
         import_id: string;
         duplicate: boolean;
-        counts: CloudImportCounts;
+        counts: CloudImportResult["counts"];
       };
       return {
         importId: result.import_id,
         duplicate: result.duplicate,
         counts: result.counts,
       };
+    },
+    async markRolledBack({ workspaceId, importId, reason }) {
+      const { error } = await client.rpc("mark_local_import_rolled_back", {
+        p_workspace_id: workspaceId,
+        p_import_id: importId,
+        p_reason: reason,
+      });
+      fail(error);
     },
   };
 }

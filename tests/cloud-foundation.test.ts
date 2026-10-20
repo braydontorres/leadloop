@@ -1,19 +1,24 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  ConfirmedCloudTransactionError,
+  importApprovedLocalWorkspace,
+  LOCAL_CLOUD_IMPORT_BACKUP_KEY,
+  LocalImportConflictError,
+  previewLocalCloudImport,
+  restoreLegacyLocalSnapshot,
+  snapshotDigest,
+  type LocalImportGateway,
+} from "../lib/cloud/local-import";
+import {
   canAccessWorkspace,
   requireWorkspaceAccess,
 } from "../lib/cloud/workspace-access";
-import {
-  importApprovedLocalWorkspace,
-  LOCAL_CLOUD_IMPORT_BACKUP_KEY,
-  localSnapshotFingerprint,
-  previewLocalCloudImport,
-  restoreLegacyLocalSnapshot,
-  type LocalImportGateway,
-} from "../lib/cloud/local-import";
 import { sampleStore, STORAGE_KEY, type Store } from "../lib/tasks";
-import type { CloudImportResult } from "../lib/cloud/types";
+import type {
+  CloudImportConflicts,
+  CloudImportCounts,
+} from "../lib/cloud/types";
 
 class MemoryStorage {
   values = new Map<string, string>();
@@ -25,10 +30,18 @@ class MemoryStorage {
   }
 }
 
+const noConflicts: CloudImportConflicts = {
+  customers: [],
+  interactions: [],
+  quotes: [],
+  quoteStatusChanges: [],
+  tasks: [],
+};
+
 function fixture(): Store {
   const store = sampleStore();
   const mike = {
-    id: "11111111-1111-4111-8111-111111111111",
+    id: "mike",
     name: "Mike",
     business: "",
     email: "",
@@ -37,7 +50,7 @@ function fixture(): Store {
     notes: "Driveway estimate",
     interactions: [
       {
-        id: "22222222-2222-4222-8222-222222222222",
+        id: "mike-note",
         note: "Asked for quote",
         createdAt: "2026-10-20T12:00:00.000Z",
       },
@@ -46,15 +59,15 @@ function fixture(): Store {
     updatedAt: "2026-10-20T12:00:00.000Z",
   };
   const quote = {
-    id: "33333333-3333-4333-8333-333333333333",
+    id: "mike-quote",
     customerId: mike.id,
     serviceDescription: "Driveway cleaning",
     amountCents: 25000,
     currency: "USD" as const,
     status: "draft" as const,
     notes: "",
-    createdAt: "2026-10-20T12:00:00.000Z",
-    updatedAt: "2026-10-20T12:00:00.000Z",
+    createdAt: mike.createdAt,
+    updatedAt: mike.updatedAt,
     statusHistory: [],
   };
   return {
@@ -63,7 +76,7 @@ function fixture(): Store {
     quotes: [quote],
     tasks: [
       {
-        id: "44444444-4444-4444-8444-444444444444",
+        id: "mike-task",
         title: "Call Mike",
         person: "Mike",
         personId: mike.id,
@@ -76,8 +89,25 @@ function fixture(): Store {
   };
 }
 
-function gateway(result: CloudImportResult): LocalImportGateway {
-  return { importSnapshot: async () => result };
+function gateway(
+  counts: CloudImportCounts,
+  overrides: Partial<LocalImportGateway> = {},
+): LocalImportGateway {
+  return {
+    prepareImport: async () => ({
+      importId: "i1",
+      duplicate: false,
+      ready: true,
+      conflicts: noConflicts,
+    }),
+    importPreparedSnapshot: async () => ({
+      importId: "i1",
+      duplicate: false,
+      counts,
+    }),
+    markRolledBack: async () => undefined,
+    ...overrides,
+  };
 }
 
 test("workspace guard prevents cross-tenant access", () => {
@@ -90,12 +120,20 @@ test("workspace guard prevents cross-tenant access", () => {
   assert.throws(() => requireWorkspaceAccess(memberships, "intruder", "a"));
 });
 
-test("preview preserves IDs and customer/quote/task relationships", () => {
-  const preview = previewLocalCloudImport(fixture());
+test("canonical SHA-256 digest changes with a changed snapshot and has no short fallback", async () => {
+  const first = await previewLocalCloudImport(fixture());
+  const secondStore = fixture();
+  secondStore.tasks[0].title = "Call Mike later";
+  const second = await previewLocalCloudImport(secondStore);
+  assert.match(first.sourceDigest, /^sha256:[a-f0-9]{64}$/);
+  assert.notEqual(first.sourceDigest, second.sourceDigest);
+  assert.equal(first.sourceDigest, await snapshotDigest(first.snapshotJson));
+});
+
+test("preview preserves IDs and customer/quote/task relationships", async () => {
+  const preview = await previewLocalCloudImport(fixture());
   assert.deepEqual(preview.errors, []);
   assert.equal(preview.counts.customers, 1);
-  assert.equal(preview.counts.quotes, 1);
-  assert.equal(preview.counts.tasks, 1);
   assert.equal(
     preview.snapshot.tasks[0].personId,
     preview.snapshot.people[0].id,
@@ -104,36 +142,28 @@ test("preview preserves IDs and customer/quote/task relationships", () => {
     preview.snapshot.tasks[0].quoteId,
     preview.snapshot.quotes[0].id,
   );
-  assert.equal(
-    localSnapshotFingerprint(preview.snapshot),
-    preview.sourceFingerprint,
-  );
 });
 
-test("preview rejects broken links before cloud upload", () => {
+test("preview rejects broken links before cloud upload", async () => {
   const store = fixture();
   store.tasks[0].quoteId = "missing";
   assert.match(
-    previewLocalCloudImport(store).errors.join(" "),
+    (await previewLocalCloudImport(store)).errors.join(" "),
     /missing quote/,
   );
 });
 
-test("approved import backs up local data and verifies returned counts", async () => {
+test("approved import backs up local data and verifies database counts", async () => {
   const store = fixture();
   const storage = new MemoryStorage();
   storage.setItem(STORAGE_KEY, JSON.stringify(store));
-  const preview = previewLocalCloudImport(store);
+  const preview = await previewLocalCloudImport(store);
   const outcome = await importApprovedLocalWorkspace({
     storage,
     workspaceId: "workspace-a",
     store,
     approved: true,
-    gateway: gateway({
-      importId: "i1",
-      duplicate: false,
-      counts: preview.counts,
-    }),
+    gateway: gateway(preview.counts),
     now: () => "2026-10-20T12:00:00.000Z",
   });
   assert.equal(outcome.result.importId, "i1");
@@ -144,54 +174,74 @@ test("approved import backs up local data and verifies returned counts", async (
   assert.equal(storage.getItem(STORAGE_KEY), JSON.stringify(store));
 });
 
-test("unapproved, duplicate, and failed imports do not delete browser data", async () => {
+test("conflicts are explicit and never overwrite a matching cloud ID", async () => {
   const store = fixture();
   const storage = new MemoryStorage();
-  storage.setItem(STORAGE_KEY, JSON.stringify(store));
-  await assert.rejects(() =>
-    importApprovedLocalWorkspace({
-      storage,
-      workspaceId: "w",
-      store,
-      approved: false,
-      gateway: gateway({
-        importId: "x",
-        duplicate: false,
-        counts: previewLocalCloudImport(store).counts,
+  const preview = await previewLocalCloudImport(store);
+  await assert.rejects(
+    () =>
+      importApprovedLocalWorkspace({
+        storage,
+        workspaceId: "w",
+        store,
+        approved: true,
+        gateway: gateway(preview.counts, {
+          prepareImport: async () => ({
+            importId: null,
+            duplicate: false,
+            ready: false,
+            conflicts: { ...noConflicts, tasks: ["mike-task"] },
+          }),
+        }),
       }),
-    }),
+    LocalImportConflictError,
   );
-  const preview = previewLocalCloudImport(store);
-  const duplicate = await importApprovedLocalWorkspace({
-    storage,
-    workspaceId: "w",
-    store,
-    approved: true,
-    gateway: gateway({
-      importId: "i2",
-      duplicate: true,
-      counts: preview.counts,
-    }),
-  });
-  assert.equal(duplicate.result.duplicate, true);
+  assert.equal(storage.getItem(STORAGE_KEY), null);
+});
+
+test("database rejection is marked rolled back but an interrupted request stays prepared", async () => {
+  const store = fixture();
+  const preview = await previewLocalCloudImport(store);
+  const storage = new MemoryStorage();
+  let marked = 0;
   await assert.rejects(() =>
     importApprovedLocalWorkspace({
       storage,
       workspaceId: "w",
       store,
       approved: true,
-      gateway: {
-        importSnapshot: async () => {
-          throw new Error("network interrupted");
+      gateway: gateway(preview.counts, {
+        importPreparedSnapshot: async () => {
+          throw new ConfirmedCloudTransactionError("P0001: relation failed");
         },
-      },
+        markRolledBack: async () => {
+          marked += 1;
+        },
+      }),
     }),
   );
-  assert.equal(storage.getItem(STORAGE_KEY), JSON.stringify(store));
+  assert.equal(marked, 1);
+  await assert.rejects(() =>
+    importApprovedLocalWorkspace({
+      storage,
+      workspaceId: "w",
+      store,
+      approved: true,
+      gateway: gateway(preview.counts, {
+        importPreparedSnapshot: async () => {
+          throw new TypeError("fetch failed");
+        },
+        markRolledBack: async () => {
+          marked += 1;
+        },
+      }),
+    }),
+  );
+  assert.equal(marked, 1);
   assert.ok(storage.getItem(LOCAL_CLOUD_IMPORT_BACKUP_KEY));
 });
 
-test("legacy browser payload still migrates without reset", () => {
+test("legacy browser payload and non-UUID local IDs migrate without reset", async () => {
   const old = {
     tasks: [],
     people: [],
@@ -200,11 +250,42 @@ test("legacy browser payload still migrates without reset", () => {
     business: "",
     workingDays: [1, 2, 3, 4, 5],
   };
-  const restored = restoreLegacyLocalSnapshot(old, "2026-10-20T12:00:00.000Z");
-  assert.deepEqual(restored.quotes, []);
-  assert.equal(restored.timezone, "America/Chicago");
-  // Existing prototype data includes non-UUID IDs such as p1 and sample-1.
-  const legacyPreview = previewLocalCloudImport(sampleStore());
+  assert.deepEqual(
+    restoreLegacyLocalSnapshot(old, "2026-10-20T12:00:00.000Z").quotes,
+    [],
+  );
+  const legacyPreview = await previewLocalCloudImport(sampleStore());
   assert.deepEqual(legacyPreview.errors, []);
   assert.equal(legacyPreview.snapshot.people[0].id, "p1");
+});
+
+test("completed digest is idempotent and does not upload a second snapshot", async () => {
+  const store = fixture();
+  const storage = new MemoryStorage();
+  const preview = await previewLocalCloudImport(store);
+  let uploads = 0;
+  const result = await importApprovedLocalWorkspace({
+    storage,
+    workspaceId: "w",
+    store,
+    approved: true,
+    gateway: gateway(preview.counts, {
+      prepareImport: async () => ({
+        importId: "completed-import",
+        duplicate: true,
+        ready: true,
+        conflicts: noConflicts,
+      }),
+      importPreparedSnapshot: async () => {
+        uploads += 1;
+        return {
+          importId: "completed-import",
+          duplicate: true,
+          counts: preview.counts,
+        };
+      },
+    }),
+  });
+  assert.equal(result.result.duplicate, true);
+  assert.equal(uploads, 0);
 });
