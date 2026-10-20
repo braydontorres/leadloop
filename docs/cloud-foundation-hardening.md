@@ -11,7 +11,7 @@ RLS but cannot move a browser database into the workspace.
 
 The browser creates canonical JSON and a `sha256:<64 hex>` digest with Web
 Crypto. It sends both exact JSON text and digest. PostgreSQL independently
-computes `pgcrypto.digest()` over that same received text before parsing it,
+computes `extensions.digest()` over that same received text before parsing it,
 which prevents a changed payload from borrowing another snapshot’s approval.
 
 `prepare_local_import` checks all incoming IDs against actual workspace records.

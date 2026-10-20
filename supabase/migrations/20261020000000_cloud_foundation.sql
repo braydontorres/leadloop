@@ -1,6 +1,10 @@
 -- LeadLoop Phase 3A.1 cloud foundation, hardened before first deployment.
 -- Applies no customer data by itself. Run only against a reviewed Supabase project.
-create extension if not exists pgcrypto;
+create schema if not exists extensions;
+create extension if not exists pgcrypto with schema extensions;
+-- Import RPCs run with search_path=public, so expose only the required hash primitive.
+grant usage on schema extensions to authenticated;
+grant execute on function extensions.digest(bytea, text) to authenticated;
 
 create type public.workspace_role as enum ('owner', 'member');
 create type public.quote_status as enum ('draft', 'sent', 'accepted', 'declined');
@@ -111,7 +115,7 @@ grant execute on function public.local_import_conflicts(uuid,jsonb) to authentic
 create or replace function public.prepare_local_import(p_workspace_id uuid,p_source_digest text,p_snapshot_json text) returns jsonb language plpgsql security invoker set search_path=public as $$
 declare snapshot jsonb; existing public.local_imports; conflicts jsonb; counts jsonb; begin
   if not public.is_workspace_owner(p_workspace_id) then raise exception 'Workspace owner access required'; end if;
-  if p_source_digest !~ '^sha256:[a-f0-9]{64}$' or p_source_digest <> ('sha256:' || encode(digest(convert_to(p_snapshot_json,'UTF8'),'sha256'),'hex')) then raise exception 'Snapshot digest does not match supplied JSON'; end if;
+  if p_source_digest !~ '^sha256:[a-f0-9]{64}$' or p_source_digest <> ('sha256:' || encode(extensions.digest(convert_to(p_snapshot_json,'UTF8'),'sha256'::text),'hex')) then raise exception 'Snapshot digest does not match supplied JSON'; end if;
   -- An identical, verified snapshot is idempotent. It must win before ID
   -- conflict detection, because its records are already present by design.
   select * into existing from public.local_imports where workspace_id=p_workspace_id and source_digest=p_source_digest;
@@ -128,7 +132,7 @@ grant execute on function public.prepare_local_import(uuid,text,text) to authent
 create or replace function public.import_local_workspace(p_workspace_id uuid,p_import_id uuid,p_source_digest text,p_snapshot_json text) returns jsonb language plpgsql security invoker set search_path=public as $$
 declare snapshot jsonb; item public.local_imports; conflicts jsonb; actual jsonb; begin
   if not public.is_workspace_owner(p_workspace_id) then raise exception 'Workspace owner access required'; end if;
-  if p_source_digest <> ('sha256:' || encode(digest(convert_to(p_snapshot_json,'UTF8'),'sha256'),'hex')) then raise exception 'Snapshot digest does not match supplied JSON'; end if;
+  if p_source_digest <> ('sha256:' || encode(extensions.digest(convert_to(p_snapshot_json,'UTF8'),'sha256'::text),'hex')) then raise exception 'Snapshot digest does not match supplied JSON'; end if;
   snapshot:=p_snapshot_json::jsonb; perform pg_advisory_xact_lock(hashtext(p_workspace_id::text));
   select * into item from public.local_imports where id=p_import_id and workspace_id=p_workspace_id and source_digest=p_source_digest for update;
   if not found then raise exception 'Prepared import was not found'; end if;

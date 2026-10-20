@@ -3,7 +3,7 @@
 -- This is a real PostgreSQL RLS/RPC test, not a browser mock.
 begin;
 create extension if not exists pgtap;
-select plan(13);
+select plan(14);
 
 insert into auth.users (id, instance_id, aud, role, email, encrypted_password, email_confirmed_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at)
 values
@@ -18,11 +18,12 @@ insert into public.workspace_members(workspace_id,user_id,role) values
   ('20000000-0000-0000-0000-0000000000b2','00000000-0000-0000-0000-0000000000b2','owner');
 insert into public.customers(id,workspace_id,name,created_at,updated_at) values ('customer-a','10000000-0000-0000-0000-0000000000a1','Customer A',now(),now());
 create function pg_temp.snapshot() returns text language sql immutable as $$ select '{"people":[{"id":"imported-customer","name":"Imported","business":"","email":"","phone":"","address":"","notes":"","createdAt":"2026-10-20T00:00:00Z","updatedAt":"2026-10-20T00:00:00Z","interactions":[]}],"quotes":[],"tasks":[],"timezone":"America/Chicago","workingDays":[1,2,3,4,5],"name":"","business":""}' $$;
-create function pg_temp.digest_of(value text) returns text language sql immutable as $$ select 'sha256:' || encode(digest(convert_to(value,'UTF8'),'sha256'),'hex') $$;
+create function pg_temp.digest_of(value text) returns text language sql immutable as $$ select 'sha256:' || encode(extensions.digest(convert_to(value,'UTF8'),'sha256'::text),'hex') $$;
 
 set local role authenticated;
 select set_config('request.jwt.claim.role','authenticated',true);
 select set_config('request.jwt.claim.sub','00000000-0000-0000-0000-0000000000a1',true);
+select lives_ok($$select extensions.digest(convert_to('LeadLoop','UTF8'),'sha256'::text)$$, 'authenticated callers can execute extensions.digest');
 select results_eq('select count(*)::int from public.customers where workspace_id=''10000000-0000-0000-0000-0000000000a1''', array[1], 'owner sees own workspace');
 select is_empty('select * from public.customers where workspace_id=''20000000-0000-0000-0000-0000000000b2''', 'owner A cannot read workspace B');
 select throws_ok($$insert into public.customers(id,workspace_id,name,created_at,updated_at) values('cross-write','20000000-0000-0000-0000-0000000000b2','No',now(),now())$$, '42501', null, 'owner A cannot write workspace B');
