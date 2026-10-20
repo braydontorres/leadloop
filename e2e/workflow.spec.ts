@@ -1530,3 +1530,148 @@ test("a confirmed reminder links to a unique existing customer without changing 
     .click();
   await expect(page.getByText("1 open tasks")).toBeVisible();
 });
+
+test("customer profiles derive, edit, and complete their linked reminders safely", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "leadloop.phase1.v1",
+      JSON.stringify({
+        name: "Owner",
+        business: "Demo",
+        timezone: "America/Chicago",
+        workingDays: [1, 2, 3, 4, 5],
+        people: [
+          {
+            id: "mike-1",
+            name: "Mike",
+            business: "Driveway customer",
+            email: "",
+            phone: "",
+            address: "",
+            notes: "Quoted $250 for the driveway.",
+            interactions: [
+              {
+                id: "history-1",
+                note: "Mike will talk to his wife about the quote.",
+                createdAt: "2026-10-20T12:00:00.000Z",
+              },
+            ],
+            createdAt: "2026-10-20T12:00:00.000Z",
+            updatedAt: "2026-10-20T12:00:00.000Z",
+          },
+          {
+            id: "sarah-1",
+            name: "Sarah",
+            business: "Other customer",
+            email: "",
+            phone: "",
+            address: "",
+            notes: "",
+            interactions: [],
+            createdAt: "2026-10-20T12:00:00.000Z",
+            updatedAt: "2026-10-20T12:00:00.000Z",
+          },
+        ],
+        tasks: [
+          {
+            id: "mike-overdue",
+            title: "Call Mike about the driveway estimate",
+            person: "Mike",
+            personId: "mike-1",
+            due: "2020-01-01T18:00:00.000Z",
+            completed: false,
+            notes: "",
+          },
+          {
+            id: "mike-later",
+            title: "Follow up with Mike",
+            person: "Mike",
+            personId: "mike-1",
+            due: "2030-01-02T18:00:00.000Z",
+            completed: false,
+            notes: "",
+          },
+          {
+            id: "mike-completed",
+            title: "Completed Mike reminder",
+            person: "Mike",
+            personId: "mike-1",
+            due: "2030-01-03T18:00:00.000Z",
+            completed: true,
+            notes: "",
+          },
+          {
+            id: "sarah-reminder",
+            title: "Call Sarah only",
+            person: "Sarah",
+            personId: "sarah-1",
+            due: "2020-01-01T18:00:00.000Z",
+            completed: false,
+            notes: "",
+          },
+        ],
+      }),
+    );
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.locator(".person-card").filter({ hasText: "Mike" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "Contact details" });
+  await expect(
+    dialog.getByRole("heading", { name: "Upcoming reminders" }),
+  ).toBeVisible();
+  await expect(
+    dialog.getByText("Call Mike about the driveway estimate"),
+  ).toBeVisible();
+  await expect(dialog.getByText("Follow up with Mike")).toBeVisible();
+  await expect(dialog.getByText("Call Sarah only")).not.toBeVisible();
+  await expect(dialog.getByText("Overdue", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("Completed Mike reminder")).toBeVisible();
+  await expect(dialog.getByText("Interaction history")).toBeVisible();
+  await expect(
+    dialog.getByText("Mike will talk to his wife about the quote."),
+  ).toBeVisible();
+
+  const reminderRows = dialog
+    .locator(".customer-reminder-list")
+    .first()
+    .locator(".customer-reminder");
+  await expect(reminderRows.nth(0)).toContainText(
+    "Call Mike about the driveway estimate",
+  );
+  await expect(reminderRows.nth(1)).toContainText("Follow up with Mike");
+
+  await dialog
+    .locator(".customer-reminder")
+    .filter({ hasText: "Call Mike about the driveway estimate" })
+    .getByRole("button", { name: "Edit reminder" })
+    .click();
+  const taskDialog = page.getByRole("dialog", { name: "Edit your task" });
+  await taskDialog
+    .getByRole("textbox", { name: "Task" })
+    .fill("Call Mike about the updated estimate");
+  await taskDialog.getByRole("button", { name: /Confirm & save/ }).click();
+
+  await page.locator(".person-card").filter({ hasText: "Mike" }).click();
+  const reopenedDialog = page.getByRole("dialog", { name: "Contact details" });
+  const editedReminder = reopenedDialog
+    .locator(".customer-reminder")
+    .filter({ hasText: "Call Mike about the updated estimate" });
+  await expect(editedReminder).toBeVisible();
+  await editedReminder.getByRole("button", { name: "Mark complete" }).click();
+  await expect(
+    reopenedDialog
+      .locator(".customer-reminder-list")
+      .first()
+      .getByText("Call Mike about the updated estimate"),
+  ).toHaveCount(0);
+  await expect(
+    reopenedDialog.getByRole("heading", { name: "Completed reminders" }),
+  ).toBeVisible();
+  await expect(
+    reopenedDialog.getByText("Call Mike about the updated estimate"),
+  ).toBeVisible();
+});

@@ -146,6 +146,46 @@ export function saveTask(tasks: Task[], task: Task): Task[] {
     ? tasks.map((t) => (t.id === task.id ? task : t))
     : [...tasks, task];
 }
+
+function normalizedPersonName(name: string) {
+  return name.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+/**
+ * Returns the reminders that safely belong to one customer.
+ *
+ * A stable `personId` always wins. Older reminders with only a `person` name
+ * can be shown only when exactly one saved customer has that exact name; this
+ * deliberately leaves legacy reminders unlinked when names are ambiguous.
+ */
+export function remindersForPerson(
+  tasks: Task[],
+  people: Person[],
+  person: Person,
+): Task[] {
+  const name = normalizedPersonName(person.name);
+  const uniqueName =
+    Boolean(name) &&
+    people.filter((candidate) => normalizedPersonName(candidate.name) === name)
+      .length === 1;
+
+  return tasks
+    .filter((task) => {
+      if (task.personId) return task.personId === person.id;
+      return uniqueName && normalizedPersonName(task.person) === name;
+    })
+    .slice()
+    .sort((left, right) => {
+      if (!left.due && !right.due) return left.title.localeCompare(right.title);
+      if (!left.due) return 1;
+      if (!right.due) return -1;
+      return (
+        left.due.localeCompare(right.due) ||
+        left.title.localeCompare(right.title)
+      );
+    });
+}
+
 export function sampleStore(): Store {
   const due = (days: number, hour: number) => {
     const d = new Date();

@@ -48,6 +48,7 @@ import {
   dateLabel,
   fromLocalInput,
   isToday,
+  remindersForPerson,
   toLocalInput,
 } from "../lib/tasks";
 import {
@@ -302,6 +303,17 @@ export default function Page() {
       )
       .sort((a, b) => (a.due || "z").localeCompare(b.due || "z"));
   const activeReminder = conversation.activeReminder;
+  const customerReminders = person
+    ? remindersForPerson(store.tasks, store.people, person)
+    : [];
+  const upcomingCustomerReminders = customerReminders.filter(
+    (task) => !task.completed,
+  );
+  const completedCustomerReminders = customerReminders.filter(
+    (task) => task.completed,
+  );
+  const isOverdueReminder = (task: Task) =>
+    Boolean(task.due) && new Date(task.due) < new Date();
   const voicePhase =
     conversation.stage === "ended"
       ? "Ended"
@@ -2227,9 +2239,11 @@ export default function Page() {
                       <div>
                         <LayoutList size={14} />
                         {
-                          active.filter(
-                            (t) => t.personId === p.id || t.person === p.name,
-                          ).length
+                          remindersForPerson(
+                            store.tasks,
+                            store.people,
+                            p,
+                          ).filter((task) => !task.completed).length
                         }{" "}
                         open tasks
                       </div>
@@ -2670,6 +2684,90 @@ export default function Page() {
                   )}
                 </label>
               ))}
+              <section
+                className="customer-reminders"
+                aria-labelledby="customer-reminders-heading"
+              >
+                <div className="customer-reminders-heading">
+                  <h3 id="customer-reminders-heading">Upcoming reminders</h3>
+                  <span>{upcomingCustomerReminders.length}</span>
+                </div>
+                {upcomingCustomerReminders.length ? (
+                  <div className="customer-reminder-list">
+                    {upcomingCustomerReminders.map((task) => (
+                      <article className="customer-reminder" key={task.id}>
+                        <div className="customer-reminder-copy">
+                          <strong>{task.title}</strong>
+                          <small>{dateLabel(task.due, timezone)}</small>
+                        </div>
+                        <span
+                          className={
+                            isOverdueReminder(task)
+                              ? "reminder-status overdue"
+                              : "reminder-status"
+                          }
+                        >
+                          {isOverdueReminder(task) ? "Overdue" : "Upcoming"}
+                        </span>
+                        <div className="customer-reminder-actions">
+                          <button
+                            type="button"
+                            className="button secondary"
+                            onClick={() => {
+                              setPerson(null);
+                              setDraft({ ...task });
+                            }}
+                          >
+                            Edit reminder
+                          </button>
+                          <button
+                            type="button"
+                            className="button secondary"
+                            onClick={() => toggle(task.id)}
+                          >
+                            <Check size={14} /> Mark complete
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="customer-reminders-empty">
+                    No upcoming reminders for this customer.
+                  </p>
+                )}
+              </section>
+              {completedCustomerReminders.length > 0 && (
+                <section
+                  className="customer-reminders completed-customer-reminders"
+                  aria-label="Completed reminders"
+                >
+                  <div className="customer-reminders-heading">
+                    <h3>Completed reminders</h3>
+                    <span>{completedCustomerReminders.length}</span>
+                  </div>
+                  <div className="customer-reminder-list">
+                    {completedCustomerReminders.map((task) => (
+                      <article className="customer-reminder" key={task.id}>
+                        <div className="customer-reminder-copy">
+                          <strong>{task.title}</strong>
+                          <small>{dateLabel(task.due, timezone)}</small>
+                        </div>
+                        <span className="reminder-status completed">
+                          Completed
+                        </span>
+                        <button
+                          type="button"
+                          className="button secondary"
+                          onClick={() => toggle(task.id)}
+                        >
+                          Reopen
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
               <div className="modal-actions">
                 {store.people.some((p) => p.id === person.id) && (
                   <button

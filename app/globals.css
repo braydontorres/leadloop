@@ -1937,6 +1937,102 @@ h1 > span {
 .customer-memory-review {
   margin-top: 14px;
 }
+.customer-reminders {
+  border-top: 1px solid #e7ece1;
+  margin-top: 18px;
+  padding-top: 14px;
+}
+.customer-reminders-heading {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.customer-reminders h3 {
+  color: #57734e;
+  font-size: 12px;
+  margin: 0;
+}
+.customer-reminders-heading > span {
+  background: #edf3e8;
+  border-radius: 999px;
+  color: #638158;
+  font-size: 10px;
+  min-width: 20px;
+  padding: 3px 7px;
+  text-align: center;
+}
+.customer-reminder-list {
+  display: grid;
+  gap: 8px;
+}
+.customer-reminder {
+  align-items: center;
+  background: #fbfdf8;
+  border: 1px solid #e4ebdf;
+  border-radius: 8px;
+  display: grid;
+  gap: 9px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 11px;
+}
+.customer-reminder-copy {
+  min-width: 0;
+}
+.customer-reminder-copy strong {
+  color: #4d644f;
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.customer-reminder-copy small {
+  color: #87967e;
+  display: block;
+  font-size: 10px;
+  margin-top: 3px;
+}
+.reminder-status {
+  background: #edf3e8;
+  border-radius: 999px;
+  color: #608156;
+  font-size: 9px;
+  padding: 3px 7px;
+  white-space: nowrap;
+}
+.reminder-status.overdue {
+  background: #fff0e6;
+  color: #af6c52;
+}
+.reminder-status.completed {
+  background: #f0f2ee;
+  color: #778473;
+}
+.customer-reminder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  grid-column: 1 / -1;
+}
+.customer-reminder .button {
+  align-items: center;
+  display: inline-flex;
+  font-size: 10px;
+  gap: 5px;
+  justify-content: center;
+  padding: 8px 10px;
+}
+.customer-reminders-empty {
+  color: #87967e;
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 0;
+}
+.completed-customer-reminders {
+  border-top: 0;
+  margin-top: 12px;
+  padding-top: 0;
+}
 .customer-history {
   border-top: 1px solid #e7ece1;
   margin-top: 18px;
@@ -1978,5 +2074,16 @@ h1 > span {
   }
   .assistant-review {
     padding: 15px;
+  }
+  .customer-reminder {
+    align-items: start;
+  }
+  .customer-reminder-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .customer-reminder .button {
+    min-width: 0;
+    padding: 9px 7px;
   }
 }
