@@ -213,6 +213,32 @@ test("Phase C spoken clocks prefer complete expressions over overlapping clock s
     time: "16:45",
     ambiguous: false,
   });
+
+  for (let targetHour = 1; targetHour <= 12; targetHour += 1) {
+    const word = words[targetHour % 12];
+    for (const marker of ["AM", "PM"] as const) {
+      if (targetHour === 12 && marker === "AM") continue;
+      let priorHour = targetHour === 1 ? 12 : targetHour - 1;
+      let effectiveMarker = marker;
+      if (targetHour === 12 && marker === "PM") effectiveMarker = "AM";
+      const expectedHour =
+        effectiveMarker === "PM"
+          ? priorHour === 12
+            ? 12
+            : priorHour + 12
+          : priorHour === 12
+            ? 0
+            : priorHour;
+      for (const sourceHour of [String(targetHour), word]) {
+        assert.equal(
+          naturalTimeFromText(
+            `Could you move it to a quarter to ${sourceHour} ${marker}, thanks?`,
+          ).time,
+          `${String(expectedHour).padStart(2, "0")}:45`,
+        );
+      }
+    }
+  }
 });
 
 test("Phase C numeric spoken-time correction preserves one draft and requires reconfirmation", () => {
