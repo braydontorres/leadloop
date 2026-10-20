@@ -417,7 +417,6 @@ function addToDate(
 }
 
 export function naturalTimeFromText(text: string) {
-  const meridiem = text.match(/\b(?:at\s+)?(.+?)\s*([ap])\.?m\.?\b/i);
   const toHour = (value: string) => numberFromText(value) || Number(value);
   const normalized = (
     hour: number,
@@ -436,18 +435,49 @@ export function naturalTimeFromText(text: string) {
           : hour;
     return `${String(converted).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
   };
-  if (/\bnoon\b/i.test(text)) return { time: "12:00", ambiguous: false };
-  if (/\bmidnight\b/i.test(text)) return { time: "00:00", ambiguous: false };
-  const clock = text.match(
-    /\b(?:at\s*)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i,
+  const meridiem = String.raw`([ap])\\s*\\.?\\s*m\\.?`;
+  const hour = String.raw`(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|0?[1-9])`;
+
+  if (/\\bnoon\\b/i.test(text)) return { time: "12:00", ambiguous: false };
+  if (/\\bmidnight\\b/i.test(text)) return { time: "00:00", ambiguous: false };
+
+  // Match complete spoken-clock expressions before generic numeric clocks.
+  // Otherwise "a quarter to 5 p.m." is prematurely consumed as "5 p.m.".
+  const named = text.match(
+    new RegExp(
+      String.raw`\\b(?:a\\s+)?(half past|quarter past|quarter to)\\s+${hour}(?:\\s*${meridiem})?(?=\\s|[,.!?;:]|$)`,
+      "i",
+    ),
   );
-  if (clock)
-    return {
-      time: normalized(Number(clock[1]), Number(clock[2] ?? 0), clock[3]),
-      ambiguous: false,
-    };
+  if (named) {
+    const phrase = named[1].toLowerCase();
+    const targetHour = toHour(named[2]);
+    let marker = named[3];
+    const minute =
+      phrase === "half past" ? 30 : phrase === "quarter past" ? 15 : 45;
+
+    if (phrase === "quarter to") {
+      // "Quarter to 12 PM" is 11:45 AM. "Quarter to 12 AM" crosses into
+      // the previous calendar day; the time-only parser cannot safely apply
+      // that date correction, so force clarification instead of scheduling
+      // the wrong day.
+      if (targetHour === 12 && marker?.toLowerCase() === "a")
+        return { time: null, ambiguous: true };
+      if (targetHour === 12 && marker?.toLowerCase() === "p") marker = "a";
+      const priorHour = targetHour === 1 ? 12 : targetHour - 1;
+      const time = normalized(priorHour, minute, marker);
+      return { time, ambiguous: !marker };
+    }
+
+    const time = normalized(targetHour, minute, marker);
+    return { time, ambiguous: !marker };
+  }
+
   const spoken = text.match(
-    /\b(?:at\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(fifteen|thirty|forty[- ]five)\s*([ap])\.?m\.?\b/i,
+    new RegExp(
+      String.raw`\\b(?:at\\s+)?${hour}\\s+(fifteen|thirty|forty[- ]five)\\s*${meridiem}(?=\\s|[,.!?;:]|$)`,
+      "i",
+    ),
   );
   if (spoken) {
     const minute = spoken[2].toLowerCase().startsWith("fifteen")
@@ -460,32 +490,38 @@ export function naturalTimeFromText(text: string) {
       ambiguous: false,
     };
   }
-  const named = text.match(
-    /\b(half past|quarter past|quarter to)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])(?:\s*([ap])\.?m\.?)?\b/i,
+
+  const clock = text.match(
+    new RegExp(
+      String.raw`\\b(?:at\\s*)?(1[0-2]|0?[1-9])(?::([0-5]\\d))?\\s*${meridiem}(?=\\s|[,.!?;:]|$)`,
+      "i",
+    ),
   );
-  if (named) {
-    let hour = toHour(named[2]);
-    const phrase = named[1].toLowerCase();
-    const minute =
-      phrase === "half past" ? 30 : phrase === "quarter past" ? 15 : 45;
-    if (phrase === "quarter to") hour = hour === 1 ? 12 : hour - 1;
-    const time = normalized(hour, minute, named[3]);
-    return { time, ambiguous: !named[3] };
-  }
+  if (clock)
+    return {
+      time: normalized(Number(clock[1]), Number(clock[2] ?? 0), clock[3]),
+      ambiguous: false,
+    };
+
   const daypart = text.match(
-    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(?:in\s+the\s+)?(morning|afternoon|evening|night)\b/i,
+    /\\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\\s+(?:in\\s+the\\s+)?(morning|afternoon|evening|night)\\b/i,
   );
   if (daypart) {
-    let hour = toHour(daypart[1]);
+    let daypartHour = toHour(daypart[1]);
     const part = daypart[2].toLowerCase();
-    if ((part === "afternoon" || part === "evening") && hour < 12) hour += 12;
-    if (part === "morning" && hour === 12) hour = 0;
-    return { time: `${String(hour).padStart(2, "0")}:00`, ambiguous: false };
+    if ((part === "afternoon" || part === "evening") && daypartHour < 12)
+      daypartHour += 12;
+    if (part === "morning" && daypartHour === 12) daypartHour = 0;
+    return {
+      time: `${String(daypartHour).padStart(2, "0")}:00`,
+      ambiguous: false,
+    };
   }
-  const ambiguousClock =
-    /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(?:fifteen|thirty|forty[- ]five)\b/i.test(
-      text,
-    );
+
+  const ambiguousClock = new RegExp(
+    String.raw`\\b(?:(?:a\\s+)?(?:half past|quarter past|quarter to)\\s+${hour}|${hour}\\s+(?:fifteen|thirty|forty[- ]five))\\b`,
+    "i",
+  ).test(text);
   return { time: null, ambiguous: ambiguousClock };
 }
 
