@@ -48,9 +48,19 @@ export type CalendarAmbiguity = {
 export type RelativeDateExpression = {
   kind: "calendar_offset";
   amount: number;
-  unit: "days" | "weeks" | "months";
+  unit: "days" | "weeks" | "months" | "years";
   /** `later` is anchored to the existing reminder date; the other forms use the draft reference day. */
   anchor: "reference_day" | "existing_reminder_date";
+};
+export type CalendarLanguageFields = {
+  /** A fully deterministic local calendar date extracted from the turn. */
+  date: string | null;
+  /** A safe local clock time. `null` keeps an AM/PM-ambiguous clock unanswered. */
+  time: string | null;
+  relative: RelativeDateExpression | null;
+  /** A relative correction deliberately replaces an older ordinal constraint. */
+  replacesDateConstraint: boolean;
+  hasAmbiguousTime: boolean;
 };
 export type RelativeOffset = {
   amount: number;
@@ -156,6 +166,15 @@ function addRelativeDate(
   base: { year: number; month: number; day: number },
   relative: RelativeDateExpression,
 ) {
+  if (relative.unit === "years") {
+    const year = base.year + relative.amount;
+    const lastDay = new Date(Date.UTC(year, base.month, 0)).getUTCDate();
+    return isoDate({
+      year,
+      month: base.month,
+      day: Math.min(base.day, lastDay),
+    });
+  }
   if (relative.unit === "months") {
     const monthIndex = base.month - 1 + relative.amount;
     const year = base.year + Math.floor(monthIndex / 12);
@@ -173,12 +192,32 @@ function addRelativeDate(
 }
 
 const numberWords: Record<string, number> = {
+  a: 1,
+  an: 1,
   one: 1,
   two: 2,
   three: 3,
   four: 4,
   five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10,
+  eleven: 11,
+  twelve: 12,
+  ninety: 90,
 };
+
+const weekdayNames = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+];
 
 const monthNames = [
   "january",
@@ -244,7 +283,7 @@ export function relativeDateExpressionFromText(
       anchor: "reference_day",
     };
   const match = text.match(
-    /\b(?:(one|two|three|four|five)|(\d+))\s+(day|days|week|weeks|month|months)\s+(?:from\s+(?:today|now)|later)\b|\bin\s+(?:(one|two|three|four|five)|(\d+))\s+(day|days|week|weeks|month|months)\b/i,
+    /\b(?:(a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)|(\d+))\s+(day|days|week|weeks|month|months|year|years)\s+(?:from\s+(?:today|now)|later|(?:after|before)\s+(?:that|it|the\s+(?:reminder|date)))\b|\bin\s+(?:(a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)|(\d+))\s+(day|days|week|weeks|month|months|year|years)\b/i,
   );
   if (!match) return null;
   const amount =
@@ -259,15 +298,359 @@ export function relativeDateExpressionFromText(
       ? "weeks"
       : unitText.startsWith("month")
         ? "months"
-        : null;
+        : unitText.startsWith("year")
+          ? "years"
+          : null;
   if (!unit) return null;
   return {
     kind: "calendar_offset",
-    amount,
+    amount: /\bbefore\b/i.test(match[0]) ? -amount : amount,
     unit,
-    anchor: /\blater\b/i.test(match[0])
+    anchor: /\b(?:later|after|before)\b/i.test(match[0])
       ? "existing_reminder_date"
       : "reference_day",
+  };
+}
+
+function numberFromText(value: string | undefined) {
+  if (!value) return 0;
+  return Number(value) || numberWords[value.toLowerCase()] || 0;
+}
+
+function localDateTimeParts(instant: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(instant);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((entry) => entry.type === type)?.value ?? 0);
+  return {
+    year: part("year"),
+    month: part("month"),
+    day: part("day"),
+    hour: part("hour"),
+    minute: part("minute"),
+  };
+}
+
+function relativeFromDays(amount: number): RelativeDateExpression {
+  return {
+    kind: "calendar_offset",
+    amount,
+    unit: "days",
+    anchor: "reference_day",
+  };
+}
+
+function weekdayFromReference(
+  expression: CalendarExpression,
+  weekday: number,
+  mode: "this" | "next" | "after_next",
+) {
+  const reference = referenceDate(expression);
+  const current = new Date(
+    Date.UTC(reference.year, reference.month - 1, reference.day),
+  );
+  const initial = (weekday - current.getUTCDay() + 7) % 7;
+  const offset =
+    mode === "this"
+      ? initial
+      : mode === "next"
+        ? initial || 7
+        : (initial || 7) + 7;
+  current.setUTCDate(current.getUTCDate() + offset);
+  return isoDate({
+    year: current.getUTCFullYear(),
+    month: current.getUTCMonth() + 1,
+    day: current.getUTCDate(),
+  });
+}
+
+function explicitDateFromText(text: string, expression: CalendarExpression) {
+  const isoMatch = text.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (isoMatch && dateIsValid(isoMatch[1])) return isoMatch[1];
+  const match = text.match(
+    new RegExp(
+      `\\b(${monthNames.join("|")})\\s+(\\d{1,2})(?:,?\\s*(20\\d{2}))?\\b`,
+      "i",
+    ),
+  );
+  if (!match) return null;
+  const month = monthNames.indexOf(match[1].toLowerCase()) + 1;
+  const day = Number(match[2]);
+  if (match[3]) {
+    const value = isoDate({ year: Number(match[3]), month, day });
+    return dateIsValid(value) ? value : null;
+  }
+  if (
+    expression.date.constraint?.year !== null &&
+    expression.date.constraint?.year !== undefined
+  ) {
+    const value = isoDate({
+      year: expression.date.constraint.year,
+      month,
+      day,
+    });
+    return dateIsValid(value) ? value : null;
+  }
+  return dateWithImplicitYear({ month, day }, expression);
+}
+
+function addToDate(
+  date: string,
+  amount: number,
+  unit: RelativeDateExpression["unit"],
+) {
+  const parsed = parseIsoDate(date);
+  if (!parsed) return null;
+  return addRelativeDate(parsed, {
+    kind: "calendar_offset",
+    amount,
+    unit,
+    anchor: "reference_day",
+  });
+}
+
+export function naturalTimeFromText(text: string) {
+  const meridiem = text.match(/\b(?:at\s+)?(.+?)\s*([ap])\.?m\.?\b/i);
+  const toHour = (value: string) => numberFromText(value) || Number(value);
+  const normalized = (
+    hour: number,
+    minute: number,
+    marker: string | undefined,
+  ) => {
+    if (!marker || hour < 1 || hour > 12 || minute < 0 || minute > 59)
+      return null;
+    const converted =
+      marker.toLowerCase() === "p"
+        ? hour === 12
+          ? 12
+          : hour + 12
+        : hour === 12
+          ? 0
+          : hour;
+    return `${String(converted).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  };
+  if (/\bnoon\b/i.test(text)) return { time: "12:00", ambiguous: false };
+  if (/\bmidnight\b/i.test(text)) return { time: "00:00", ambiguous: false };
+  const clock = text.match(
+    /\b(?:at\s*)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i,
+  );
+  if (clock)
+    return {
+      time: normalized(Number(clock[1]), Number(clock[2] ?? 0), clock[3]),
+      ambiguous: false,
+    };
+  const spoken = text.match(
+    /\b(?:at\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(fifteen|thirty|forty[- ]five)\s*([ap])\.?m\.?\b/i,
+  );
+  if (spoken) {
+    const minute = spoken[2].toLowerCase().startsWith("fifteen")
+      ? 15
+      : spoken[2].toLowerCase().startsWith("thirty")
+        ? 30
+        : 45;
+    return {
+      time: normalized(toHour(spoken[1]), minute, spoken[3]),
+      ambiguous: false,
+    };
+  }
+  const named = text.match(
+    /\b(half past|quarter past|quarter to)\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])(?:\s*([ap])\.?m\.?)?\b/i,
+  );
+  if (named) {
+    let hour = toHour(named[2]);
+    const phrase = named[1].toLowerCase();
+    const minute =
+      phrase === "half past" ? 30 : phrase === "quarter past" ? 15 : 45;
+    if (phrase === "quarter to") hour = hour === 1 ? 12 : hour - 1;
+    const time = normalized(hour, minute, named[3]);
+    return { time, ambiguous: !named[3] };
+  }
+  const daypart = text.match(
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(?:in\s+the\s+)?(morning|afternoon|evening|night)\b/i,
+  );
+  if (daypart) {
+    let hour = toHour(daypart[1]);
+    const part = daypart[2].toLowerCase();
+    if ((part === "afternoon" || part === "evening") && hour < 12) hour += 12;
+    if (part === "morning" && hour === 12) hour = 0;
+    return { time: `${String(hour).padStart(2, "0")}:00`, ambiguous: false };
+  }
+  const ambiguousClock =
+    /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2])\s+(?:fifteen|thirty|forty[- ]five)\b/i.test(
+      text,
+    );
+  return { time: null, ambiguous: ambiguousClock };
+}
+
+function durationMinutesFromText(text: string) {
+  if (/\bin\s+(?:an?|one)\s+hour\s+and\s+a\s+half\b/i.test(text)) return 90;
+  const match = text.match(
+    /\bin\s+((?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|ninety)|\d+)\s+(minutes?|hours?)\b/i,
+  );
+  if (!match) return null;
+  const amount = numberFromText(match[1]);
+  if (!amount || amount > 1440) return null;
+  return amount * (match[2].toLowerCase().startsWith("hour") ? 60 : 1);
+}
+
+/**
+ * Central, deterministic Phase C language extraction. It returns only values
+ * that the CalendarExpression resolver can validate; unknown phrasing remains
+ * unanswered for the conversation manager to clarify.
+ */
+export function calendarLanguageFieldsFromText(
+  text: string,
+  expression: CalendarExpression,
+): CalendarLanguageFields {
+  const time = naturalTimeFromText(text);
+  const duration = durationMinutesFromText(text);
+  if (duration !== null) {
+    const resolved = resolveCalendarExpression(expression);
+    const base =
+      resolved.kind === "resolved"
+        ? new Date(resolved.instant)
+        : new Date(expression.referenceInstant);
+    const target = localDateTimeParts(
+      new Date(base.getTime() + duration * 60_000),
+      expression.timeZone,
+    );
+    return {
+      date: isoDate(target),
+      time: `${String(target.hour).padStart(2, "0")}:${String(target.minute).padStart(2, "0")}`,
+      relative: null,
+      replacesDateConstraint: true,
+      hasAmbiguousTime: false,
+    };
+  }
+
+  const explicitWithOffset = text.match(
+    /\b((?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)|\d+)\s+(day|days|week|weeks|month|months|year|years)\s+(before|after)\s+(?:an?\s+)?(?:the\s+)?(?:date\s+)?/i,
+  );
+  if (explicitWithOffset) {
+    const tail = text.slice(
+      (explicitWithOffset.index ?? 0) + explicitWithOffset[0].length,
+    );
+    const base = explicitDateFromText(tail, expression);
+    const unitText = explicitWithOffset[2].toLowerCase();
+    const unit = unitText.startsWith("day")
+      ? "days"
+      : unitText.startsWith("week")
+        ? "weeks"
+        : unitText.startsWith("month")
+          ? "months"
+          : "years";
+    const shifted =
+      base &&
+      addToDate(
+        base,
+        (explicitWithOffset[3].toLowerCase() === "before" ? -1 : 1) *
+          numberFromText(explicitWithOffset[1]),
+        unit,
+      );
+    if (shifted)
+      return {
+        date: shifted,
+        time: time.time,
+        relative: null,
+        replacesDateConstraint: true,
+        hasAmbiguousTime: time.ambiguous,
+      };
+  }
+
+  const nextWeekdayOffset = text.match(
+    /\b((?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)|\d+)\s+(day|days|week|weeks|month|months|year|years)\s+from\s+next\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+  );
+  if (nextWeekdayOffset) {
+    const weekday = weekdayNames.indexOf(nextWeekdayOffset[3].toLowerCase());
+    const base = weekdayFromReference(expression, weekday, "next");
+    const unitText = nextWeekdayOffset[2].toLowerCase();
+    const unit = unitText.startsWith("day")
+      ? "days"
+      : unitText.startsWith("week")
+        ? "weeks"
+        : unitText.startsWith("month")
+          ? "months"
+          : "years";
+    return {
+      date: addToDate(base, numberFromText(nextWeekdayOffset[1]), unit),
+      time: time.time,
+      relative: null,
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+  }
+
+  if (/\ba\s+week\s+from\s+tomorrow\b/i.test(text))
+    return {
+      date: null,
+      time: time.time,
+      relative: relativeFromDays(8),
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+
+  const weekdayMatch = text.match(
+    /\b(this|next)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i,
+  );
+  const afterNext = text.match(
+    /\b(?:the\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s+after\s+next\b/i,
+  );
+  if (afterNext || weekdayMatch) {
+    const name = (afterNext?.[1] ?? weekdayMatch?.[2] ?? "").toLowerCase();
+    const mode = afterNext
+      ? "after_next"
+      : weekdayMatch?.[1]?.toLowerCase() === "this"
+        ? "this"
+        : "next";
+    return {
+      date: weekdayFromReference(expression, weekdayNames.indexOf(name), mode),
+      time: time.time,
+      relative: null,
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+  }
+
+  const relative = relativeDateExpressionFromText(text);
+  if (relative)
+    return {
+      date: null,
+      time: time.time,
+      relative,
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+  if (/\bday after tomorrow\b/i.test(text))
+    return {
+      date: null,
+      time: time.time,
+      relative: relativeFromDays(2),
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+  if (/\btoday\b/i.test(text))
+    return {
+      date: null,
+      time: time.time,
+      relative: relativeFromDays(0),
+      replacesDateConstraint: true,
+      hasAmbiguousTime: time.ambiguous,
+    };
+
+  const explicit = explicitDateFromText(text, expression);
+  return {
+    date: explicit,
+    time: time.time,
+    relative: null,
+    replacesDateConstraint: false,
+    hasAmbiguousTime: time.ambiguous,
   };
 }
 
@@ -763,11 +1146,12 @@ export function parseCalendarExpression(value: unknown): CalendarExpression {
         return (
           item.kind === "calendar_offset" &&
           Number.isInteger(item.amount) &&
-          (item.amount as number) >= 1 &&
+          (item.amount as number) >= -99 &&
           (item.amount as number) <= 99 &&
           (item.unit === "days" ||
             item.unit === "weeks" ||
-            item.unit === "months") &&
+            item.unit === "months" ||
+            item.unit === "years") &&
           (item.anchor === "reference_day" ||
             item.anchor === "existing_reminder_date")
         );

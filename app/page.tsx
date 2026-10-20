@@ -41,6 +41,8 @@ import {
   STORAGE_KEY,
   sampleStore,
   saveTask,
+  DEFAULT_WORKING_DAYS,
+  normalizeWorkingDays,
   dateLabel,
   fromLocalInput,
   isToday,
@@ -180,7 +182,10 @@ export default function Page() {
         )
           throw Error();
         new Intl.DateTimeFormat("en", { timeZone: saved.timezone });
-        setStore(saved);
+        setStore({
+          ...saved,
+          workingDays: normalizeWorkingDays(saved.workingDays),
+        });
       } else setStore(sampleStore());
     } catch {
       setStorageError(true);
@@ -2182,6 +2187,50 @@ export default function Page() {
                 </section>
                 <div>
                   <section className="card settings-card">
+                    <h2>Working days</h2>
+                    <p>
+                      Used for future working-day scheduling requests. LeadLoop
+                      will not move a reminder away from a weekend unless you
+                      ask it to.
+                    </p>
+                    <div
+                      className="check-list"
+                      role="group"
+                      aria-label="Working days"
+                    >
+                      {[
+                        "Sunday",
+                        "Monday",
+                        "Tuesday",
+                        "Wednesday",
+                        "Thursday",
+                        "Friday",
+                        "Saturday",
+                      ].map((day, index) => (
+                        <label key={day}>
+                          <input
+                            type="checkbox"
+                            checked={store.workingDays.includes(index)}
+                            onChange={() =>
+                              setStore({
+                                ...store,
+                                workingDays: normalizeWorkingDays(
+                                  store.workingDays.includes(index)
+                                    ? store.workingDays.filter(
+                                        (value) => value !== index,
+                                      )
+                                    : [...store.workingDays, index],
+                                ),
+                              })
+                            }
+                          />
+                          {day}
+                        </label>
+                      ))}
+                    </div>
+                    <small>New workspaces use Monday through Friday.</small>
+                  </section>
+                  <section className="card settings-card">
                     <h2>Accounts & reminders</h2>
                     <div className="status-line">
                       <ShieldCheck size={20} />
@@ -2241,6 +2290,7 @@ export default function Page() {
                             business: "",
                             timezone:
                               Intl.DateTimeFormat().resolvedOptions().timeZone,
+                            workingDays: [...DEFAULT_WORKING_DAYS],
                           });
                           setStorageError(false);
                           setNotice("Workspace cleared.");

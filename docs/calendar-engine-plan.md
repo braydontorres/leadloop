@@ -40,19 +40,19 @@ Use it to resolve a local date/time exactly once at read-back time.
 AI remains an extractor into this model. The application validates every field and
 chooses reminders, task IDs, questions, confirmation, and persistence.
 
-## Phase C: common date and time language (next MVP milestones)
+## Phase C: common date and time language (implemented)
 
-1. Add deterministic parsing for today/tomorrow/day-after-tomorrow, this/next
-   weekday, Friday-after-next, relative day/week/month/year offsets, and offsets
-   from an already resolved date.
-2. Add explicit clock forms: noon, midnight, half-past, quarter-to, and durations
-   such as ninety minutes. Do not infer a missing time.
-3. Add a clear documented convention for phrases such as “next Friday”; ask when
-   context or wording remains ambiguous.
-4. Store the reference instant used to resolve relative language, so reminders do
-   not drift while a conversation is in progress.
-5. Add a user setting for working days; do not interpret holidays until region is
-   selected.
+Phase C now adds deterministic parsing for today/tomorrow/day-after-tomorrow,
+this/next/after-next weekday expressions, calendar offsets in days/weeks/months/
+years, offsets from established reminders or stated dates, natural clocks, and
+minute/hour durations. All calculations use the draft reference instant and its
+configured IANA time zone. See
+[`calendar-expression-architecture.md`](./calendar-expression-architecture.md)
+for the weekday and duration conventions.
+
+The Settings screen persists a Monday–Friday working-day preference. It does not
+change ordinary weekend reminders, and holiday scheduling remains unavailable
+until a region and policy are introduced.
 
 ## Phase D: recurrence, holidays, and exceptions (advanced)
 

@@ -252,3 +252,63 @@ test("the interpretation route plus conversation state applies a relative correc
   assert.match(value.reply, /Monday, November 2, 2026.*5:00 PM/);
   assert.equal(requests.length, 2);
 });
+
+test("the interpretation route preserves Phase C weekday and spoken-time corrections", async () => {
+  resetRateLimitsForTest();
+  const now = new Date("2026-10-19T12:00:00Z");
+  const { value } = await withMockedInterpretations(
+    [
+      {
+        intent: {
+          kind: "new_task",
+          fields: { ...blankFields, title: "call Brad", person: "Brad" },
+        },
+      },
+      // The deterministic parser must apply the correction even if the model
+      // mistakenly classifies it as confirmation.
+      { intent: { kind: "confirm", fields: blankFields } },
+    ],
+    async () => {
+      const firstPayload = (await (
+        await interpretPost(
+          request(
+            "Remind me to call Brad this Friday at half past three PM.",
+            conversationContext(emptyConversationState()),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      const first = advanceConversation({
+        state: emptyConversationState(),
+        result: firstPayload.result,
+        text: firstPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "phase-c-route-draft",
+        now,
+      });
+      assert.match(first.reply, /October 23, 2026.*3:30 PM/);
+      const correctionPayload = (await (
+        await interpretPost(
+          request(
+            "Actually, Friday after next at quarter to five PM.",
+            conversationContext({
+              ...first.state,
+              stage: "awaiting_confirmation",
+            }),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      return advanceConversation({
+        state: { ...first.state, stage: "awaiting_confirmation" },
+        result: correctionPayload.result,
+        text: correctionPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "unexpected-phase-c-route-draft",
+        now,
+      });
+    },
+  );
+  assert.equal(value.state.activeReminder?.id, "phase-c-route-draft");
+  assert.equal(value.state.activeReminder?.title, "call Brad");
+  assert.equal(value.state.stage, "reading_back");
+  assert.match(value.reply, /October 30, 2026.*4:45 PM/);
+});

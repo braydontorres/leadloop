@@ -424,6 +424,71 @@ test("typed combined ordinal and time goes directly to reminder read-back", asyn
   ).not.toBeVisible();
 });
 
+test("typed Phase C weekday and spoken-time corrections keep one draft", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (
+      window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+    ).__spoken = spoken;
+  });
+  const turns = [
+    {
+      transcript: "Remind me to call Brad this Friday at half past three PM.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "call Brad", person: "Brad" },
+      },
+    },
+    {
+      transcript: "Actually, Friday after next at quarter to five PM.",
+      intent: { kind: "confirm", fields: blankFields },
+    },
+  ];
+  let index = 0;
+  await page.route("**/api/interpret", async (route) => {
+    const turn = turns[index++];
+    await route.fulfill({
+      json: { transcript: turn.transcript, result: { intent: turn.intent } },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => {
+      const spoken = (
+        window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+      ).__spoken;
+      spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent);
+    });
+
+  await reply.fill(turns[0].transcript);
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "Friday, October 23, 2026 at 3:30 PM",
+  );
+  await finishSpeech();
+  await reply.fill(turns[1].transcript);
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "Friday, October 30, 2026 at 4:45 PM",
+  );
+});
+
 test("a rate-limited follow-up preserves the active reminder and shows retry timing", async ({
   page,
 }) => {
@@ -1217,4 +1282,26 @@ test("one browser session keeps consecutive reminder drafts independent", async 
     expect(saved.filter((task) => task.title === title)).toHaveLength(1);
   expect(saved.some((task) => task.title === "draft a proposal")).toBeFalsy();
   expect(saved).toHaveLength(9); // five samples plus four confirmed reminders
+});
+
+test("working-day preferences default to Monday through Friday and persist", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const monday = page.getByRole("checkbox", { name: "Monday" });
+  const sunday = page.getByRole("checkbox", { name: "Sunday" });
+  await expect(monday).toBeChecked();
+  await expect(sunday).not.toBeChecked();
+  await monday.uncheck();
+  await page.reload();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(
+    page.getByRole("checkbox", { name: "Monday" }),
+  ).not.toBeChecked();
+  const workingDays = await page.evaluate(() => {
+    const raw = localStorage.getItem("leadloop.phase1.v1");
+    return raw ? (JSON.parse(raw).workingDays as number[]) : [];
+  });
+  expect(workingDays).not.toContain(1);
 });

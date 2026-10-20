@@ -19,8 +19,21 @@ export type Store = {
   name: string;
   business: string;
   timezone: string;
+  /** User preference for future working-day language; weekends stay valid unless requested otherwise. */
+  workingDays: number[];
 };
 export const STORAGE_KEY = "leadloop.phase1.v1";
+export const DEFAULT_WORKING_DAYS = [1, 2, 3, 4, 5] as const;
+
+export function normalizeWorkingDays(value: unknown): number[] {
+  if (!Array.isArray(value)) return [...DEFAULT_WORKING_DAYS];
+  const days = [
+    ...new Set(
+      value.filter((day) => Number.isInteger(day) && day >= 0 && day <= 6),
+    ),
+  ].sort((left, right) => left - right);
+  return days.length ? days : [...DEFAULT_WORKING_DAYS];
+}
 export function saveTask(tasks: Task[], task: Task): Task[] {
   if (!task.title.trim()) throw new Error("Give your task a name.");
   if (task.due && Number.isNaN(Date.parse(task.due)))
@@ -40,6 +53,7 @@ export function sampleStore(): Store {
     name: "Alex",
     business: "My business",
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    workingDays: [...DEFAULT_WORKING_DAYS],
     tasks: [
       {
         id: "sample-1",

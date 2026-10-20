@@ -3,22 +3,22 @@ import {
   calendarFromLegacy,
   calendarInvalidMessage,
   calendarProjection,
+  calendarLanguageFieldsFromText,
   createCalendarExpression,
   dateWithImplicitYear,
   hasSchedulingCorrectionLanguage,
   implicitMonthDayFromText,
   mergeCalendarExpression,
   parseCalendarExpression,
-  relativeDateExpressionFromText,
   resolveCalendarExpression,
   type CalendarExpression,
+  type RelativeDateExpression,
 } from "./calendar-expression";
 import {
   cleanReminderTitle,
   dateConstraintQuestion,
   deriveDateConstraint,
   deterministicDateFromText,
-  deterministicTimeFromText,
   matchesDateConstraint,
   mentionsUnambiguousDate,
   type DateConstraint,
@@ -299,8 +299,9 @@ function applyFields(
   fields: IntentFields,
   timeZone: string,
   dateConstraint: DateConstraint | null,
-  relativeDate: ReturnType<typeof relativeDateExpressionFromText>,
+  relativeDate: RelativeDateExpression | null,
   implicitYearForDate: boolean,
+  replacesDateConstraint: boolean,
 ) {
   let calendar = current.calendar;
   let dateConstraintError: string | null = null;
@@ -313,6 +314,8 @@ function applyFields(
     calendar = mergeCalendarExpression(calendar, { clear: true });
   if (relativeDate)
     calendar = mergeCalendarExpression(calendar, { relative: relativeDate });
+  if (replacesDateConstraint && !relativeDate)
+    calendar = mergeCalendarExpression(calendar, { constraint: null });
   if (fields.date !== null || fields.time !== null) {
     if (
       fields.date !== null &&
@@ -432,10 +435,17 @@ export function advanceConversation(args: {
 }): ConversationTransition {
   const { state, result, text: user, timeZone, createId, now } = args;
   let intent = result.intent;
-  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
-  const relativeDate = relativeDateExpressionFromText(user);
   const initialCalendar =
     state.activeReminder?.calendar ?? createCalendarExpression(timeZone, now);
+  const language = calendarLanguageFieldsFromText(user, initialCalendar);
+  // A fully resolved relative/weekday expression must not also become a
+  // partial weekday constraint. That would make an unambiguous "next Friday"
+  // ask a second question about its month.
+  const derivedConstraint =
+    language.date || language.relative
+      ? null
+      : deriveDateConstraint(user, timeZone, now);
+  const relativeDate = language.relative;
   // A month/day without a year gets the implicit-year treatment only when it
   // does not contradict an already established explicit calendar year. An
   // active `July 2027 / Saturday` constraint, for example, deliberately
@@ -454,17 +464,23 @@ export function advanceConversation(args: {
     state.activeReminder?.calendar.date.constraint ?? null;
   const activeConstraint =
     state.activeReminder?.calendar.date.constraint ?? null;
-  const deterministicDate = relativeDate
-    ? null
-    : deterministicDateFromText(
-        user,
-        timeZone,
-        activeConstraint ?? derivedConstraint,
-        now,
-      );
-  const deterministicTime = deterministicTimeFromText(user);
+  const deterministicDate =
+    language.date ??
+    (relativeDate
+      ? null
+      : deterministicDateFromText(
+          user,
+          timeZone,
+          activeConstraint ?? derivedConstraint,
+          now,
+        ));
+  const deterministicTime = language.time;
   const hasDeterministicScheduleChange = Boolean(
-    derivedConstraint || relativeDate || deterministicDate || deterministicTime,
+    derivedConstraint ||
+    relativeDate ||
+    deterministicDate ||
+    deterministicTime ||
+    language.hasAmbiguousTime,
   );
 
   // An ordinal reply answers the application's outstanding calendar question.
@@ -612,6 +628,22 @@ export function advanceConversation(args: {
       },
     };
   }
+  if (
+    intent.kind === "none" &&
+    state.activeReminder &&
+    language.hasAmbiguousTime
+  )
+    intent = {
+      kind: "follow_up",
+      fields: {
+        title: null,
+        person: null,
+        date: null,
+        time: null,
+        notes: null,
+        clearDue: false,
+      },
+    };
   if (intent.kind === "none")
     return withReply(
       state,
@@ -647,6 +679,7 @@ export function advanceConversation(args: {
     derivedConstraint,
     relativeDate,
     implicitMonthDate !== null,
+    language.replacesDateConstraint,
   );
   const next = nextReply(
     applied.reminder,

@@ -1,4 +1,4 @@
-# Calendar expression architecture (Phase B)
+# Calendar expression architecture (Phases B and C)
 
 ## Why this changed
 
@@ -103,3 +103,34 @@ current month, a selected ordinal that has already passed (including its stated
 local time) uses the following year. Explicit years are never changed; an
 explicit past schedule is rejected for clarification. A nonexistent fifth
 weekday remains invalid rather than moving to another month or year.
+
+## Phase C natural-language scheduling
+
+Phase C keeps `CalendarExpression` as the only mutable scheduling state. The
+shared `calendarLanguageFieldsFromText` parser produces deterministic date,
+time, or relative-expression updates before `advanceConversation` merges them
+into the active draft. Typed and spoken transcripts therefore take the same
+path.
+
+Supported relative language includes today, tomorrow, day after tomorrow, this
+or next weekday, weekday-after-next, calendar offsets in days/weeks/months/years,
+offsets from an established reminder, a week from tomorrow, offsets from next
+weekday, and offsets from a stated calendar date. Month and year arithmetic is
+calendar-aware and clamps only overflowing month-end days.
+
+The convention is fixed: **this Friday** is the Friday in the current local
+calendar week, including today; **next Friday** is the first Friday strictly
+after the captured local reference date; **Friday after next** is the following
+Friday. On a Monday, both “this Friday” and “next Friday” are that week’s
+Friday; “Friday after next” is the Friday one week later.
+
+Spoken clocks support noon, midnight, `half past`, `quarter past`, `quarter
+to`, and word-based `three fifteen`/`three thirty` forms when AM or PM is
+spoken. A clock without AM/PM stays unanswered and the conversation asks for a
+time. Minute/hour durations use the completed reminder's instant when one is
+already established; otherwise they use the draft's frozen reference instant.
+
+The local workspace persists `workingDays`, defaulting to Monday through Friday.
+It is a Phase C preference for future working-day language and does not move
+ordinary weekend reminders. Holiday, recurrence, and explicit fall-back DST
+selection remain outside this phase.

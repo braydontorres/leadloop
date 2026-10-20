@@ -25,6 +25,11 @@ calendar and conversation layers are deterministic.
   `new_task`, `follow_up`, and `update` labels. A 100-session state simulation
   covers confirmations, cancellations, corrections, conversation endings, and
   fresh drafts.
+- **Phase C language:** generated incomplete ordinal conversations cover the
+  same 588 month/weekday/occurrence combinations with the ordinal supplied in
+  a later turn. Relative weekdays, calendar offsets, natural clocks, duration
+  corrections, AM/PM ambiguity, and persisted working-day preferences are
+  checked in the comprehensive command.
 - **Route integration:** `/api/interpret` is called with mocked provider
   responses to verify parsing and state transitions together. It never calls a
   paid provider.

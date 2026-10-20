@@ -6,12 +6,20 @@ import {
   sampleStore,
   fromLocalInput,
   toLocalInput,
+  DEFAULT_WORKING_DAYS,
+  normalizeWorkingDays,
 } from "../lib/tasks";
 test("saving a correction replaces the original without duplicates", () => {
   const original = sampleStore().tasks[0];
   const tasks = saveTask([original], { ...original, title: "Corrected task" });
   assert.equal(tasks.length, 1);
   assert.equal(tasks[0].title, "Corrected task");
+});
+
+test("working days default to Monday through Friday and normalize persisted settings", () => {
+  assert.deepEqual(sampleStore().workingDays, DEFAULT_WORKING_DAYS);
+  assert.deepEqual(normalizeWorkingDays(undefined), DEFAULT_WORKING_DAYS);
+  assert.deepEqual(normalizeWorkingDays([5, 1, 5, 0, 9, "2"]), [0, 1, 5]);
 });
 test("task saving rejects blank titles and invalid reminder dates", () => {
   const t = sampleStore().tasks[0];
