@@ -432,6 +432,31 @@ export function advanceConversation(args: {
 }): ConversationTransition {
   const { state, result, text: user, timeZone, createId, now } = args;
   let intent = result.intent;
+  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
+  const activeCalendarClarification =
+    state.activeReminder?.pendingDateConstraint ?? null;
+
+  // An ordinal reply answers the application's outstanding calendar question.
+  // Treat it as a follow-up before consulting the model's intent label: models
+  // may label a short phrase such as "the fifth Saturday" as none, confirm, or
+  // even a new task, but none of those labels should discard the active draft.
+  if (
+    activeCalendarClarification &&
+    derivedConstraint &&
+    derivedConstraint.occurrence !== null
+  ) {
+    intent = {
+      kind: "follow_up",
+      fields: {
+        title: null,
+        person: null,
+        date: null,
+        time: null,
+        notes: null,
+        clearDue: false,
+      },
+    };
+  }
   if (
     intent.kind === "end_conversation" &&
     (state.stage === "awaiting_confirmation" ||
@@ -500,7 +525,6 @@ export function advanceConversation(args: {
       stage: "awaiting_details",
     });
   }
-  const derivedConstraint = deriveDateConstraint(user, timeZone, now);
   if (
     intent.kind === "none" &&
     derivedConstraint &&
