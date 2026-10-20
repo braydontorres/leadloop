@@ -136,6 +136,11 @@ test("updates, missing customers, ambiguity, and cancellation are explicit", () 
     [mike, person("Mike Davis")],
   );
   assert.match(ambiguous.reply, /more than one customer/);
+  const selected = step(ambiguous.state, "Mike Davis", [
+    mike,
+    person("Mike Davis"),
+  ]);
+  assert.match(selected.reply, /Mike Davis/);
 
   const renamed = step(
     emptyCustomerMemoryState(),

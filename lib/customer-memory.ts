@@ -19,7 +19,17 @@ export type CustomerDraft = {
 
 export type CustomerMemoryState = {
   pending: CustomerDraft | null;
+  choice: { intent: CustomerIntent; people: Person[] } | null;
 };
+
+export type CustomerIntent =
+  | { kind: "retrieve"; name: string }
+  | {
+      kind: "write";
+      operation: CustomerOperation;
+      name: string;
+      fields: CustomerFields;
+    };
 
 export type CustomerMemoryTransition = {
   handled: boolean;
@@ -38,7 +48,7 @@ const emptyFields = (): CustomerFields => ({
 });
 
 export function emptyCustomerMemoryState(): CustomerMemoryState {
-  return { pending: null };
+  return { pending: null, choice: null };
 }
 
 function normalized(value: string) {
@@ -188,15 +198,7 @@ function nameFrom(text: string, expression: RegExp) {
   return clean(match?.[1]);
 }
 
-export function parseCustomerMemoryText(text: string):
-  | { kind: "retrieve"; name: string }
-  | {
-      kind: "write";
-      operation: CustomerOperation;
-      name: string;
-      fields: CustomerFields;
-    }
-  | null {
+export function parseCustomerMemoryText(text: string): CustomerIntent | null {
   if (/\bremind me\b/i.test(text)) return null;
   const retrieve = nameFrom(
     text,
@@ -238,6 +240,64 @@ export function parseCustomerMemoryText(text: string):
 
 function unchangedPendingReply() {
   return "Please say yes to save that customer change, or cancel to discard it.";
+}
+
+function selectedCustomer(people: Person[], answer: string) {
+  const query = normalized(
+    answer.replace(/^(?:it'?s|it is|the one called)\s+/i, ""),
+  );
+  const exact = people.filter((person) => normalized(person.name) === query);
+  if (exact.length === 1) return exact[0];
+  const partial = people.filter((person) =>
+    normalized(person.name).includes(query),
+  );
+  return partial.length === 1 ? partial[0] : null;
+}
+
+function writeTransition(
+  intent: Extract<CustomerIntent, { kind: "write" }>,
+  existing: Person | null,
+  state: CustomerMemoryState,
+  now: string,
+  createId: () => string,
+): CustomerMemoryTransition {
+  if (intent.operation === "update" && !existing)
+    return {
+      handled: true,
+      state,
+      reply: `I couldn’t find a customer named ${intent.name}. Add them first, then I can update their information.`,
+    };
+  const operation: CustomerOperation = existing
+    ? intent.operation === "create"
+      ? "note"
+      : intent.operation
+    : "create";
+  const base: Person = existing
+    ? { ...existing, interactions: [...existing.interactions] }
+    : {
+        id: createId(),
+        name: titleCase(intent.name),
+        business: "",
+        email: "",
+        phone: "",
+        address: "",
+        notes: "",
+        interactions: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+  const pending = mergeDraft(base, intent.fields, operation, now, createId);
+  if (!pending.changed.length && operation !== "create")
+    return {
+      handled: true,
+      state,
+      reply: `I didn’t hear a customer detail to change for ${base.name}.`,
+    };
+  return {
+    handled: true,
+    state: { pending, choice: null },
+    reply: readBack(pending),
+  };
 }
 
 /**
@@ -282,9 +342,36 @@ export function advanceCustomerMemory(args: {
         now,
         createId,
       );
-      return { handled: true, state: { pending }, reply: readBack(pending) };
+      return {
+        handled: true,
+        state: { pending, choice: null },
+        reply: readBack(pending),
+      };
     }
     return { handled: true, state, reply: unchangedPendingReply() };
+  }
+
+  if (state.choice) {
+    const selected = selectedCustomer(state.choice.people, user);
+    if (!selected)
+      return {
+        handled: true,
+        state,
+        reply: ambiguityReply(state.choice.people),
+      };
+    if (state.choice.intent.kind === "retrieve")
+      return {
+        handled: true,
+        state: emptyCustomerMemoryState(),
+        reply: personSummary(selected),
+      };
+    return writeTransition(
+      state.choice.intent,
+      selected,
+      emptyCustomerMemoryState(),
+      now,
+      createId,
+    );
   }
 
   const intent = parseCustomerMemoryText(user);
@@ -298,48 +385,28 @@ export function advanceCustomerMemory(args: {
         reply: `I don’t have any information for ${intent.name} yet.`,
       };
     if (lookup.kind === "ambiguous")
-      return { handled: true, state, reply: ambiguityReply(lookup.people) };
+      return {
+        handled: true,
+        state: { pending: null, choice: { intent, people: lookup.people } },
+        reply: ambiguityReply(lookup.people),
+      };
     return { handled: true, state, reply: personSummary(lookup.person) };
   }
 
   const lookup = findCustomer(people, intent.name);
   if (lookup.kind === "ambiguous")
-    return { handled: true, state, reply: ambiguityReply(lookup.people) };
-  if (intent.operation === "update" && lookup.kind === "none")
     return {
       handled: true,
-      state,
-      reply: `I couldn’t find a customer named ${intent.name}. Add them first, then I can update their information.`,
+      state: { pending: null, choice: { intent, people: lookup.people } },
+      reply: ambiguityReply(lookup.people),
     };
-
-  const existing = lookup.kind === "one" ? lookup.person : null;
-  const operation: CustomerOperation = existing
-    ? intent.operation === "create"
-      ? "note"
-      : intent.operation
-    : "create";
-  const base: Person = existing
-    ? { ...existing, interactions: [...existing.interactions] }
-    : {
-        id: createId(),
-        name: titleCase(intent.name),
-        business: "",
-        email: "",
-        phone: "",
-        address: "",
-        notes: "",
-        interactions: [],
-        createdAt: now,
-        updatedAt: now,
-      };
-  const pending = mergeDraft(base, intent.fields, operation, now, createId);
-  if (!pending.changed.length && operation !== "create")
-    return {
-      handled: true,
-      state,
-      reply: `I didn’t hear a customer detail to change for ${base.name}.`,
-    };
-  return { handled: true, state: { pending }, reply: readBack(pending) };
+  return writeTransition(
+    intent,
+    lookup.kind === "one" ? lookup.person : null,
+    state,
+    now,
+    createId,
+  );
 }
 
 export function saveCustomer(people: Person[], person: Person) {
