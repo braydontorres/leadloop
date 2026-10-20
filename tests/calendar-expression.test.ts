@@ -326,3 +326,86 @@ test("a relative correction invalidates read-back and preserves the draft time a
   });
   assert.equal(prematureYes.savedTask, undefined);
 });
+
+test("implicit years resolve ordinal months to their next upcoming occurrence", () => {
+  const cases: Array<
+    [
+      {
+        month: number;
+        weekday: number;
+        occurrence: 1 | 2 | 3 | 4 | 5 | "last";
+      },
+      string,
+    ]
+  > = [
+    [{ month: 6, weekday: 6, occurrence: 2 }, "2027-06-12"],
+    [{ month: 12, weekday: 1, occurrence: 1 }, "2026-12-07"],
+    [{ month: 9, weekday: 5, occurrence: "last" }, "2027-09-24"],
+    [{ month: 11, weekday: 3, occurrence: 3 }, "2026-11-18"],
+    [{ month: 7, weekday: 5, occurrence: 2 }, "2027-07-09"],
+  ];
+  for (const [input, expected] of cases) {
+    const resolved = resolveCalendarExpression(
+      expression({ year: null, ...input }, "17:00"),
+    );
+    assert.equal(resolved.kind, "resolved", expected);
+    if (resolved.kind === "resolved") assert.equal(resolved.date, expected);
+  }
+});
+
+test("implicit ordinal years cover all months and move a passed current-month occurrence forward", () => {
+  for (let month = 1; month <= 12; month += 1) {
+    const resolved = resolveCalendarExpression(
+      expression({ year: null, month, weekday: 1, occurrence: 1 }, "17:00"),
+    );
+    assert.equal(resolved.kind, "resolved", `month ${month}`);
+    if (resolved.kind !== "resolved") continue;
+    const date = new Date(`${resolved.date}T00:00:00Z`);
+    assert.equal(date.getUTCMonth() + 1, month);
+    assert.ok(resolved.date >= "2026-10-19");
+  }
+  const passed = resolveCalendarExpression(
+    expression({ year: null, month: 10, weekday: 1, occurrence: 3 }, "06:00"),
+  );
+  assert.equal(passed.kind, "resolved");
+  if (passed.kind === "resolved") assert.equal(passed.date, "2027-10-18");
+
+  const unavailable = resolveCalendarExpression(
+    expression({ year: null, month: 2, weekday: 1, occurrence: 5 }, "09:00"),
+  );
+  assert.equal(unavailable.kind, "invalid");
+  if (unavailable.kind === "invalid") {
+    assert.equal(unavailable.reason, "unavailable_occurrence");
+    assert.equal(unavailable.occurrenceCount, 4);
+  }
+});
+
+test("an explicit past year is never silently advanced", () => {
+  const resolved = resolveCalendarExpression(
+    expression({ year: 2026, month: 6, weekday: 6, occurrence: 2 }, "17:00"),
+  );
+  assert.deepEqual(resolved, { kind: "invalid", reason: "past_date" });
+});
+
+test("a month/day without a year resolves centrally to the next upcoming date", () => {
+  const nextJune = resolveCalendarExpression(
+    mergeCalendarExpression(createCalendarExpression(zone, reference), {
+      date: "2026-06-12",
+      implicitYear: true,
+      time: "17:00",
+    }),
+  );
+  assert.equal(nextJune.kind, "resolved");
+  if (nextJune.kind === "resolved") assert.equal(nextJune.date, "2027-06-12");
+
+  const passedToday = resolveCalendarExpression(
+    mergeCalendarExpression(createCalendarExpression(zone, reference), {
+      date: "2026-10-19",
+      implicitYear: true,
+      time: "06:00",
+    }),
+  );
+  assert.equal(passedToday.kind, "resolved");
+  if (passedToday.kind === "resolved")
+    assert.equal(passedToday.date, "2027-10-19");
+});

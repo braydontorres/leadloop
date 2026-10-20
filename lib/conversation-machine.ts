@@ -4,11 +4,13 @@ import {
   calendarInvalidMessage,
   calendarProjection,
   createCalendarExpression,
+  dateWithImplicitYear,
+  hasSchedulingCorrectionLanguage,
+  implicitMonthDayFromText,
   mergeCalendarExpression,
   parseCalendarExpression,
   relativeDateExpressionFromText,
   resolveCalendarExpression,
-  hasSchedulingCorrectionLanguage,
   type CalendarExpression,
 } from "./calendar-expression";
 import {
@@ -298,6 +300,7 @@ function applyFields(
   timeZone: string,
   dateConstraint: DateConstraint | null,
   relativeDate: ReturnType<typeof relativeDateExpressionFromText>,
+  implicitYearForDate: boolean,
 ) {
   let calendar = current.calendar;
   let dateConstraintError: string | null = null;
@@ -320,6 +323,7 @@ function applyFields(
     } else
       calendar = mergeCalendarExpression(calendar, {
         date: fields.date === null ? undefined : fields.date,
+        implicitYear: fields.date === null ? undefined : implicitYearForDate,
         time: fields.time === null ? undefined : fields.time,
       });
   }
@@ -430,6 +434,22 @@ export function advanceConversation(args: {
   let intent = result.intent;
   const derivedConstraint = deriveDateConstraint(user, timeZone, now);
   const relativeDate = relativeDateExpressionFromText(user);
+  const initialCalendar =
+    state.activeReminder?.calendar ?? createCalendarExpression(timeZone, now);
+  // A month/day without a year gets the implicit-year treatment only when it
+  // does not contradict an already established explicit calendar year. An
+  // active `July 2027 / Saturday` constraint, for example, deliberately
+  // remains the source of the year for a reply such as "July 10 at 3 PM".
+  // This lets the deterministic constraint validation complete the reminder
+  // instead of replacing the established context with a fresh implicit date.
+  const implicitMonthDay =
+    initialCalendar.date.constraint?.year === null ||
+    initialCalendar.date.constraint === null
+      ? implicitMonthDayFromText(user)
+      : null;
+  const implicitMonthDate = implicitMonthDay
+    ? dateWithImplicitYear(implicitMonthDay, initialCalendar)
+    : null;
   const activeCalendarClarification =
     state.activeReminder?.calendar.date.constraint ?? null;
   const activeConstraint =
@@ -608,7 +628,8 @@ export function advanceConversation(args: {
     date:
       derivedConstraint || relativeDate
         ? null
-        : (deterministicDate ??
+        : (implicitMonthDate ??
+          deterministicDate ??
           (mentionsUnambiguousDate(user) ? intent.fields.date : null)),
     time: deterministicTime,
   };
@@ -619,12 +640,13 @@ export function advanceConversation(args: {
         title: "",
         person: "",
         notes: "",
-        calendar: createCalendarExpression(timeZone, now),
+        calendar: initialCalendar,
       }),
     fields,
     timeZone,
     derivedConstraint,
     relativeDate,
+    implicitMonthDate !== null,
   );
   const next = nextReply(
     applied.reminder,

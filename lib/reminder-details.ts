@@ -186,6 +186,8 @@ export function deriveDateConstraint(
   const local = localParts(now, timeZone);
   const next = /\bnext\b/i.test(text);
   const explicitYear = text.match(/\b(20\d{2})\b/);
+  // Generic omitted years stay unresolved for CalendarExpression. `next` is
+  // explicit user language whose existing behavior is preserved here.
   const year = explicitYear
     ? Number(explicitYear[1])
     : next && monthIndex >= 0

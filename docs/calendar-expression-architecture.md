@@ -93,3 +93,13 @@ in-memory conversation context lacks a calendar expression, `calendarFromLegacy`
 creates one from its existing final or pending fields. Removing the new
 expression from an in-progress context leaves the old compatibility fields
 usable by the prior version, so no destructive local-data migration is needed.
+
+## Implicit-year policy
+
+For a month/weekday expression without an explicit year, the resolver selects
+that month’s next upcoming occurrence from the captured local reference date.
+Past months use the following year; future months use the current year. For the
+current month, a selected ordinal that has already passed (including its stated
+local time) uses the following year. Explicit years are never changed; an
+explicit past schedule is rejected for clarification. A nonexistent fifth
+weekday remains invalid rather than moving to another month or year.

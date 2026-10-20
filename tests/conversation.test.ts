@@ -515,3 +515,32 @@ test("a spoken goodbye ends a saved session, while no at confirmation asks for a
   assert.equal(ended.state.activeReminder, null);
   assert.match(ended.reply, /Have a great day/);
 });
+
+test("an implicit month year resolves the next ordinal occurrence without asking for a year", () => {
+  ids = 0;
+  const initial = turn(
+    emptyConversationState(),
+    { kind: "new_task", fields: { ...fields, title: "order supplies" } },
+    "Remind me to order supplies on a Saturday in June.",
+  );
+  assert.match(initial.reply, /Which Saturday in June/);
+  const resolved = turn(
+    initial.state,
+    { kind: "none", fields },
+    "The second Saturday at 5 PM.",
+  );
+  assert.equal(resolved.state.activeReminder?.id, "draft-1");
+  assert.equal(resolved.state.stage, "reading_back");
+  assert.match(resolved.reply, /Saturday, June 12, 2027.*5:00 PM/);
+});
+
+test("an implicit month/day uses the calendar expression instead of an AI year guess", () => {
+  ids = 0;
+  const result = turn(
+    emptyConversationState(),
+    { kind: "new_task", fields: { ...fields, title: "call Brad" } },
+    "Remind me to call Brad on June 12 at 5 PM.",
+  );
+  assert.equal(result.state.stage, "reading_back");
+  assert.match(result.reply, /June 12, 2027.*5:00 PM/);
+});

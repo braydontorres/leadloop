@@ -20,6 +20,8 @@ export type CalendarExpression = {
   date: {
     /** An explicit YYYY-MM-DD supplied by the user. */
     absolute: string | null;
+    /** True only when the user supplied a month/day without a year. */
+    implicitYear: boolean;
     /** A partially specified or ordinal weekday date. */
     constraint: DateConstraint | null;
     /** The limited, deterministic relative-date subset supported by this repair. */
@@ -71,7 +73,8 @@ export type CalendarResolution =
         | "invalid_date"
         | "constraint_conflict"
         | "unavailable_occurrence"
-        | "invalid_local_time";
+        | "invalid_local_time"
+        | "past_date";
       occurrenceCount?: number;
       constraint?: DateConstraint;
     }
@@ -79,6 +82,7 @@ export type CalendarResolution =
 
 export type CalendarExpressionUpdate = {
   date?: string | null;
+  implicitYear?: boolean;
   time?: string | null;
   constraint?: DateConstraint | null;
   relative?: RelativeDateExpression | null;
@@ -176,6 +180,47 @@ const numberWords: Record<string, number> = {
   five: 5,
 };
 
+const monthNames = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+];
+
+/** A concrete month/day that deliberately omitted its year. */
+export function implicitMonthDayFromText(text: string) {
+  const match = text.match(
+    new RegExp(
+      `\\b(${monthNames.join("|")})\\s+(\\d{1,2})(?!\\s*,?\\s*20\\d{2})\\b`,
+      "i",
+    ),
+  );
+  if (!match) return null;
+  const month = monthNames.indexOf(match[1].toLowerCase()) + 1;
+  const day = Number(match[2]);
+  const probe = new Date(Date.UTC(2026, month - 1, day));
+  if (probe.getUTCMonth() + 1 !== month || probe.getUTCDate() !== day)
+    return null;
+  return { month, day };
+}
+
+export function dateWithImplicitYear(
+  monthDay: { month: number; day: number },
+  expression: CalendarExpression,
+) {
+  const reference = referenceDate(expression);
+  const value = isoDate({ year: reference.year, ...monthDay });
+  return dateIsValid(value) ? value : null;
+}
+
 /**
  * Parses only the explicitly supported relative-date phrases. It is central so
  * typed and voice turns cannot diverge. `null` means this phrase is not part of
@@ -239,7 +284,13 @@ export function createCalendarExpression(
     version: 1,
     timeZone,
     referenceInstant: now.toISOString(),
-    date: { absolute: null, constraint: null, relative: null, range: null },
+    date: {
+      absolute: null,
+      implicitYear: false,
+      constraint: null,
+      relative: null,
+      range: null,
+    },
     time: { local: null },
     offset: null,
     recurrence: null,
@@ -280,6 +331,7 @@ export function calendarFromLegacy(args: {
   const expression = createCalendarExpression(args.timeZone, args.now);
   const due = localDueParts(args.due ?? "", args.timeZone);
   expression.date.absolute = args.pendingDate ?? due.date;
+  expression.date.implicitYear = false;
   expression.time.local = args.pendingTime ?? due.time;
   expression.date.constraint = args.pendingDateConstraint ?? null;
   return expression;
@@ -322,6 +374,12 @@ export function mergeCalendarExpression(
           : update.date === undefined
             ? base.date.absolute
             : update.date,
+      implicitYear:
+        replacesDateThroughConstraint || replacesDateThroughRelative
+          ? false
+          : update.date === undefined
+            ? base.date.implicitYear
+            : (update.implicitYear ?? false),
       constraint,
       relative:
         replacesDateThroughConstraint || update.date !== undefined
@@ -370,6 +428,110 @@ function constraintMissing(constraint: DateConstraint): CalendarField[] {
   return missing;
 }
 
+function referenceDate(expression: CalendarExpression) {
+  return localDateParts(
+    new Date(expression.referenceInstant),
+    expression.timeZone,
+  );
+}
+
+/**
+ * A missing year on a month/weekday expression means the next occurrence,
+ * calculated from the draft's frozen local reference date. The returned
+ * constraint is a resolver value only: the stored expression keeps `year:
+ * null` to preserve what the user actually said.
+ */
+function constraintWithImplicitYear(
+  expression: CalendarExpression,
+  constraint: DateConstraint,
+) {
+  if (constraint.year !== null || constraint.month === null)
+    return { constraint, unavailable: null as number | null };
+  const reference = referenceDate(expression);
+  let year = reference.year + (constraint.month < reference.month ? 1 : 0);
+  const candidate = { ...constraint, year };
+  if (
+    constraint.month !== reference.month ||
+    constraint.weekday === null ||
+    constraint.occurrence === null
+  )
+    return { constraint: candidate, unavailable: null as number | null };
+
+  // A nonexistent fifth weekday is invalid for the month being discussed, not
+  // a reason to quietly search a different year.
+  const current = calendarDateForWeekdayOccurrence(
+    year,
+    constraint.month,
+    constraint.weekday,
+    constraint.occurrence,
+  );
+  if (!current.date)
+    return { constraint: candidate, unavailable: current.occurrenceCount };
+  const referenceIso = isoDate(reference);
+  let hasPassed = current.date < referenceIso;
+  if (
+    !hasPassed &&
+    current.date === referenceIso &&
+    expression.time.local &&
+    timeIsValid(expression.time.local)
+  ) {
+    try {
+      hasPassed =
+        new Date(
+          fromLocalInput(
+            `${current.date}T${expression.time.local}`,
+            expression.timeZone,
+          ),
+        ).getTime() < new Date(expression.referenceInstant).getTime();
+    } catch {
+      // The normal resolver produces the local-time error below.
+    }
+  }
+  if (hasPassed) year += 1;
+  return {
+    constraint: { ...constraint, year },
+    unavailable: null as number | null,
+  };
+}
+
+function resolveImplicitAbsoluteDate(
+  expression: CalendarExpression,
+  date: string,
+) {
+  const parsed = parseIsoDate(date);
+  if (!parsed) return null;
+  const reference = referenceDate(expression);
+  let year = reference.year;
+  let candidate = isoDate({ year, month: parsed.month, day: parsed.day });
+  if (!dateIsValid(candidate)) return null;
+  const referenceIso = isoDate(reference);
+  let hasPassed = candidate < referenceIso;
+  if (
+    !hasPassed &&
+    candidate === referenceIso &&
+    expression.time.local &&
+    timeIsValid(expression.time.local)
+  ) {
+    try {
+      hasPassed =
+        new Date(
+          fromLocalInput(
+            `${candidate}T${expression.time.local}`,
+            expression.timeZone,
+          ),
+        ).getTime() < new Date(expression.referenceInstant).getTime();
+    } catch {
+      // The normal resolver returns the invalid-local-time outcome.
+    }
+  }
+  if (hasPassed) {
+    year += 1;
+    candidate = isoDate({ year, month: parsed.month, day: parsed.day });
+    if (!dateIsValid(candidate)) return null;
+  }
+  return candidate;
+}
+
 /** Deterministically resolve only the Phase B one-time date/time subset. */
 export function resolveCalendarExpression(
   expression: CalendarExpression,
@@ -382,6 +544,10 @@ export function resolveCalendarExpression(
     return { kind: "invalid", reason: "invalid_local_time" };
 
   let date = expression.date.absolute;
+  if (date && expression.date.implicitYear) {
+    date = resolveImplicitAbsoluteDate(expression, date);
+    if (!date) return { kind: "invalid", reason: "invalid_date" };
+  }
   if (expression.date.relative) {
     const relative = expression.date.relative;
     const base =
@@ -405,14 +571,27 @@ export function resolveCalendarExpression(
   }
   const constraint = expression.date.constraint;
   if (constraint) {
-    if (date && !matchesDateConstraint(date, constraint))
-      return { kind: "invalid", reason: "constraint_conflict", constraint };
+    const implicit = constraintWithImplicitYear(expression, constraint);
+    const resolvedConstraint = implicit.constraint;
+    if (implicit.unavailable !== null)
+      return {
+        kind: "invalid",
+        reason: "unavailable_occurrence",
+        occurrenceCount: implicit.unavailable,
+        constraint: resolvedConstraint,
+      };
+    if (date && !matchesDateConstraint(date, resolvedConstraint))
+      return {
+        kind: "invalid",
+        reason: "constraint_conflict",
+        constraint: resolvedConstraint,
+      };
     if (!date) {
-      const resolution = resolveDateConstraint(constraint);
+      const resolution = resolveDateConstraint(resolvedConstraint);
       if (resolution.status === "incomplete")
         return {
           kind: "ambiguous",
-          ambiguities: constraintMissing(constraint).map((field) => ({
+          ambiguities: constraintMissing(resolvedConstraint).map((field) => ({
             field,
             reason:
               field === "weekday_occurrence"
@@ -425,7 +604,7 @@ export function resolveCalendarExpression(
           kind: "invalid",
           reason: "unavailable_occurrence",
           occurrenceCount: resolution.occurrenceCount,
-          constraint,
+          constraint: resolvedConstraint,
         };
       date = resolution.date;
     }
@@ -437,14 +616,20 @@ export function resolveCalendarExpression(
   const resolvedDate = date as string;
   const resolvedTime = expression.time.local as string;
   try {
+    const instant = fromLocalInput(
+      `${resolvedDate}T${resolvedTime}`,
+      expression.timeZone,
+    );
+    if (
+      new Date(instant).getTime() <
+      new Date(expression.referenceInstant).getTime()
+    )
+      return { kind: "invalid", reason: "past_date" };
     return {
       kind: "resolved",
       date: resolvedDate,
       time: resolvedTime,
-      instant: fromLocalInput(
-        `${resolvedDate}T${resolvedTime}`,
-        expression.timeZone,
-      ),
+      instant,
     };
   } catch {
     return { kind: "invalid", reason: "invalid_local_time" };
@@ -488,7 +673,9 @@ export function calendarInvalidMessage(resolution: CalendarResolution) {
   if (resolution.reason !== "unavailable_occurrence" || !resolution.constraint)
     return resolution.reason === "constraint_conflict"
       ? "That date doesn't match the date details already provided. What date should I use?"
-      : "That date or time is not valid in your selected time zone. What should I use instead?";
+      : resolution.reason === "past_date"
+        ? "That time has already passed. What future date or time should I use?"
+        : "That date or time is not valid in your selected time zone. What should I use instead?";
   const weekday = new Intl.DateTimeFormat("en-US", {
     weekday: "long",
     timeZone: "UTC",
@@ -532,7 +719,12 @@ export function parseCalendarExpression(value: unknown): CalendarExpression {
   const parsedTime = time as Record<string, unknown>;
   const nullableString = (item: unknown) =>
     item === null || typeof item === "string";
-  if (!nullableString(parsedDate.absolute) || !nullableString(parsedTime.local))
+  if (
+    !nullableString(parsedDate.absolute) ||
+    !nullableString(parsedTime.local) ||
+    (parsedDate.implicitYear !== undefined &&
+      typeof parsedDate.implicitYear !== "boolean")
+  )
     throw new Error("Invalid calendar expression.");
   const constraint = parsedDate.constraint;
   const validConstraint =
@@ -591,7 +783,14 @@ export function parseCalendarExpression(value: unknown): CalendarExpression {
     !Array.isArray(source.correctionTargets)
   )
     throw new Error("Invalid calendar expression.");
-  return value as CalendarExpression;
+  return {
+    ...(value as CalendarExpression),
+    date: {
+      ...(parsedDate as CalendarExpression["date"]),
+      // Context created before this repair has no metadata and remains safe.
+      implicitYear: parsedDate.implicitYear === true,
+    },
+  };
 }
 
 export type { DateConstraint, WeekdayOccurrence };

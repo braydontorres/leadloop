@@ -1112,14 +1112,16 @@ test("one browser session keeps consecutive reminder drafts independent", async 
   });
   const turns = [
     {
-      transcript: "Remind me to order supplies on a Saturday in July 2027.",
+      // No year: this must use the active draft's frozen local reference and
+      // choose the next upcoming June, even after later drafts start.
+      transcript: "Remind me to order supplies on a Saturday in June.",
       intent: {
         kind: "new_task",
         fields: { ...blankFields, title: "order supplies" },
       },
     },
     {
-      transcript: "The fifth Saturday at 5 PM.",
+      transcript: "The second Saturday at 5 PM.",
       intent: { kind: "none", fields: blankFields },
     },
     { transcript: "Yes.", intent: { kind: "confirm", fields: blankFields } },
