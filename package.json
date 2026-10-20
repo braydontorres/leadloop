@@ -12,7 +12,8 @@
     "test:live-ai": "tsx scripts/live-ai-contract.ts",
     "test:e2e": "playwright test",
     "format": "prettier --write app lib tests e2e *.ts *.mjs README.md package.json",
-    "format:check": "prettier --check app lib tests e2e *.ts *.mjs README.md package.json"
+    "format:check": "prettier --check app lib tests e2e *.ts *.mjs README.md package.json",
+    "test:calendar": "tsx --test tests/calendar-reliability-audit.test.ts tests/calendar-api-audit.test.ts tests/calendar-phase-c.test.ts tests/interpret-route.test.ts"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
