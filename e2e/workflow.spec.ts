@@ -1093,3 +1093,126 @@ test("ten consecutive voice turns submit once each without overlapping recording
     page.getByText("Conversation ended — microphone off."),
   ).toHaveCount(0);
 });
+
+test("one browser session keeps consecutive reminder drafts independent", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (
+      window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+    ).__spoken = spoken;
+  });
+  const turns = [
+    {
+      transcript: "Remind me to order supplies on a Saturday in July 2027.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "order supplies" },
+      },
+    },
+    {
+      transcript: "The fifth Saturday at 5 PM.",
+      intent: { kind: "none", fields: blankFields },
+    },
+    { transcript: "Yes.", intent: { kind: "confirm", fields: blankFields } },
+    {
+      transcript: "Remind me to review invoices on a Saturday in August 2027.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "review invoices" },
+      },
+    },
+    {
+      transcript: "The second Saturday at 10 AM.",
+      intent: { kind: "confirm", fields: blankFields },
+    },
+    { transcript: "Yes.", intent: { kind: "confirm", fields: blankFields } },
+    {
+      transcript: "Remind me to call Dana on a Friday in July 2027.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "call Dana" },
+      },
+    },
+    {
+      transcript: "The second Friday at 9 AM.",
+      intent: { kind: "new_task", fields: blankFields },
+    },
+    { transcript: "Yes.", intent: { kind: "confirm", fields: blankFields } },
+    {
+      transcript: "Remind me to draft a proposal.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "draft a proposal" },
+      },
+    },
+    { transcript: "Cancel.", intent: { kind: "cancel", fields: blankFields } },
+    {
+      transcript: "Remind me to renew the license on July 1 2028 at 9 AM.",
+      intent: {
+        kind: "new_task",
+        fields: { ...blankFields, title: "renew the license" },
+      },
+    },
+    { transcript: "Yes.", intent: { kind: "confirm", fields: blankFields } },
+  ];
+  let index = 0;
+  await page.route("**/api/interpret", async (route) => {
+    const turn = turns[index++];
+    await route.fulfill({
+      json: { transcript: turn.transcript, result: { intent: turn.intent } },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => {
+      const spoken = (
+        window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+      ).__spoken;
+      spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent);
+    });
+  for (const [turnIndex, turn] of turns.entries()) {
+    await reply.fill(turn.transcript);
+    await send.click();
+    await page.waitForFunction(
+      (count) =>
+        (
+          window as unknown as Window & {
+            __spoken: SpeechSynthesisUtterance[];
+          }
+        ).__spoken.length >= count,
+      turnIndex + 1,
+    );
+    await finishSpeech();
+  }
+  const saved = await page.evaluate(() => {
+    const raw = localStorage.getItem("leadloop.phase1.v1");
+    return raw
+      ? (JSON.parse(raw).tasks as Array<{ title: string; due: string }>)
+      : [];
+  });
+  for (const title of [
+    "order supplies",
+    "review invoices",
+    "call Dana",
+    "renew the license",
+  ])
+    expect(saved.filter((task) => task.title === title)).toHaveLength(1);
+  expect(saved.some((task) => task.title === "draft a proposal")).toBeFalsy();
+  expect(saved).toHaveLength(9); // five samples plus four confirmed reminders
+});

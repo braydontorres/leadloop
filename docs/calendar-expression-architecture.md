@@ -47,6 +47,35 @@ merge an ordinal weekday and a time. A resolved ordinal remains as context for
 corrections while its exact date is presented to the existing UI, preventing a
 repeated clarification.
 
+## Reliability repair: relative corrections and state synchronization
+
+The Phase B follow-up repair supports a deliberately small, deterministic
+relative-date subset: `tomorrow`, `the day after tomorrow`, `in five days`,
+`three days from now`, `two weeks from today`, `one week later`, and `two months
+from now`. These expressions are represented in `CalendarExpression`, not in a
+separate UI parser. `from today` and `from now` use the draft's captured
+reference instant in the configured IANA time zone, so a conversation does not
+drift across processing delays. `later` uses the existing reminder's local date.
+Date-only changes keep the existing local clock time. Month arithmetic clamps to
+the final day of the target month (for example, January 31 plus one month is
+February 28 or 29).
+
+An explicit deterministic schedule change now takes priority over an AI
+`confirm` or `none` label during read-back. The conversation returns to
+read-back with the recalculated schedule and requires a fresh confirmation. An
+unrecognized correction enters clarification instead, so `Yes` cannot silently
+save the stale schedule.
+
+The browser logs anonymous session/turn IDs, stage transitions, and resolver
+outcomes for accepted or discarded turns. It does not log transcripts, audio,
+API keys, titles, contacts, or calendar values.
+
+The initial time zone comes from the browser for a new local store and is saved
+with that store. Settings exposes the selected IANA zone, including
+`America/Chicago` for Midland, Texas. That same selected zone controls parsing,
+read-back, display, and conversion to the stored UTC instant. Changing the
+setting does not rewrite existing saved instants.
+
 ## Intentional Phase B boundaries
 
 The model also reserves typed fields for relative offsets, date ranges,

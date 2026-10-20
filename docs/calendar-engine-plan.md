@@ -17,6 +17,11 @@ Phase B adds the model and deterministic resolver for the existing one-time
 calendar flow; it deliberately leaves the Phase C and D language/features below
 unsupported rather than guessing.
 
+The Phase B reliability repair also implements the narrow relative-date subset
+needed for safe corrections: tomorrow, day-after-tomorrow, day/week/month
+offsets from the draft reference day, and `later` from an existing reminder
+date. The broader relative-language work remains Phase C.
+
 Create a `CalendarExpression` model separate from reminder UI state. It should carry
 the user-supplied constraints and their certainty rather than a prematurely chosen
 timestamp:

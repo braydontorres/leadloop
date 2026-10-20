@@ -6,6 +6,7 @@ import {
   createCalendarExpression,
   mergeCalendarExpression,
   resolveCalendarExpression,
+  relativeDateExpressionFromText,
 } from "../lib/calendar-expression";
 import {
   advanceConversation,
@@ -221,4 +222,107 @@ test("a calendar correction replaces the ordinal in the same active expression",
     4,
   );
   assert.match(corrected.reply, /July 24.*5:00 PM/);
+});
+
+test("central relative-date parser resolves supported phrases from the frozen local reference day", () => {
+  const cases: Array<[string, string]> = [
+    ["Two weeks from today", "2026-11-02"],
+    ["Three days from now", "2026-10-22"],
+    ["Tomorrow", "2026-10-20"],
+    ["The day after tomorrow", "2026-10-21"],
+    ["In five days", "2026-10-24"],
+    ["Two months from now", "2026-12-19"],
+  ];
+  for (const [phrase, expectedDate] of cases) {
+    const relative = relativeDateExpressionFromText(phrase);
+    assert.ok(relative, phrase);
+    const resolved = resolveCalendarExpression(
+      mergeCalendarExpression(createCalendarExpression(zone, reference), {
+        relative,
+        time: "17:00",
+      }),
+    );
+    assert.equal(resolved.kind, "resolved", phrase);
+    if (resolved.kind === "resolved") assert.equal(resolved.date, expectedDate);
+  }
+
+  const monthEnd = createCalendarExpression(
+    zone,
+    new Date("2027-01-31T18:00:00Z"),
+  );
+  const resolved = resolveCalendarExpression(
+    mergeCalendarExpression(monthEnd, {
+      relative: relativeDateExpressionFromText("one month from now"),
+      time: "09:00",
+    }),
+  );
+  assert.equal(resolved.kind, "resolved");
+  if (resolved.kind === "resolved") assert.equal(resolved.date, "2027-02-28");
+});
+
+test("later is anchored to the existing reminder date while from today uses the draft reference", () => {
+  const base = mergeCalendarExpression(
+    createCalendarExpression(zone, reference),
+    {
+      date: "2026-10-19",
+      time: "17:00",
+    },
+  );
+  const later = resolveCalendarExpression(
+    mergeCalendarExpression(base, {
+      relative: relativeDateExpressionFromText("one week later"),
+    }),
+  );
+  assert.equal(later.kind, "resolved");
+  if (later.kind === "resolved") assert.equal(later.date, "2026-10-26");
+});
+
+test("a relative correction invalidates read-back and preserves the draft time and ID", () => {
+  const initial = advanceConversation({
+    state: emptyConversationState(),
+    result: {
+      intent: {
+        kind: "new_task",
+        fields: { ...emptyFields, title: "talk to Steven", person: "Steven" },
+      },
+    },
+    text: "Remind me to talk to Steven today at 5 PM.",
+    timeZone: zone,
+    createId: () => "steven-draft",
+    now: reference,
+  });
+  assert.equal(initial.state.stage, "reading_back");
+  const correction = advanceConversation({
+    state: { ...initial.state, stage: "awaiting_confirmation" },
+    // Simulate the observed incorrect provider classification. The deterministic
+    // correction must still win and prevent a stale confirmation save.
+    result: { intent: { kind: "confirm", fields: emptyFields } },
+    text: "Actually, two weeks from today.",
+    timeZone: zone,
+    createId: () => "unexpected-id",
+    now: reference,
+  });
+  assert.equal(correction.state.stage, "reading_back");
+  assert.equal(correction.state.activeReminder?.id, "steven-draft");
+  assert.match(correction.reply, /Monday, November 2.*5:00 PM/);
+
+  const unsupported = advanceConversation({
+    state: { ...correction.state, stage: "awaiting_confirmation" },
+    result: { intent: { kind: "confirm", fields: emptyFields } },
+    text: "Actually, sometime soon.",
+    timeZone: zone,
+    createId: () => "unexpected-id",
+    now: reference,
+  });
+  assert.equal(unsupported.state.stage, "awaiting_details");
+  assert.match(unsupported.reply, /couldn't reliably understand/i);
+  const prematureYes = advanceConversation({
+    state: unsupported.state,
+    result: { intent: { kind: "confirm", fields: emptyFields } },
+    text: "Yes.",
+    timeZone: zone,
+    createId: () => "unexpected-id",
+    now: reference,
+  });
+  assert.equal(prematureYes.savedTask, undefined);
 });

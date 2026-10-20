@@ -67,7 +67,10 @@ import {
   type VoiceActivityConfig,
   type VoiceActivityState,
 } from "../lib/voice-activity";
-import { calendarFromLegacy } from "../lib/calendar-expression";
+import {
+  calendarFromLegacy,
+  resolveCalendarExpression,
+} from "../lib/calendar-expression";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -385,7 +388,12 @@ export default function Page() {
   ) => {
     console.info(
       "[LeadLoop voice turn]",
-      JSON.stringify({ turnId: turnId ?? "text", stage, ...values }),
+      JSON.stringify({
+        sessionId: activeSessionIdRef.current,
+        turnId: turnId ?? "text",
+        stage,
+        ...values,
+      }),
     );
   };
   const cancelSpeechPlayback = () => {
@@ -473,8 +481,9 @@ export default function Page() {
     turnId: number | null = null,
   ) => {
     try {
+      const previous = conversationRef.current;
       const transition = advanceConversation({
-        state: conversationRef.current,
+        state: previous,
         result,
         text: transcript,
         timeZone: timezone,
@@ -487,8 +496,16 @@ export default function Page() {
         });
       conversationRef.current = transition.state;
       setConversation(transition.state);
+      const resolution = transition.state.activeReminder
+        ? resolveCalendarExpression(transition.state.activeReminder.calendar)
+        : null;
+      logVoiceTurn(turnId, "conversation_accepted", {
+        fromStage: previous.stage,
+        toStage: transition.state.stage,
+        activeDraft: transition.state.activeReminder ? "present" : "none",
+        resolution: resolution?.kind ?? "saved_or_ended",
+      });
       setAssistantMessage(transition.reply);
-      logVoiceTurn(turnId, "conversation_updated");
       if (transition.state.stage === "ended") {
         stopConversationSession();
         speakReply(transition.reply, false, false, turnId);
@@ -856,6 +873,9 @@ export default function Page() {
     inactivityRef.current = null;
   };
   const stopConversationSession = () => {
+    logVoiceTurn(activeTurnIdRef.current, "session_stopping", {
+      fromStage: conversationRef.current.stage,
+    });
     clearSessionTimers();
     sessionActiveRef.current = false;
     activeSessionIdRef.current = ++nextSessionIdRef.current;
@@ -882,6 +902,9 @@ export default function Page() {
       recorderRef.current = null;
       setIsRecording(false);
     }
+    logVoiceTurn(null, "session_stopped", {
+      stage: conversationRef.current.stage,
+    });
   };
   const resetInactivityTimer = () => {
     if (inactivityRef.current) clearTimeout(inactivityRef.current);
@@ -939,6 +962,9 @@ export default function Page() {
     sessionActiveRef.current = true;
     activeSessionIdRef.current = ++nextSessionIdRef.current;
     setSessionActive(true);
+    logVoiceTurn(null, "session_started", {
+      stage: next.stage,
+    });
     resetInactivityTimer();
     void startRecording(activeSessionIdRef.current);
   };
@@ -2148,6 +2174,10 @@ export default function Page() {
                         <option key={z}>{z}</option>
                       ))}
                     </select>
+                    <small>
+                      Midland, Texas uses America/Chicago. Changing this does
+                      not shift reminders already saved on this device.
+                    </small>
                   </label>
                 </section>
                 <div>

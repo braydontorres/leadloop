@@ -193,3 +193,62 @@ test("the real interpretation route preserves a combined ordinal date and determ
   assert.equal(value.state.activeReminder?.pendingTime, null);
   assert.match(value.reply, /Saturday, July 31, 2027.*5:00 PM/);
 });
+
+test("the interpretation route plus conversation state applies a relative correction despite a confirm label", async () => {
+  resetRateLimitsForTest();
+  const now = new Date("2026-10-19T12:00:00Z");
+  const { value, requests } = await withMockedInterpretations(
+    [
+      {
+        intent: {
+          kind: "new_task",
+          fields: { ...blankFields, title: "talk to Steven", person: "Steven" },
+        },
+      },
+      // This is the unsafe classification reported in production. Application
+      // logic must still apply the explicit relative-date correction.
+      { intent: { kind: "confirm", fields: blankFields } },
+    ],
+    async () => {
+      const firstPayload = (await (
+        await interpretPost(
+          request(
+            "Remind me to talk to Steven today at 5 PM.",
+            conversationContext(emptyConversationState()),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      const first = advanceConversation({
+        state: emptyConversationState(),
+        result: firstPayload.result,
+        text: firstPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "steven-route-draft",
+        now,
+      });
+      const correctionPayload = (await (
+        await interpretPost(
+          request(
+            "Actually, two weeks from today.",
+            conversationContext({
+              ...first.state,
+              stage: "awaiting_confirmation",
+            }),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      return advanceConversation({
+        state: { ...first.state, stage: "awaiting_confirmation" },
+        result: correctionPayload.result,
+        text: correctionPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "unexpected-new-draft",
+        now,
+      });
+    },
+  );
+  assert.equal(value.state.activeReminder?.id, "steven-route-draft");
+  assert.equal(value.state.stage, "reading_back");
+  assert.match(value.reply, /Monday, November 2, 2026.*5:00 PM/);
+  assert.equal(requests.length, 2);
+});

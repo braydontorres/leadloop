@@ -6,7 +6,9 @@ import {
   createCalendarExpression,
   mergeCalendarExpression,
   parseCalendarExpression,
+  relativeDateExpressionFromText,
   resolveCalendarExpression,
+  hasSchedulingCorrectionLanguage,
   type CalendarExpression,
 } from "./calendar-expression";
 import {
@@ -295,6 +297,7 @@ function applyFields(
   fields: IntentFields,
   timeZone: string,
   dateConstraint: DateConstraint | null,
+  relativeDate: ReturnType<typeof relativeDateExpressionFromText>,
 ) {
   let calendar = current.calendar;
   let dateConstraintError: string | null = null;
@@ -305,6 +308,8 @@ function applyFields(
   }
   if (fields.clearDue)
     calendar = mergeCalendarExpression(calendar, { clear: true });
+  if (relativeDate)
+    calendar = mergeCalendarExpression(calendar, { relative: relativeDate });
   if (fields.date !== null || fields.time !== null) {
     if (
       fields.date !== null &&
@@ -371,6 +376,15 @@ function nextReply(
         : `${dateQuestion}${needsTime ? ", and what time?" : "?"}`,
     };
   }
+  if (calendar.kind === "ambiguous")
+    return {
+      stage: "awaiting_details" as const,
+      reply:
+        calendar.ambiguities[0]?.reason ===
+        "a reminder date is needed before using later"
+          ? "What date should I count from before moving it later?"
+          : "Which date should I use?",
+    };
   if (
     calendar.kind === "incomplete" &&
     calendar.missing.includes("time") &&
@@ -415,8 +429,23 @@ export function advanceConversation(args: {
   const { state, result, text: user, timeZone, createId, now } = args;
   let intent = result.intent;
   const derivedConstraint = deriveDateConstraint(user, timeZone, now);
+  const relativeDate = relativeDateExpressionFromText(user);
   const activeCalendarClarification =
     state.activeReminder?.calendar.date.constraint ?? null;
+  const activeConstraint =
+    state.activeReminder?.calendar.date.constraint ?? null;
+  const deterministicDate = relativeDate
+    ? null
+    : deterministicDateFromText(
+        user,
+        timeZone,
+        activeConstraint ?? derivedConstraint,
+        now,
+      );
+  const deterministicTime = deterministicTimeFromText(user);
+  const hasDeterministicScheduleChange = Boolean(
+    derivedConstraint || relativeDate || deterministicDate || deterministicTime,
+  );
 
   // An ordinal reply answers the application's outstanding calendar question.
   // Treat it as a follow-up before consulting the model's intent label: models
@@ -429,6 +458,29 @@ export function advanceConversation(args: {
   ) {
     intent = {
       kind: "follow_up",
+      fields: {
+        title: null,
+        person: null,
+        date: null,
+        time: null,
+        notes: null,
+        clearDue: false,
+      },
+    };
+  }
+  // A clear scheduling correction must win over a model label such as confirm
+  // or none. Otherwise an old read-back could be saved after the user asked to
+  // change its date or time.
+  if (
+    state.activeReminder &&
+    hasDeterministicScheduleChange &&
+    (state.stage === "reading_back" ||
+      state.stage === "awaiting_confirmation" ||
+      intent.kind === "update" ||
+      intent.kind === "none")
+  ) {
+    intent = {
+      kind: "update",
       fields: {
         title: null,
         person: null,
@@ -465,6 +517,19 @@ export function advanceConversation(args: {
       user,
       "Okay, I canceled that unfinished reminder. Anything else?",
       { stage: "canceled", activeReminder: null },
+    );
+  if (
+    state.activeReminder &&
+    (state.stage === "reading_back" ||
+      state.stage === "awaiting_confirmation") &&
+    hasSchedulingCorrectionLanguage(user) &&
+    !hasDeterministicScheduleChange
+  )
+    return withReply(
+      state,
+      user,
+      "I couldn't reliably understand that scheduling change. What date or time should I use instead?",
+      { stage: "awaiting_details" },
     );
   if (intent.kind === "confirm") {
     if (state.stage === "awaiting_confirmation" && state.activeReminder) {
@@ -537,22 +602,14 @@ export function advanceConversation(args: {
       { stage: state.activeReminder ? "awaiting_details" : "idle" },
     );
 
-  const activeConstraint =
-    state.activeReminder?.calendar.date.constraint ?? null;
-  const deterministicDate = deterministicDateFromText(
-    user,
-    timeZone,
-    activeConstraint ?? derivedConstraint,
-    now,
-  );
-  const deterministicTime = deterministicTimeFromText(user);
   const fields: IntentFields = {
     ...intent.fields,
     title: cleanReminderTitle(intent.fields.title),
-    date: derivedConstraint
-      ? null
-      : (deterministicDate ??
-        (mentionsUnambiguousDate(user) ? intent.fields.date : null)),
+    date:
+      derivedConstraint || relativeDate
+        ? null
+        : (deterministicDate ??
+          (mentionsUnambiguousDate(user) ? intent.fields.date : null)),
     time: deterministicTime,
   };
   const applied = applyFields(
@@ -567,6 +624,7 @@ export function advanceConversation(args: {
     fields,
     timeZone,
     derivedConstraint,
+    relativeDate,
   );
   const next = nextReply(
     applied.reminder,

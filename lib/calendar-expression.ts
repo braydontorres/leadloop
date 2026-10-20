@@ -22,7 +22,7 @@ export type CalendarExpression = {
     absolute: string | null;
     /** A partially specified or ordinal weekday date. */
     constraint: DateConstraint | null;
-    /** Reserved representation for Phase C relative language. */
+    /** The limited, deterministic relative-date subset supported by this repair. */
     relative: RelativeDateExpression | null;
     /** Reserved representation for Phase C ranges. */
     range: DateRangeExpression | null;
@@ -44,8 +44,11 @@ export type CalendarAmbiguity = {
   reason: string;
 };
 export type RelativeDateExpression = {
-  kind: "keyword" | "offset";
-  value: string;
+  kind: "calendar_offset";
+  amount: number;
+  unit: "days" | "weeks" | "months";
+  /** `later` is anchored to the existing reminder date; the other forms use the draft reference day. */
+  anchor: "reference_day" | "existing_reminder_date";
 };
 export type RelativeOffset = {
   amount: number;
@@ -78,6 +81,7 @@ export type CalendarExpressionUpdate = {
   date?: string | null;
   time?: string | null;
   constraint?: DateConstraint | null;
+  relative?: RelativeDateExpression | null;
   clear?: boolean;
   correctionTargets?: CalendarField[];
 };
@@ -103,6 +107,128 @@ function dateIsValid(value: string) {
 
 function timeIsValid(value: string) {
   return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
+}
+
+function localDateParts(instant: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    Number(parts.find((entry) => entry.type === type)?.value ?? 0);
+  return { year: part("year"), month: part("month"), day: part("day") };
+}
+
+function isoDate({
+  year,
+  month,
+  day,
+}: {
+  year: number;
+  month: number;
+  day: number;
+}) {
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function parseIsoDate(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match || !dateIsValid(value)) return null;
+  return {
+    year: Number(match[1]),
+    month: Number(match[2]),
+    day: Number(match[3]),
+  };
+}
+
+/**
+ * Adds calendar days, weeks, or months in local-date space. Month arithmetic
+ * clamps an overflowing day to the final day of the target month (Jan 31 + one
+ * month becomes Feb 28/29), avoiding JavaScript's accidental March rollover.
+ */
+function addRelativeDate(
+  base: { year: number; month: number; day: number },
+  relative: RelativeDateExpression,
+) {
+  if (relative.unit === "months") {
+    const monthIndex = base.month - 1 + relative.amount;
+    const year = base.year + Math.floor(monthIndex / 12);
+    const month = (((monthIndex % 12) + 12) % 12) + 1;
+    const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    return isoDate({ year, month, day: Math.min(base.day, lastDay) });
+  }
+  const offset = relative.amount * (relative.unit === "weeks" ? 7 : 1);
+  const date = new Date(Date.UTC(base.year, base.month - 1, base.day + offset));
+  return isoDate({
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate(),
+  });
+}
+
+const numberWords: Record<string, number> = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+};
+
+/**
+ * Parses only the explicitly supported relative-date phrases. It is central so
+ * typed and voice turns cannot diverge. `null` means this phrase is not part of
+ * the supported subset and must be clarified instead of guessed.
+ */
+export function relativeDateExpressionFromText(
+  text: string,
+): RelativeDateExpression | null {
+  if (/\bday after tomorrow\b/i.test(text))
+    return {
+      kind: "calendar_offset",
+      amount: 2,
+      unit: "days",
+      anchor: "reference_day",
+    };
+  if (/\btomorrow\b/i.test(text))
+    return {
+      kind: "calendar_offset",
+      amount: 1,
+      unit: "days",
+      anchor: "reference_day",
+    };
+  const match = text.match(
+    /\b(?:(one|two|three|four|five)|(\d+))\s+(day|days|week|weeks|month|months)\s+(?:from\s+(?:today|now)|later)\b|\bin\s+(?:(one|two|three|four|five)|(\d+))\s+(day|days|week|weeks|month|months)\b/i,
+  );
+  if (!match) return null;
+  const amount =
+    Number(match[1] ?? match[2] ?? match[4] ?? match[5]) ||
+    numberWords[(match[1] ?? match[4] ?? "").toLowerCase()] ||
+    0;
+  const unitText = (match[3] ?? match[6] ?? "").toLowerCase();
+  if (!amount || amount > 99) return null;
+  const unit = unitText.startsWith("day")
+    ? "days"
+    : unitText.startsWith("week")
+      ? "weeks"
+      : unitText.startsWith("month")
+        ? "months"
+        : null;
+  if (!unit) return null;
+  return {
+    kind: "calendar_offset",
+    amount,
+    unit,
+    anchor: /\blater\b/i.test(match[0])
+      ? "existing_reminder_date"
+      : "reference_day",
+  };
+}
+
+/** A scheduling correction must never be acknowledged if no deterministic field was understood. */
+export function hasSchedulingCorrectionLanguage(text: string) {
+  return /\b(?:actually|change|move|make|reschedule)\b/i.test(text);
 }
 
 export function createCalendarExpression(
@@ -170,24 +296,39 @@ export function mergeCalendarExpression(
       )
     : current;
   const constraint =
-    update.constraint === undefined
-      ? base.date.constraint
-      : update.constraint === null
-        ? null
-        : mergeConstraints(base.date.constraint, update.constraint);
+    update.relative !== undefined && update.relative !== null
+      ? null
+      : update.constraint === undefined
+        ? base.date.constraint
+        : update.constraint === null
+          ? null
+          : mergeConstraints(base.date.constraint, update.constraint);
   const replacesDateThroughConstraint =
     update.constraint !== undefined && update.constraint !== null;
+  const replacesDateThroughRelative =
+    update.relative !== undefined && update.relative !== null;
   return {
     ...base,
     date: {
       ...base.date,
       // A new ordinal/weekday constraint is a correction to the prior exact date.
+      // A relative correction keeps an existing absolute date only when its
+      // language says "later", which is explicitly anchored to that reminder.
       absolute: replacesDateThroughConstraint
         ? null
-        : update.date === undefined
-          ? base.date.absolute
-          : update.date,
+        : replacesDateThroughRelative &&
+            update.relative?.anchor !== "existing_reminder_date"
+          ? null
+          : update.date === undefined
+            ? base.date.absolute
+            : update.date,
       constraint,
+      relative:
+        replacesDateThroughConstraint || update.date !== undefined
+          ? null
+          : update.relative === undefined
+            ? base.date.relative
+            : update.relative,
     },
     time: {
       local: update.time === undefined ? base.time.local : update.time,
@@ -210,7 +351,6 @@ export function mergeConstraints(
 
 function unsupportedFeatures(expression: CalendarExpression) {
   const features: string[] = [];
-  if (expression.date.relative) features.push("relative dates");
   if (expression.date.range) features.push("date ranges");
   if (expression.offset) features.push("relative offsets");
   if (expression.recurrence) features.push("recurrence");
@@ -242,6 +382,27 @@ export function resolveCalendarExpression(
     return { kind: "invalid", reason: "invalid_local_time" };
 
   let date = expression.date.absolute;
+  if (expression.date.relative) {
+    const relative = expression.date.relative;
+    const base =
+      relative.anchor === "existing_reminder_date"
+        ? date && parseIsoDate(date)
+        : localDateParts(
+            new Date(expression.referenceInstant),
+            expression.timeZone,
+          );
+    if (!base)
+      return {
+        kind: "ambiguous",
+        ambiguities: [
+          {
+            field: "date",
+            reason: "a reminder date is needed before using later",
+          },
+        ],
+      };
+    date = addRelativeDate(base, relative);
+  }
   const constraint = expression.date.constraint;
   if (constraint) {
     if (date && !matchesDateConstraint(date, constraint))
@@ -400,9 +561,28 @@ export function parseCalendarExpression(value: unknown): CalendarExpression {
         );
       })());
   if (!validConstraint) throw new Error("Invalid calendar expression.");
-  // Phase B only serializes the one-time subset. Reject arbitrary new shapes.
+  const relative = parsedDate.relative;
+  const validRelative =
+    relative === null ||
+    (typeof relative === "object" &&
+      !Array.isArray(relative) &&
+      (() => {
+        const item = relative as Record<string, unknown>;
+        return (
+          item.kind === "calendar_offset" &&
+          Number.isInteger(item.amount) &&
+          (item.amount as number) >= 1 &&
+          (item.amount as number) <= 99 &&
+          (item.unit === "days" ||
+            item.unit === "weeks" ||
+            item.unit === "months") &&
+          (item.anchor === "reference_day" ||
+            item.anchor === "existing_reminder_date")
+        );
+      })());
+  if (!validRelative) throw new Error("Invalid calendar expression.");
+  // Phase B only serializes the supported one-time subset. Reject arbitrary new shapes.
   if (
-    parsedDate.relative !== null ||
     parsedDate.range !== null ||
     source.offset !== null ||
     source.recurrence !== null ||
