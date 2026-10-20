@@ -79,6 +79,34 @@ export function isMeaningfulReminderTitle(value: string | null) {
   );
 }
 
+/** Removes a trailing, clearly scheduling-only phrase from an extracted task title. */
+export function cleanReminderTitle(value: string | null) {
+  if (!value?.trim()) return null;
+  const monthPattern = months.join("|");
+  const weekdayPattern = weekdays.join("|");
+  const ordinalPattern =
+    "(?:first|second|third|fourth|fifth|last|second[- ]to[- ]last|[1-5](?:st|nd|rd|th))";
+  const timePattern =
+    "(?:at\\s+)?(?:1[0-2]|0?[1-9])(?::[0-5]\\d)?\\s*(?:a\\.?m\\.?|p\\.?m\\.?)|(?:noon|midnight)";
+  let cleaned = value.trim();
+  cleaned = cleaned.replace(
+    new RegExp(
+      `\\s+(?:on\\s+)?(?:a\\s+|the\\s+)?(?:${ordinalPattern}\\s+)?(?:next\\s+)?(?:${weekdayPattern})(?:\\s+(?:in\\s+)?(?:next\\s+)?(?:${monthPattern}))?(?:\\s+(?:at\\s+)?${timePattern})?[,.!?]*$`,
+      "i",
+    ),
+    "",
+  );
+  cleaned = cleaned.replace(
+    new RegExp(
+      `\\s+(?:on\\s+)?(?:today|tomorrow|next\\s+(?:week|month|year))(?:\\s+(?:at\\s+)?${timePattern})?[,.!?]*$`,
+      "i",
+    ),
+    "",
+  );
+  cleaned = cleaned.replace(/[,.!?\s]+$/, "").trim();
+  return isMeaningfulReminderTitle(cleaned) ? cleaned : null;
+}
+
 export function weekdayOccurrenceFromText(
   text: string,
 ): WeekdayOccurrence | null {
@@ -95,10 +123,45 @@ export function weekdayOccurrenceFromText(
   return names.find(([expression]) => expression.test(text))?.[1] ?? null;
 }
 
-export function mentionsExplicitTime(text: string) {
-  return /\b(?:at\s*)?(?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*[ap]\.?m\.?\b|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|0?[1-9])(?::[0-5]\d)?\s+(?:in\s+the\s+)?(?:morning|afternoon|evening|night)\b|\b(?:noon|midnight)\b/i.test(
-    text,
+export function deterministicTimeFromText(text: string) {
+  if (/\bnoon\b/i.test(text)) return "12:00";
+  if (/\bmidnight\b/i.test(text)) return "00:00";
+  const clock = text.match(
+    /\b(?:at\s*)?(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i,
   );
+  if (clock) {
+    let hour = Number(clock[1]);
+    if (clock[3].toLowerCase() === "p" && hour !== 12) hour += 12;
+    if (clock[3].toLowerCase() === "a" && hour === 12) hour = 0;
+    return `${String(hour).padStart(2, "0")}:${clock[2] ?? "00"}`;
+  }
+  const wordHours: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+  };
+  const daypart = text.match(
+    /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|1[0-2]|0?[1-9])\s+(?:in\s+the\s+)?(morning|afternoon|evening|night)\b/i,
+  );
+  if (!daypart) return null;
+  let hour = wordHours[daypart[1].toLowerCase()] ?? Number(daypart[1]);
+  const part = daypart[2].toLowerCase();
+  if ((part === "afternoon" || part === "evening") && hour < 12) hour += 12;
+  if (part === "morning" && hour === 12) hour = 0;
+  return `${String(hour).padStart(2, "0")}:00`;
+}
+
+export function mentionsExplicitTime(text: string) {
+  return deterministicTimeFromText(text) !== null;
 }
 
 export function deriveDateConstraint(

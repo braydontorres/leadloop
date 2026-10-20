@@ -1,12 +1,12 @@
 import { fromLocalInput, type Task } from "./tasks";
 import {
+  cleanReminderTitle,
   dateConstraintQuestion,
   deriveDateConstraint,
   deterministicDateFromText,
-  isMeaningfulReminderTitle,
+  deterministicTimeFromText,
   mergeDateConstraints,
   matchesDateConstraint,
-  mentionsExplicitTime,
   mentionsUnambiguousDate,
   resolveDateConstraint,
   type DateConstraint,
@@ -561,16 +561,15 @@ export function advanceConversation(args: {
     activeConstraint ?? derivedConstraint,
     now,
   );
+  const deterministicTime = deterministicTimeFromText(user);
   const fields: IntentFields = {
     ...intent.fields,
-    title: isMeaningfulReminderTitle(intent.fields.title)
-      ? intent.fields.title
-      : null,
+    title: cleanReminderTitle(intent.fields.title),
     date: derivedConstraint
       ? null
       : (deterministicDate ??
         (mentionsUnambiguousDate(user) ? intent.fields.date : null)),
-    time: mentionsExplicitTime(user) ? intent.fields.time : null,
+    time: deterministicTime,
   };
   const applied = applyFields(
     state.activeReminder ?? {

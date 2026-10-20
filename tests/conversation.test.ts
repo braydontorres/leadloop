@@ -238,6 +238,46 @@ test("fifth and last weekday replies resolve the active Saturday constraint inst
   }
 });
 
+test("a combined ordinal date and explicit time goes straight to read-back", () => {
+  const cases = [
+    { text: "The fifth Saturday at 5 PM.", date: "July 31", time: "5:00 PM" },
+    { text: "The fourth Saturday at 5 PM.", date: "July 24", time: "5:00 PM" },
+    { text: "The fifth one at 3 PM.", date: "July 31", time: "3:00 PM" },
+    { text: "The last Saturday at noon.", date: "July 31", time: "12:00 PM" },
+  ];
+  for (const { text, date, time } of cases) {
+    ids = 0;
+    const initial = turn(
+      emptyConversationState(),
+      { kind: "new_task", fields: { ...fields, title: "order supplies" } },
+      "Remind me to order supplies on a Saturday next July.",
+    );
+    const complete = turn(initial.state, { kind: "confirm", fields }, text);
+    assert.equal(complete.state.activeReminder?.id, "draft-1");
+    assert.equal(complete.state.activeReminder?.pendingDate, null);
+    assert.equal(complete.state.activeReminder?.pendingTime, null);
+    assert.equal(complete.state.activeReminder?.pendingDateConstraint, null);
+    assert.equal(complete.state.stage, "reading_back");
+    assert.match(complete.reply, new RegExp(`${date}.*${time}`));
+  }
+});
+
+test("scheduling language is not retained in an extracted task title", () => {
+  ids = 0;
+  const transition = turn(
+    emptyConversationState(),
+    {
+      kind: "new_task",
+      fields: {
+        ...fields,
+        title: "get groceries next Saturday in July",
+      },
+    },
+    "Remind me to get groceries next Saturday in July.",
+  );
+  assert.equal(transition.state.activeReminder?.title, "get groceries");
+});
+
 test("a nonexistent ordinal weekday asks for clarification without substituting a date", () => {
   ids = 0;
   const invalid = turn(

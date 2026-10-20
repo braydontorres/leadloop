@@ -359,6 +359,71 @@ test("typed fifth Saturday resolves the pending July constraint instead of repea
   await expect(page.getByText(/Which Saturday in July/)).not.toBeVisible();
 });
 
+test("typed combined ordinal and time goes directly to reminder read-back", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (
+      window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+    ).__spoken = spoken;
+  });
+  const intents = [
+    {
+      kind: "new_task",
+      fields: { ...blankFields, title: "order supplies", date: "2027-07-01" },
+    },
+    { kind: "confirm", fields: blankFields },
+  ];
+  const transcripts = [
+    "Remind me to order supplies on a Saturday next July.",
+    "The fifth Saturday at 5 PM.",
+  ];
+  let turn = 0;
+  await page.route("**/api/interpret", async (route) => {
+    const intent = intents[turn++];
+    await route.fulfill({
+      json: { transcript: transcripts[turn - 1], result: { intent } },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => {
+      const spoken = (
+        window as unknown as Window & { __spoken: SpeechSynthesisUtterance[] }
+      ).__spoken;
+      spoken.at(-1)?.onend?.({} as SpeechSynthesisEvent);
+    });
+
+  await reply.fill(transcripts[0]);
+  await send.click();
+  await expect(page.getByText(/Which Saturday in July/)).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill(transcripts[1]);
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "Saturday, July 31, 2027 at 5:00 PM",
+  );
+  await expect(
+    page.getByText(/What time should I remind you/),
+  ).not.toBeVisible();
+});
+
 test("a rate-limited follow-up preserves the active reminder and shows retry timing", async ({
   page,
 }) => {

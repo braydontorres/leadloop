@@ -135,3 +135,61 @@ test("the real interpretation route cannot make an ordinal reply repeat an activ
     );
   }
 });
+
+test("the real interpretation route preserves a combined ordinal date and deterministic time", async () => {
+  resetRateLimitsForTest();
+  const { value } = await withMockedInterpretations(
+    [
+      {
+        intent: {
+          kind: "new_task",
+          fields: {
+            ...blankFields,
+            title: "order supplies",
+            date: "2027-07-01",
+          },
+        },
+      },
+      { intent: { kind: "confirm", fields: blankFields } },
+    ],
+    async () => {
+      const firstPayload = (await (
+        await interpretPost(
+          request(
+            "Remind me to order supplies on a Saturday next July.",
+            conversationContext(emptyConversationState()),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      const first = advanceConversation({
+        state: emptyConversationState(),
+        result: firstPayload.result,
+        text: firstPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "draft-order-supplies",
+        now: new Date("2026-10-19T12:00:00Z"),
+      });
+      const secondPayload = (await (
+        await interpretPost(
+          request(
+            "The fifth Saturday at 5 PM.",
+            conversationContext(first.state),
+          ),
+        )
+      ).json()) as { transcript: string; result: IntentResult };
+      return advanceConversation({
+        state: first.state,
+        result: secondPayload.result,
+        text: secondPayload.transcript,
+        timeZone: "America/Chicago",
+        createId: () => "unexpected-new-draft",
+        now: new Date("2026-10-19T12:00:00Z"),
+      });
+    },
+  );
+  assert.equal(value.state.activeReminder?.id, "draft-order-supplies");
+  assert.equal(value.state.stage, "reading_back");
+  assert.equal(value.state.activeReminder?.pendingDate, null);
+  assert.equal(value.state.activeReminder?.pendingTime, null);
+  assert.match(value.reply, /Saturday, July 31, 2027.*5:00 PM/);
+});

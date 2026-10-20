@@ -2,11 +2,34 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   calendarDateForWeekdayOccurrence,
+  cleanReminderTitle,
+  deterministicTimeFromText,
   deriveDateConstraint,
   resolveDateConstraint,
   weekdayOccurrenceCount,
   weekdayOccurrenceFromText,
 } from "../lib/reminder-details";
+
+test("extracts explicit times without confusing an ordinal word for a clock", () => {
+  assert.equal(
+    deterministicTimeFromText("the fifth Saturday at 5 PM"),
+    "17:00",
+  );
+  assert.equal(deterministicTimeFromText("the last Saturday at noon"), "12:00");
+  assert.equal(deterministicTimeFromText("the fifth Saturday"), null);
+  assert.equal(deterministicTimeFromText("five in the morning"), "05:00");
+});
+
+test("removes trailing scheduling language from AI-extracted titles", () => {
+  assert.equal(
+    cleanReminderTitle("get groceries next Saturday in July"),
+    "get groceries",
+  );
+  assert.equal(
+    cleanReminderTitle("Order supplies on a Saturday next July"),
+    "Order supplies",
+  );
+});
 
 test("calculates every ordinal weekday in July 2027", () => {
   const saturday = 6;

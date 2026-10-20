@@ -1,5 +1,5 @@
 import type { AssistantIntent, IntentFields } from "./conversation-machine";
-import { isMeaningfulReminderTitle } from "./reminder-details";
+import { cleanReminderTitle } from "./reminder-details";
 
 function localDate(timeZone: string, now: Date, offsetDays: number) {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -65,8 +65,16 @@ export function inferClearReminderRequest(
     )
     .replace(/[,.\s]+$/, "")
     .trim();
-  if (!isMeaningfulReminderTitle(title)) return null;
-  return { title, person: null, date, time, notes: null, clearDue: false };
+  const cleanedTitle = cleanReminderTitle(title);
+  if (!cleanedTitle) return null;
+  return {
+    title: cleanedTitle,
+    person: null,
+    date,
+    time,
+    notes: null,
+    clearDue: false,
+  };
 }
 
 export function recoverInitialReminderIntent(args: {
