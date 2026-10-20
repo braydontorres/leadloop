@@ -1305,3 +1305,228 @@ test("working-day preferences default to Monday through Friday and persist", asy
   });
   expect(workingDays).not.toContain(1);
 });
+
+test("typed customer memory confirms before writing, recalls facts, and preserves People storage", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (window as unknown as { __spoken: SpeechSynthesisUtterance[] }).__spoken =
+      spoken;
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => (window as any).__spoken.at(-1)?.onend?.({}));
+
+  await reply.fill(
+    "Remember that Mike wants his driveway cleaned for $250. His phone number is 555-010-1234.",
+  );
+  await send.click();
+  await expect(page.getByText(/I’ll add Mike as a customer/)).toBeVisible();
+  await expect(page.getByText("Customer memory to confirm")).toBeVisible();
+  await finishSpeech();
+  await reply.fill("Yes");
+  await send.click();
+  await expect(
+    page.getByText("Mike's information is saved on this device."),
+  ).toBeVisible();
+  await finishSpeech();
+
+  await reply.fill("What do I know about Mike?");
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "555-010-1234",
+  );
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^People/ })
+    .click();
+  await expect(page.getByRole("heading", { name: "Mike" })).toBeVisible();
+});
+
+test("mocked voice customer memory uses the same confirmation flow", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    const recorders: any[] = [];
+    class TestRecorder {
+      static isTypeSupported() {
+        return true;
+      }
+      state = "inactive";
+      mimeType = "audio/webm;codecs=opus";
+      ondataavailable?: (event: { data: Blob }) => void;
+      onstop?: () => void;
+      constructor(public stream: MediaStream) {
+        recorders.push(this);
+      }
+      start() {
+        this.state = "recording";
+      }
+      stop() {
+        if (this.state !== "recording") return;
+        this.state = "inactive";
+        this.ondataavailable?.({
+          data: new Blob(["voice"], { type: this.mimeType }),
+        });
+        this.onstop?.();
+      }
+    }
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    Object.defineProperty(navigator, "mediaDevices", {
+      configurable: true,
+      value: {
+        getUserMedia: async () => ({ getTracks: () => [{ stop: () => {} }] }),
+      },
+    });
+    Object.defineProperty(window, "MediaRecorder", {
+      configurable: true,
+      value: TestRecorder,
+    });
+    Object.defineProperty(window, "AudioContext", {
+      configurable: true,
+      value: undefined,
+    });
+    Object.assign(window, { __spoken: spoken, __recorders: recorders });
+  });
+  let turn = 0;
+  await page.route("**/api/voice", async (route) => {
+    const transcript =
+      turn++ === 0 ? "Remember that Mike wants a driveway estimate." : "Yes";
+    await route.fulfill({
+      json: {
+        transcript,
+        result: { intent: { kind: "none", fields: blankFields } },
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(1);
+  await page.evaluate(() => (window as any).__recorders[0].stop());
+  await expect(page.getByText(/I’ll add Mike as a customer/)).toBeVisible();
+  await page.evaluate(() => (window as any).__spoken.at(-1)?.onend?.({}));
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__recorders.length))
+    .toBe(2);
+  await page.evaluate(() => (window as any).__recorders[1].stop());
+  await expect(
+    page.getByText("Mike's information is saved on this device."),
+  ).toBeVisible();
+});
+
+test("a confirmed reminder links to a unique existing customer without changing calendar flow", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (window as any).__spoken = spoken;
+    localStorage.setItem(
+      "leadloop.phase1.v1",
+      JSON.stringify({
+        name: "Owner",
+        business: "Demo",
+        timezone: "America/Chicago",
+        workingDays: [1, 2, 3, 4, 5],
+        tasks: [],
+        people: [
+          {
+            id: "mike-1",
+            name: "Mike",
+            business: "",
+            email: "",
+            phone: "",
+            address: "",
+            notes: "Driveway estimate",
+            interactions: [],
+            createdAt: "2026-10-20T12:00:00.000Z",
+            updatedAt: "2026-10-20T12:00:00.000Z",
+          },
+        ],
+      }),
+    );
+  });
+  let turn = 0;
+  await page.route("**/api/interpret", async (route) => {
+    const intent =
+      turn++ === 0
+        ? {
+            kind: "new_task",
+            fields: {
+              ...blankFields,
+              title: "call Mike about his driveway estimate",
+              person: "Mike",
+              date: "2026-10-23",
+              time: "15:00",
+            },
+          }
+        : { kind: "confirm", fields: blankFields };
+    await route.fulfill({
+      json: {
+        transcript:
+          turn === 1
+            ? "Remind me to call Mike next Friday at 3 PM about his driveway estimate."
+            : "Yes",
+        result: { intent },
+      },
+    });
+  });
+  await page.goto("/");
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^Capture/ })
+    .click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  await reply.fill(
+    "Remind me to call Mike next Friday at 3 PM about his driveway estimate.",
+  );
+  await send.click();
+  await expect(page.locator(".assistant-message strong")).toContainText(
+    "Is that correct",
+  );
+  await page.evaluate(() => (window as any).__spoken.at(-1)?.onend?.({}));
+  await reply.fill("Yes");
+  await send.click();
+  await expect(page.getByText("Reminder saved on this device.")).toBeVisible();
+  await page
+    .getByRole("navigation", { name: /navigation/ })
+    .getByRole("button", { name: /^People/ })
+    .click();
+  await expect(page.getByText("1 open tasks")).toBeVisible();
+});

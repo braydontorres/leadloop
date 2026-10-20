@@ -1934,6 +1934,31 @@ h1 > span {
 .continue-speaking:disabled {
   opacity: 0.45;
 }
+.customer-memory-review {
+  margin-top: 14px;
+}
+.customer-history {
+  border-top: 1px solid #e7ece1;
+  margin-top: 18px;
+  padding-top: 14px;
+}
+.customer-history h3 {
+  color: #57734e;
+  font-size: 12px;
+  margin: 0 0 8px;
+}
+.customer-history p {
+  color: #61725d;
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 7px 0;
+}
+.customer-history small {
+  color: #8a9785;
+  display: block;
+  font-size: 10px;
+  margin-top: 2px;
+}
 @keyframes recording-pulse {
   50% {
     box-shadow: 0 0 0 5px #cfa8a480;

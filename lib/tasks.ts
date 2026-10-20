@@ -2,16 +2,30 @@ export type Task = {
   id: string;
   title: string;
   person: string;
+  /** Optional stable link to a local customer record. Legacy person text stays supported. */
+  personId?: string;
   due: string;
   completed: boolean;
   notes: string;
 };
+
+export type CustomerInteraction = {
+  id: string;
+  note: string;
+  createdAt: string;
+};
+
 export type Person = {
   id: string;
   name: string;
   business: string;
   email: string;
+  phone: string;
+  address: string;
   notes: string;
+  interactions: CustomerInteraction[];
+  createdAt: string;
+  updatedAt: string;
 };
 export type Store = {
   tasks: Task[];
@@ -25,6 +39,15 @@ export type Store = {
 export const STORAGE_KEY = "leadloop.phase1.v1";
 export const DEFAULT_WORKING_DAYS = [1, 2, 3, 4, 5] as const;
 
+export function persistStore(storage: Pick<Storage, "setItem">, store: Store) {
+  try {
+    storage.setItem(STORAGE_KEY, JSON.stringify(store));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function normalizeWorkingDays(value: unknown): number[] {
   if (!Array.isArray(value)) return [...DEFAULT_WORKING_DAYS];
   const days = [
@@ -33,6 +56,87 @@ export function normalizeWorkingDays(value: unknown): number[] {
     ),
   ].sort((left, right) => left - right);
   return days.length ? days : [...DEFAULT_WORKING_DAYS];
+}
+
+function stringValue(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
+function validDate(value: unknown, fallback: string) {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value))
+    ? value
+    : fallback;
+}
+
+/** Adds Phase 1 customer fields without changing old IDs, reminders, or timezone data. */
+export function migrateStore(
+  value: unknown,
+  now = new Date().toISOString(),
+): Store {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Invalid saved workspace.");
+  const saved = value as Record<string, unknown>;
+  if (
+    !Array.isArray(saved.tasks) ||
+    !Array.isArray(saved.people) ||
+    typeof saved.timezone !== "string"
+  )
+    throw new Error("Invalid saved workspace.");
+  return {
+    tasks: saved.tasks.map((task) => {
+      const record = task as Record<string, unknown>;
+      return {
+        id: stringValue(record.id),
+        title: stringValue(record.title),
+        person: stringValue(record.person),
+        ...(typeof record.personId === "string" && record.personId
+          ? { personId: record.personId }
+          : {}),
+        due: stringValue(record.due),
+        completed: Boolean(record.completed),
+        notes: stringValue(record.notes),
+      };
+    }),
+    people: saved.people.map((person) => {
+      const record = person as Record<string, unknown>;
+      const createdAt = validDate(record.createdAt, now);
+      return {
+        id: stringValue(record.id),
+        name: stringValue(record.name),
+        business: stringValue(record.business),
+        email: stringValue(record.email),
+        phone: stringValue(record.phone),
+        address: stringValue(record.address),
+        notes: stringValue(record.notes),
+        interactions: Array.isArray(record.interactions)
+          ? record.interactions
+              .filter(
+                (entry) =>
+                  entry &&
+                  typeof entry === "object" &&
+                  typeof (entry as Record<string, unknown>).note === "string",
+              )
+              .map((entry, index) => {
+                const note = entry as Record<string, unknown>;
+                return {
+                  id:
+                    typeof note.id === "string" && note.id
+                      ? note.id
+                      : `${record.id || "legacy-person"}-interaction-${index}`,
+                  note: note.note as string,
+                  createdAt: validDate(note.createdAt, createdAt),
+                };
+              })
+          : [],
+        createdAt,
+        updatedAt: validDate(record.updatedAt, createdAt),
+      };
+    }),
+    name: stringValue(saved.name),
+    business: stringValue(saved.business),
+    timezone: saved.timezone,
+    workingDays: normalizeWorkingDays(saved.workingDays),
+  };
 }
 export function saveTask(tasks: Task[], task: Task): Task[] {
   if (!task.title.trim()) throw new Error("Give your task a name.");
@@ -102,21 +206,36 @@ export function sampleStore(): Store {
         name: "James Wilson",
         business: "Customer · Kitchen renovation",
         email: "",
+        phone: "",
+        address: "",
         notes: "Interested in a kitchen renovation. Follow up on the estimate.",
+        interactions: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
       {
         id: "p2",
         name: "Sarah Chen",
         business: "Customer · New project",
         email: "",
+        phone: "",
+        address: "",
         notes: "Prefers a call in the morning.",
+        interactions: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
       {
         id: "p3",
         name: "Bill Davis",
         business: "Business contact",
         email: "",
+        phone: "",
+        address: "",
         notes: "Send updated proposal.",
+        interactions: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       },
     ],
   };

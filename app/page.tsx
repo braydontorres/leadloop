@@ -43,11 +43,19 @@ import {
   saveTask,
   DEFAULT_WORKING_DAYS,
   normalizeWorkingDays,
+  migrateStore,
+  persistStore,
   dateLabel,
   fromLocalInput,
   isToday,
   toLocalInput,
 } from "../lib/tasks";
+import {
+  advanceCustomerMemory,
+  emptyCustomerMemoryState,
+  findCustomer,
+  saveCustomer,
+} from "../lib/customer-memory";
 import {
   advanceConversation,
   conversationContext,
@@ -121,7 +129,8 @@ export default function Page() {
     [sessionActive, setSessionActive] = useState(false),
     [speechDetected, setSpeechDetected] = useState(false),
     [microphoneStarting, setMicrophoneStarting] = useState(false),
-    [conversation, setConversation] = useState(emptyConversationState);
+    [conversation, setConversation] = useState(emptyConversationState),
+    [customerMemory, setCustomerMemory] = useState(emptyCustomerMemoryState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -163,10 +172,14 @@ export default function Page() {
   }>({});
   const sessionActiveRef = useRef(false);
   const conversationRef = useRef(conversation);
+  const customerMemoryRef = useRef(customerMemory);
   const storeRef = useRef<Store | null>(store);
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
+  useEffect(() => {
+    customerMemoryRef.current = customerMemory;
+  }, [customerMemory]);
   useEffect(() => {
     storeRef.current = store;
   }, [store]);
@@ -175,17 +188,18 @@ export default function Page() {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
-        if (
-          !Array.isArray(saved.tasks) ||
-          !Array.isArray(saved.people) ||
-          typeof saved.timezone !== "string"
-        )
-          throw Error();
-        new Intl.DateTimeFormat("en", { timeZone: saved.timezone });
-        setStore({
-          ...saved,
-          workingDays: normalizeWorkingDays(saved.workingDays),
-        });
+        const migrated = migrateStore(saved);
+        new Intl.DateTimeFormat("en", { timeZone: migrated.timezone });
+        if (JSON.stringify(saved) !== JSON.stringify(migrated)) {
+          try {
+            const backupKey = `${STORAGE_KEY}.backup.v1`;
+            if (!localStorage.getItem(backupKey))
+              localStorage.setItem(backupKey, raw);
+          } catch {
+            // The migration is still safe in memory; persistence will report its own failure.
+          }
+        }
+        setStore(migrated);
       } else setStore(sampleStore());
     } catch {
       setStorageError(true);
@@ -369,9 +383,18 @@ export default function Page() {
         );
         return;
       }
+      const lookup = draft.person
+        ? findCustomer(store.people, draft.person)
+        : { kind: "none" as const };
       setStore({
         ...store,
-        tasks: saveTask(store.tasks, { ...draft, title: draft.title.trim() }),
+        tasks: saveTask(store.tasks, {
+          ...draft,
+          title: draft.title.trim(),
+          ...(lookup.kind === "one"
+            ? { person: lookup.person.name, personId: lookup.person.id }
+            : {}),
+        }),
       });
       setDraft(null);
       setText("");
@@ -480,13 +503,73 @@ export default function Page() {
       complete("exception");
     }
   };
+  const commitLocalStore = (next: Store) => {
+    if (persistStore(localStorage, next)) {
+      storeRef.current = next;
+      setStore(next);
+      setStorageError(false);
+      return true;
+    }
+    setStorageError(true);
+    setVoiceError(
+      "LeadLoop couldn't save that customer information in this browser. Your pending change is still available to retry.",
+    );
+    return false;
+  };
+  const handleCustomerInput = (
+    transcript: string,
+    turnId: number | null = null,
+  ) => {
+    const currentStore = storeRef.current;
+    if (!currentStore) return false;
+    const transition = advanceCustomerMemory({
+      state: customerMemoryRef.current,
+      text: transcript,
+      people: currentStore.people,
+      createId: () => crypto.randomUUID(),
+    });
+    if (!transition.handled) return false;
+    if (transition.savedPerson) {
+      const nextStore = {
+        ...currentStore,
+        people: saveCustomer(currentStore.people, transition.savedPerson),
+      };
+      if (!commitLocalStore(nextStore)) return true;
+      customerMemoryRef.current = transition.state;
+      setCustomerMemory(transition.state);
+      setNotice("Customer information saved on this device.");
+    } else {
+      customerMemoryRef.current = transition.state;
+      setCustomerMemory(transition.state);
+    }
+    setAssistantMessage(transition.reply);
+    speakReply(transition.reply, false, sessionActiveRef.current, turnId);
+    return true;
+  };
   const handleAssistantResult = (
     transcript: string,
     result: IntentResult,
     turnId: number | null = null,
   ) => {
     try {
+      if (handleCustomerInput(transcript, turnId)) return;
       const previous = conversationRef.current;
+      const confirmingCustomerReminder =
+        previous.stage === "awaiting_confirmation" &&
+        result.intent.kind === "confirm" &&
+        previous.activeReminder?.person;
+      if (confirmingCustomerReminder && storeRef.current) {
+        const lookup = findCustomer(
+          storeRef.current.people,
+          previous.activeReminder!.person,
+        );
+        if (lookup.kind === "ambiguous") {
+          const reply = `I found more than one customer named ${previous.activeReminder!.person}. Which one should this reminder be linked to?`;
+          setAssistantMessage(reply);
+          speakReply(reply, false, sessionActiveRef.current, turnId);
+          return;
+        }
+      }
       const transition = advanceConversation({
         state: previous,
         result,
@@ -494,11 +577,23 @@ export default function Page() {
         timeZone: timezone,
         createId: () => crypto.randomUUID(),
       });
-      if (transition.savedTask && storeRef.current)
+      if (transition.savedTask && storeRef.current) {
+        const lookup = transition.savedTask.person
+          ? findCustomer(storeRef.current.people, transition.savedTask.person)
+          : { kind: "none" as const };
+        const savedTask =
+          lookup.kind === "one"
+            ? {
+                ...transition.savedTask,
+                person: lookup.person.name,
+                personId: lookup.person.id,
+              }
+            : transition.savedTask;
         setStore({
           ...storeRef.current,
-          tasks: saveTask(storeRef.current.tasks, transition.savedTask),
+          tasks: saveTask(storeRef.current.tasks, savedTask),
         });
+      }
       conversationRef.current = transition.state;
       setConversation(transition.state);
       const resolution = transition.state.activeReminder
@@ -530,6 +625,10 @@ export default function Page() {
   const requestInterpretation = async (thought: string) => {
     if (!sessionActiveRef.current) {
       setVoiceError("Start a conversation before sending a reply.");
+      return;
+    }
+    if (handleCustomerInput(thought)) {
+      setText(thought);
       return;
     }
     if (submissionRef.current) {
@@ -1662,8 +1761,8 @@ export default function Page() {
                       <Mic size={21} />
                     </span>
                     <div>
-                      <h2>Your reminder conversation</h2>
-                      <p>One reminder at a time, confirmed out loud.</p>
+                      <h2>Your LeadLoop conversation</h2>
+                      <p>Reminders and customer facts, confirmed out loud.</p>
                     </div>
                   </div>
                   <div className="recording-controls">
@@ -1837,10 +1936,26 @@ export default function Page() {
                       <Pencil size={15} /> Edit reminder details
                     </button>
                   )}
+                  {customerMemory.pending && (
+                    <dl className="conversation-reminder customer-memory-review">
+                      <div>
+                        <dt>Customer memory to confirm</dt>
+                        <dd>{customerMemory.pending.person.name}</dd>
+                      </div>
+                      <div>
+                        <dt>Change</dt>
+                        <dd>
+                          {customerMemory.pending.changed.join(", ") ||
+                            "Customer record"}
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
                 </aside>
               </div>
               {(assistantMessage ||
                 activeReminder ||
+                customerMemory.pending ||
                 conversation.lastSavedReminder) && (
                 <section className="assistant-review" aria-live="polite">
                   <div className="assistant-message">
@@ -2062,7 +2177,12 @@ export default function Page() {
                       name: "",
                       business: "",
                       email: "",
+                      phone: "",
+                      address: "",
                       notes: "",
+                      interactions: [],
+                      createdAt: new Date().toISOString(),
+                      updatedAt: new Date().toISOString(),
                     })
                   }
                 >
@@ -2106,8 +2226,12 @@ export default function Page() {
                       </p>
                       <div>
                         <LayoutList size={14} />
-                        {active.filter((t) => t.person === p.name).length} open
-                        tasks
+                        {
+                          active.filter(
+                            (t) => t.personId === p.id || t.person === p.name,
+                          ).length
+                        }{" "}
+                        open tasks
                       </div>
                     </button>
                   ))}
@@ -2237,8 +2361,9 @@ export default function Page() {
                       <span>
                         <strong>Local demo workspace</strong>
                         <p>
-                          No sign-in or cloud backup yet. Use sample information
-                          on shared devices.
+                          Customer records, notes, and reminders are stored in
+                          this browser only. There is no sign-in or cloud backup
+                          yet; use sample information on shared devices.
                         </p>
                       </span>
                     </div>
@@ -2490,17 +2615,35 @@ export default function Page() {
             <form
               onSubmit={(e) => {
                 e.preventDefault();
+                const timestamp = new Date().toISOString();
+                const savedPerson = {
+                  ...person,
+                  createdAt: person.createdAt || timestamp,
+                  updatedAt: timestamp,
+                  interactions: person.interactions ?? [],
+                };
                 setStore({
                   ...store,
                   people: store.people.some((p) => p.id === person.id)
-                    ? store.people.map((p) => (p.id === person.id ? person : p))
-                    : [...store.people, person],
+                    ? store.people.map((p) =>
+                        p.id === person.id ? savedPerson : p,
+                      )
+                    : [...store.people, savedPerson],
                 });
                 setPerson(null);
                 setNotice("Contact saved.");
               }}
             >
-              {(["name", "business", "email", "notes"] as const).map((k) => (
+              {(
+                [
+                  "name",
+                  "business",
+                  "phone",
+                  "email",
+                  "address",
+                  "notes",
+                ] as const
+              ).map((k) => (
                 <label className="field" key={k}>
                   {k === "business"
                     ? "Business / relationship"
@@ -2516,7 +2659,9 @@ export default function Page() {
                   ) : (
                     <input
                       required={k === "name"}
-                      type={k === "email" ? "email" : "text"}
+                      type={
+                        k === "email" ? "email" : k === "phone" ? "tel" : "text"
+                      }
                       value={person[k]}
                       onChange={(e) =>
                         setPerson({ ...person, [k]: e.target.value })
@@ -2542,6 +2687,15 @@ export default function Page() {
                           people: store.people.filter(
                             (p) => p.id !== person.id,
                           ),
+                          tasks: store.tasks.map((task) =>
+                            task.personId === person.id
+                              ? (() => {
+                                  const { personId: _personId, ...legacy } =
+                                    task;
+                                  return legacy;
+                                })()
+                              : task,
+                          ),
                         });
                         setPerson(null);
                       }
@@ -2559,6 +2713,30 @@ export default function Page() {
                 </button>
                 <button className="button primary">Save contact</button>
               </div>
+              {person.interactions.length > 0 && (
+                <section
+                  className="customer-history"
+                  aria-label="Customer history"
+                >
+                  <h3>Interaction history</h3>
+                  {person.interactions
+                    .slice()
+                    .reverse()
+                    .map((item) => (
+                      <p key={item.id}>
+                        {item.note}
+                        <small>
+                          {new Intl.DateTimeFormat("en-US", {
+                            month: "short",
+                            day: "numeric",
+                            year: "numeric",
+                            timeZone: timezone,
+                          }).format(new Date(item.createdAt))}
+                        </small>
+                      </p>
+                    ))}
+                </section>
+              )}
             </form>
           </section>
         </div>
