@@ -141,6 +141,146 @@ test("Phase C understands safe spoken clocks and keeps ambiguous clocks unanswer
   });
 });
 
+test("Phase C spoken clocks prefer complete expressions over overlapping clock substrings", () => {
+  const required = [
+    ["Quarter to five PM", "16:45"],
+    ["Quarter to 5 PM", "16:45"],
+    ["A quarter to 5 p.m.", "16:45"],
+    ["No, make it a quarter to 5 p.m.", "16:45"],
+    ["Actually, Friday after next at quarter to 5 PM", "16:45"],
+    ["Half past 3 PM", "15:30"],
+    ["Quarter past 4 AM", "04:15"],
+    ["5 PM", "17:00"],
+  ] as const;
+  for (const [text, expected] of required)
+    assert.deepEqual(naturalTimeFromText(text), {
+      time: expected,
+      ambiguous: false,
+    });
+
+  const words = [
+    "twelve",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+  ];
+  for (let hour = 1; hour <= 12; hour += 1) {
+    const word = words[hour % 12];
+    for (const marker of ["AM", "PM"] as const) {
+      const base = marker === "PM" ? (hour === 12 ? 12 : hour + 12) : hour === 12 ? 0 : hour;
+      for (const sourceHour of [String(hour), word]) {
+        assert.equal(
+          naturalTimeFromText(`Please make it half past ${sourceHour} ${marker}.`).time,
+          `${String(base).padStart(2, "0")}:30`,
+        );
+        assert.equal(
+          naturalTimeFromText(`Set it for quarter past ${sourceHour} ${marker}, please.`).time,
+          `${String(base).padStart(2, "0")}:15`,
+        );
+      }
+    }
+  }
+
+  assert.deepEqual(naturalTimeFromText("quarter to 12 PM"), {
+    time: "11:45",
+    ambiguous: false,
+  });
+  assert.deepEqual(naturalTimeFromText("quarter to 12 AM"), {
+    time: null,
+    ambiguous: true,
+  });
+  assert.deepEqual(naturalTimeFromText("quarter to twelve AM"), {
+    time: null,
+    ambiguous: true,
+  });
+  assert.deepEqual(naturalTimeFromText("half past 12 AM"), {
+    time: "00:30",
+    ambiguous: false,
+  });
+  assert.deepEqual(naturalTimeFromText("quarter past 12 PM"), {
+    time: "12:15",
+    ambiguous: false,
+  });
+  assert.deepEqual(naturalTimeFromText("quarter to 5 p m"), {
+    time: "16:45",
+    ambiguous: false,
+  });
+});
+
+test("Phase C numeric spoken-time correction preserves one draft and requires reconfirmation", () => {
+  const first = turn(
+    emptyConversationState(),
+    {
+      kind: "new_task",
+      fields: { ...fields, title: "call Brad", person: "Brad" },
+    },
+    "Remind me to call Brad Friday after next at 5 PM.",
+    "numeric-time-draft",
+  );
+  assert.equal(first.state.stage, "reading_back");
+  assert.match(first.reply, /Friday, October 30, 2026.*5:00 PM/);
+
+  const corrected = turn(
+    finishSpeech(first.state),
+    { kind: "confirm", fields },
+    "No, make it a quarter to 5 p.m.",
+    "must-not-replace-numeric-time-draft",
+  );
+  assert.equal(corrected.savedTask, undefined);
+  assert.equal(corrected.state.activeReminder?.id, "numeric-time-draft");
+  assert.equal(corrected.state.activeReminder?.title, "call Brad");
+  assert.equal(corrected.state.activeReminder?.person, "Brad");
+  assert.equal(corrected.state.stage, "reading_back");
+  const resolution = resolveCalendarExpression(
+    corrected.state.activeReminder!.calendar,
+  );
+  assert.equal(resolution.kind, "resolved");
+  if (resolution.kind === "resolved") {
+    assert.equal(resolution.date, "2026-10-30");
+    assert.equal(resolution.time, "16:45");
+  }
+  assert.match(corrected.reply, /Friday, October 30, 2026.*4:45 PM/);
+  assert.match(corrected.reply, /Is that correct/);
+
+  const saved = turn(
+    finishSpeech(corrected.state),
+    { kind: "confirm", fields },
+    "Yes.",
+    "must-not-create-after-numeric-confirmation",
+  );
+  assert.equal(saved.savedTask?.id, "numeric-time-draft");
+  assert.equal(saved.state.activeReminder, null);
+  assert.match(saved.savedTask?.due ?? "", /2026-10-30T21:45:00.000Z/);
+});
+
+test("Phase C original correction conversation works with numeric spoken hours", () => {
+  const first = turn(
+    emptyConversationState(),
+    {
+      kind: "new_task",
+      fields: { ...fields, title: "call Brad", person: "Brad" },
+    },
+    "Remind me to call Brad this Friday at half past 3 PM.",
+  );
+  const corrected = turn(
+    finishSpeech(first.state),
+    { kind: "confirm", fields },
+    "Actually, Friday after next at quarter to 5 PM.",
+  );
+  assert.equal(corrected.state.activeReminder?.id, "phase-c-draft");
+  assert.equal(corrected.state.activeReminder?.title, "call Brad");
+  assert.equal(corrected.state.activeReminder?.person, "Brad");
+  assert.match(corrected.reply, /Friday, October 30, 2026.*4:45 PM/);
+});
+
 test("Phase C resolves duration clocks from the frozen reference or existing reminder", () => {
   for (const [text, expected] of [
     ["in ninety minutes", "2026-10-19T08:30"],
