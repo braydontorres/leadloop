@@ -67,6 +67,7 @@ import {
   type VoiceActivityConfig,
   type VoiceActivityState,
 } from "../lib/voice-activity";
+import { calendarFromLegacy } from "../lib/calendar-expression";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -333,6 +334,14 @@ export default function Page() {
           pendingTime: conversation.activeReminder?.pendingTime ?? null,
           pendingDateConstraint:
             conversation.activeReminder?.pendingDateConstraint ?? null,
+          calendar: calendarFromLegacy({
+            timeZone: timezone,
+            due: draft.due,
+            pendingDate: conversation.activeReminder?.pendingDate ?? null,
+            pendingTime: conversation.activeReminder?.pendingTime ?? null,
+            pendingDateConstraint:
+              conversation.activeReminder?.pendingDateConstraint ?? null,
+          }),
         };
         if (!updatedReminder.title) throw new Error("Give your task a name.");
         const reply = updatedReminder.due

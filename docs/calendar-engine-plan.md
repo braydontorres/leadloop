@@ -10,6 +10,13 @@ exist, the state remains incomplete and LeadLoop asks for a different occurrence
 
 ## Phase B: calendar domain model (immediate MVP)
 
+Implemented on `feat/calendar-expression-phase-b`. See
+[`calendar-expression-architecture.md`](./calendar-expression-architecture.md)
+for the module boundaries, compatibility adapter, and current supported subset.
+Phase B adds the model and deterministic resolver for the existing one-time
+calendar flow; it deliberately leaves the Phase C and D language/features below
+unsupported rather than guessing.
+
 Create a `CalendarExpression` model separate from reminder UI state. It should carry
 the user-supplied constraints and their certainty rather than a prematurely chosen
 timestamp:

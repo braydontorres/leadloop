@@ -1,14 +1,22 @@
-import { fromLocalInput, type Task } from "./tasks";
+import { type Task } from "./tasks";
+import {
+  calendarFromLegacy,
+  calendarInvalidMessage,
+  calendarProjection,
+  createCalendarExpression,
+  mergeCalendarExpression,
+  parseCalendarExpression,
+  resolveCalendarExpression,
+  type CalendarExpression,
+} from "./calendar-expression";
 import {
   cleanReminderTitle,
   dateConstraintQuestion,
   deriveDateConstraint,
   deterministicDateFromText,
   deterministicTimeFromText,
-  mergeDateConstraints,
   matchesDateConstraint,
   mentionsUnambiguousDate,
-  resolveDateConstraint,
   type DateConstraint,
   type WeekdayOccurrence,
 } from "./reminder-details";
@@ -28,6 +36,8 @@ export type ActiveReminder = Pick<
   Task,
   "id" | "title" | "person" | "due" | "notes"
 > & {
+  /** Canonical scheduling state. The pending* fields below are a read-only compatibility projection. */
+  calendar: CalendarExpression;
   pendingDate: string | null;
   pendingTime: string | null;
   pendingDateConstraint: DateConstraint | null;
@@ -100,26 +110,34 @@ function text(
 function activeReminder(value: unknown): ActiveReminder | null {
   if (value === null || value === undefined) return null;
   if (!isRecord(value)) throw new Error("Invalid active reminder.");
-  return {
+  const common = {
     id: text(value.id, "reminder id", 120),
     title: text(value.title, "reminder title", 240, true),
     person: text(value.person, "person", 160, true),
     due: text(value.due, "reminder time", 80, true),
     notes: text(value.notes, "notes", 1000, true),
-    pendingDate:
-      value.pendingDate === undefined || value.pendingDate === null
-        ? null
-        : text(value.pendingDate, "pending reminder date", 10),
-    pendingTime:
-      value.pendingTime === undefined || value.pendingTime === null
-        ? null
-        : text(value.pendingTime, "pending reminder time", 5),
-    pendingDateConstraint:
-      value.pendingDateConstraint === undefined ||
-      value.pendingDateConstraint === null
-        ? null
-        : dateConstraint(value.pendingDateConstraint),
   };
+  const calendar =
+    value.calendar === undefined
+      ? calendarFromLegacy({
+          timeZone: "UTC",
+          due: common.due,
+          pendingDate:
+            value.pendingDate === undefined || value.pendingDate === null
+              ? null
+              : text(value.pendingDate, "pending reminder date", 10),
+          pendingTime:
+            value.pendingTime === undefined || value.pendingTime === null
+              ? null
+              : text(value.pendingTime, "pending reminder time", 5),
+          pendingDateConstraint:
+            value.pendingDateConstraint === undefined ||
+            value.pendingDateConstraint === null
+              ? null
+              : dateConstraint(value.pendingDateConstraint),
+        })
+      : parseCalendarExpression(value.calendar);
+  return reminderWithCalendar({ ...common, calendar });
 }
 
 function dateConstraint(value: unknown): DateConstraint {
@@ -262,99 +280,55 @@ function withReply(
   };
 }
 
+/** Keeps older UI/API fields available while making CalendarExpression the only mutable schedule state. */
+function reminderWithCalendar(
+  reminder: Pick<ActiveReminder, "id" | "title" | "person" | "notes"> & {
+    calendar: CalendarExpression;
+  },
+): ActiveReminder {
+  const projection = calendarProjection(reminder.calendar);
+  return { ...reminder, ...projection };
+}
+
 function applyFields(
   current: ActiveReminder,
   fields: IntentFields,
   timeZone: string,
   dateConstraint: DateConstraint | null,
 ) {
-  let due = fields.clearDue ? "" : current.due;
-  let pendingDate = fields.clearDue ? null : current.pendingDate;
-  let pendingTime = fields.clearDue ? null : current.pendingTime;
-  let pendingDateConstraint = fields.clearDue
-    ? null
-    : current.pendingDateConstraint;
+  let calendar = current.calendar;
   let dateConstraintError: string | null = null;
   if (dateConstraint) {
-    const mergedConstraint = mergeDateConstraints(
-      pendingDateConstraint,
-      dateConstraint,
-    );
-    if (!mergedConstraint) throw new Error("Invalid reminder date constraint.");
-    pendingDateConstraint = mergedConstraint;
-    pendingDate = null;
-    due = "";
-    const resolution = resolveDateConstraint(mergedConstraint);
-    if (resolution.status === "resolved") {
-      pendingDate = resolution.date;
-      pendingDateConstraint = null;
-    } else if (resolution.status === "unavailable") {
-      const weekday = new Intl.DateTimeFormat("en-US", {
-        weekday: "long",
-        timeZone: "UTC",
-      }).format(new Date(Date.UTC(2023, 0, 1 + mergedConstraint.weekday!)));
-      const countWord =
-        ["zero", "one", "two", "three", "four", "five"][
-          resolution.occurrenceCount
-        ] ?? String(resolution.occurrenceCount);
-      const ordinalWord =
-        ["zeroth", "first", "second", "third", "fourth", "fifth"][
-          resolution.occurrenceCount
-        ] ?? `${resolution.occurrenceCount}th`;
-      dateConstraintError = `That month only has ${countWord} ${weekday}s. Would you like the ${ordinalWord} ${weekday} instead?`;
-    }
+    calendar = mergeCalendarExpression(calendar, {
+      constraint: dateConstraint,
+    });
   }
+  if (fields.clearDue)
+    calendar = mergeCalendarExpression(calendar, { clear: true });
   if (fields.date !== null || fields.time !== null) {
-    const previous = due
-      ? new Intl.DateTimeFormat("en-CA", {
-          timeZone,
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-          hour: "2-digit",
-          minute: "2-digit",
-          hourCycle: "h23",
-        }).formatToParts(new Date(due))
-      : [];
-    const part = (name: Intl.DateTimeFormatPartTypes) =>
-      previous.find((entry) => entry.type === name)?.value ?? "";
-    const dueDate = `${part("year")}-${part("month")}-${part("day")}`;
-    const dueTime = `${part("hour")}:${part("minute")}`;
     if (
       fields.date !== null &&
-      !matchesDateConstraint(fields.date, pendingDateConstraint)
+      !matchesDateConstraint(fields.date, calendar.date.constraint)
     ) {
-      const question = dateConstraintQuestion(pendingDateConstraint!);
+      const question = dateConstraintQuestion(calendar.date.constraint!);
       dateConstraintError = `That date doesn't match ${question.slice(6)}. ${question}?`;
-    } else if (fields.date !== null) {
-      pendingDate = fields.date;
-      pendingDateConstraint = null;
-    } else {
-      pendingDate = pendingDate ?? (due ? dueDate : null);
-    }
-    pendingTime = fields.time ?? pendingTime ?? (due ? dueTime : null);
-    if (pendingDate && pendingTime) {
-      try {
-        due = fromLocalInput(`${pendingDate}T${pendingTime}`, timeZone);
-        pendingDate = null;
-        pendingTime = null;
-        pendingDateConstraint = null;
-      } catch {
-        due = "";
-      }
-    }
+    } else
+      calendar = mergeCalendarExpression(calendar, {
+        date: fields.date === null ? undefined : fields.date,
+        time: fields.time === null ? undefined : fields.time,
+      });
   }
+  const resolution = resolveCalendarExpression(calendar);
+  dateConstraintError =
+    dateConstraintError ?? calendarInvalidMessage(resolution);
   return {
-    reminder: {
-      ...current,
+    reminder: reminderWithCalendar({
+      id: current.id,
       title: fields.title ?? current.title,
       person: fields.person ?? current.person,
       notes: fields.notes ?? current.notes,
-      due,
-      pendingDate,
-      pendingTime,
-      pendingDateConstraint,
-    },
+      calendar,
+    }),
     dateConstraintError,
   };
 }
@@ -384,21 +358,29 @@ function nextReply(
       stage: "awaiting_details" as const,
       reply: "What would you like me to remind you about?",
     };
-  if (!reminder.due && reminder.pendingDateConstraint) {
-    const dateQuestion = dateConstraintQuestion(reminder.pendingDateConstraint);
+  const calendar = resolveCalendarExpression(reminder.calendar);
+  if (calendar.kind === "ambiguous" && reminder.calendar.date.constraint) {
+    const dateQuestion = dateConstraintQuestion(
+      reminder.calendar.date.constraint,
+    );
+    const needsTime = !reminder.calendar.time.local;
     return {
       stage: "awaiting_details" as const,
       reply: dateConstraintError
-        ? `${dateConstraintError} ${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`
-        : `${dateQuestion}${reminder.pendingTime ? "?" : ", and what time?"}`,
+        ? `${dateConstraintError} ${dateQuestion}?`
+        : `${dateQuestion}${needsTime ? ", and what time?" : "?"}`,
     };
   }
-  if (!reminder.due && reminder.pendingDate)
+  if (
+    calendar.kind === "incomplete" &&
+    calendar.missing.includes("time") &&
+    !calendar.missing.includes("date")
+  )
     return {
       stage: "awaiting_details" as const,
       reply: "Of course! What time should I remind you?",
     };
-  if (!reminder.due)
+  if (calendar.kind !== "resolved")
     return {
       stage: "awaiting_details" as const,
       reply: "Sure! When would you like me to remind you?",
@@ -434,7 +416,7 @@ export function advanceConversation(args: {
   let intent = result.intent;
   const derivedConstraint = deriveDateConstraint(user, timeZone, now);
   const activeCalendarClarification =
-    state.activeReminder?.pendingDateConstraint ?? null;
+    state.activeReminder?.calendar.date.constraint ?? null;
 
   // An ordinal reply answers the application's outstanding calendar question.
   // Treat it as a follow-up before consulting the model's intent label: models
@@ -487,6 +469,7 @@ export function advanceConversation(args: {
   if (intent.kind === "confirm") {
     if (state.stage === "awaiting_confirmation" && state.activeReminder) {
       const {
+        calendar: _calendar,
         pendingDate: _pendingDate,
         pendingTime: _pendingTime,
         pendingDateConstraint: _pendingDateConstraint,
@@ -554,7 +537,8 @@ export function advanceConversation(args: {
       { stage: state.activeReminder ? "awaiting_details" : "idle" },
     );
 
-  const activeConstraint = state.activeReminder?.pendingDateConstraint ?? null;
+  const activeConstraint =
+    state.activeReminder?.calendar.date.constraint ?? null;
   const deterministicDate = deterministicDateFromText(
     user,
     timeZone,
@@ -572,16 +556,14 @@ export function advanceConversation(args: {
     time: deterministicTime,
   };
   const applied = applyFields(
-    state.activeReminder ?? {
-      id: createId(),
-      title: "",
-      person: "",
-      due: "",
-      notes: "",
-      pendingDate: null,
-      pendingTime: null,
-      pendingDateConstraint: null,
-    },
+    state.activeReminder ??
+      reminderWithCalendar({
+        id: createId(),
+        title: "",
+        person: "",
+        notes: "",
+        calendar: createCalendarExpression(timeZone, now),
+      }),
     fields,
     timeZone,
     derivedConstraint,
