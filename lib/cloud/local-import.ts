@@ -203,15 +203,24 @@ export async function importApprovedLocalWorkspace(args: {
     `${STORAGE_KEY}${JOURNAL_SUFFIX}`,
     JSON.stringify(journal),
   );
-  if (preparation.duplicate)
+  if (preparation.duplicate) {
+    if (
+      !preparation.counts ||
+      JSON.stringify(preparation.counts) !== JSON.stringify(preview.counts)
+    ) {
+      throw new Error(
+        "The completed cloud import no longer matches this local snapshot.",
+      );
+    }
     return {
       preview,
       result: {
         importId: preparation.importId,
         duplicate: true,
-        counts: preview.counts,
+        counts: preparation.counts,
       },
     };
+  }
   try {
     const result = await args.gateway.importPreparedSnapshot({
       workspaceId: args.workspaceId,

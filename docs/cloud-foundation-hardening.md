@@ -57,3 +57,11 @@ supabase test db --file supabase/tests/cloud-foundation-hardening.sql
 
 The test is not runnable in this repository workspace because Supabase CLI and
 a disposable PostgreSQL/Supabase instance are not configured here.
+
+## Completed-import retry ordering
+
+`prepare_local_import` authorizes the owner and validates the SHA-256 digest
+before reading `local_imports`. If the exact workspace/digest pair is already
+`completed`, it returns that import ID and its database-verified counts before
+checking record-ID conflicts. A different digest still reaches conflict
+detection and is blocked if it reuses any imported ID.

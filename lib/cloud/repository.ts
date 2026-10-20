@@ -110,12 +110,14 @@ export function createSupabaseWorkspaceRepository(
         duplicate: boolean;
         ready: boolean;
         conflicts: CloudImportPreparation["conflicts"];
+        counts?: CloudImportPreparation["counts"];
       };
       return {
         importId: result.import_id,
         duplicate: result.duplicate,
         ready: result.ready,
         conflicts: result.conflicts,
+        counts: result.counts,
       };
     },
     async importPreparedSnapshot({

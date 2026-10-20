@@ -112,10 +112,12 @@ create or replace function public.prepare_local_import(p_workspace_id uuid,p_sou
 declare snapshot jsonb; existing public.local_imports; conflicts jsonb; counts jsonb; begin
   if not public.is_workspace_owner(p_workspace_id) then raise exception 'Workspace owner access required'; end if;
   if p_source_digest !~ '^sha256:[a-f0-9]{64}$' or p_source_digest <> ('sha256:' || encode(digest(convert_to(p_snapshot_json,'UTF8'),'sha256'),'hex')) then raise exception 'Snapshot digest does not match supplied JSON'; end if;
+  -- An identical, verified snapshot is idempotent. It must win before ID
+  -- conflict detection, because its records are already present by design.
+  select * into existing from public.local_imports where workspace_id=p_workspace_id and source_digest=p_source_digest;
+  if found and existing.state='completed' then return jsonb_build_object('import_id',existing.id,'duplicate',true,'ready',true,'conflicts',jsonb_build_object('customers','[]'::jsonb,'interactions','[]'::jsonb,'quotes','[]'::jsonb,'quoteStatusChanges','[]'::jsonb,'tasks','[]'::jsonb),'counts',existing.database_counts); end if;
   snapshot:=p_snapshot_json::jsonb; conflicts:=public.local_import_conflicts(p_workspace_id,snapshot);
   if conflicts <> '{"customers":[],"interactions":[],"quotes":[],"quoteStatusChanges":[],"tasks":[]}'::jsonb then return jsonb_build_object('import_id',null,'duplicate',false,'ready',false,'conflicts',conflicts); end if;
-  select * into existing from public.local_imports where workspace_id=p_workspace_id and source_digest=p_source_digest;
-  if found and existing.state='completed' then return jsonb_build_object('import_id',existing.id,'duplicate',true,'ready',true,'conflicts',conflicts); end if;
   counts:=jsonb_build_object('customers',jsonb_array_length(coalesce(snapshot->'people','[]')),'interactions',coalesce((select sum(jsonb_array_length(coalesce(x->'interactions','[]'))) from jsonb_array_elements(coalesce(snapshot->'people','[]')) x),0),'quotes',jsonb_array_length(coalesce(snapshot->'quotes','[]')),'quoteStatusChanges',coalesce((select sum(jsonb_array_length(coalesce(x->'statusHistory','[]'))) from jsonb_array_elements(coalesce(snapshot->'quotes','[]')) x),0),'tasks',jsonb_array_length(coalesce(snapshot->'tasks','[]')));
   insert into public.local_imports(workspace_id,initiated_by,source_digest,state,expected_counts) values(p_workspace_id,auth.uid(),p_source_digest,'prepared',counts) on conflict(workspace_id,source_digest) do update set state='prepared',expected_counts=excluded.expected_counts,rollback_reason=null,prepared_at=now(),rolled_back_at=null where public.local_imports.state='rolled_back' returning * into existing;
   if existing.id is null then select * into existing from public.local_imports where workspace_id=p_workspace_id and source_digest=p_source_digest; end if;

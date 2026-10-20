@@ -51,6 +51,8 @@ export type CloudImportPreparation = {
   duplicate: boolean;
   ready: boolean;
   conflicts: CloudImportConflicts;
+  /** Present when a matching completed import is returned. */
+  counts?: CloudImportCounts;
 };
 
 export type CloudImportResult = {

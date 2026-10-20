@@ -275,6 +275,7 @@ test("completed digest is idempotent and does not upload a second snapshot", asy
         duplicate: true,
         ready: true,
         conflicts: noConflicts,
+        counts: preview.counts,
       }),
       importPreparedSnapshot: async () => {
         uploads += 1;
