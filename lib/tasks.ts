@@ -1,9 +1,13 @@
+import { migrateQuotes, type Quote } from "./quotes";
+
 export type Task = {
   id: string;
   title: string;
   person: string;
   /** Optional stable link to a local customer record. Legacy person text stays supported. */
   personId?: string;
+  /** Optional stable link to a customer estimate. */
+  quoteId?: string;
   due: string;
   completed: boolean;
   notes: string;
@@ -30,6 +34,7 @@ export type Person = {
 export type Store = {
   tasks: Task[];
   people: Person[];
+  quotes: Quote[];
   name: string;
   business: string;
   timezone: string;
@@ -92,11 +97,15 @@ export function migrateStore(
         ...(typeof record.personId === "string" && record.personId
           ? { personId: record.personId }
           : {}),
+        ...(typeof record.quoteId === "string" && record.quoteId
+          ? { quoteId: record.quoteId }
+          : {}),
         due: stringValue(record.due),
         completed: Boolean(record.completed),
         notes: stringValue(record.notes),
       };
     }),
+    quotes: migrateQuotes(saved.quotes, now),
     people: saved.people.map((person) => {
       const record = person as Record<string, unknown>;
       const createdAt = validDate(record.createdAt, now);
@@ -240,6 +249,7 @@ export function sampleStore(): Store {
         notes: "",
       },
     ],
+    quotes: [],
     people: [
       {
         id: "p1",

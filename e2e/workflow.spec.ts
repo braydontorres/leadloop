@@ -1675,3 +1675,78 @@ test("customer profiles derive, edit, and complete their linked reminders safely
     reopenedDialog.getByText("Call Mike about the updated estimate"),
   ).toBeVisible();
 });
+
+test("typed quote workflow confirms an estimate and shows it in the customer profile", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    const spoken: SpeechSynthesisUtterance[] = [];
+    Object.defineProperty(window, "speechSynthesis", {
+      configurable: true,
+      value: {
+        speak: (utterance: SpeechSynthesisUtterance) => spoken.push(utterance),
+        cancel: () => {},
+      },
+    });
+    (window as unknown as { __spoken: SpeechSynthesisUtterance[] }).__spoken =
+      spoken;
+    localStorage.setItem(
+      "leadloop.phase1.v1",
+      JSON.stringify({
+        name: "Owner",
+        business: "Demo",
+        timezone: "America/Chicago",
+        workingDays: [1, 2, 3, 4, 5],
+        tasks: [],
+        people: [
+          {
+            id: "mike-1",
+            name: "Mike",
+            business: "",
+            email: "",
+            phone: "",
+            address: "",
+            notes: "",
+            interactions: [],
+            createdAt: "2026-10-20T12:00:00.000Z",
+            updatedAt: "2026-10-20T12:00:00.000Z",
+          },
+        ],
+      }),
+    );
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^Capture/ }).click();
+  await page.getByRole("button", { name: "Start Conversation" }).click();
+  const reply = page.getByLabel("Or type your reply");
+  const send = page.getByRole("button", { name: /Send reply/ });
+  const finishSpeech = () =>
+    page.evaluate(() => (window as any).__spoken.at(-1)?.onend?.({}));
+
+  await reply.fill("Create a $250 driveway cleaning estimate for Mike.");
+  await send.click();
+  await expect(page.getByText(/\$250.00 driveway cleaning/i)).toBeVisible();
+  await finishSpeech();
+  await reply.fill("Yes");
+  await send.click();
+  await expect(
+    page.getByText("Estimate saved on this device.", { exact: true }),
+  ).toBeVisible();
+  await finishSpeech();
+
+  const storedQuote = await page.evaluate(() => {
+    const stored = JSON.parse(
+      localStorage.getItem("leadloop.phase1.v1") || "{}",
+    );
+    return stored.quotes?.[0];
+  });
+  expect(storedQuote.amountCents).toBe(25_000);
+
+  await page.getByRole("button", { name: "People", exact: true }).click();
+  await page.locator(".person-card").filter({ hasText: "Mike" }).click();
+  await expect(page.getByText("Quotes & Estimates")).toBeVisible();
+  await expect(
+    page.getByText("Driveway cleaning", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText(/\$250.00 · draft/)).toBeVisible();
+});

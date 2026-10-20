@@ -52,6 +52,16 @@ import {
   toLocalInput,
 } from "../lib/tasks";
 import {
+  advanceQuoteMemory,
+  emptyQuoteMemoryState,
+  quoteAmountLabel,
+  quoteForReminder,
+  matchingQuotesForReminder,
+  quotesForCustomer,
+  saveQuote,
+  type Quote,
+} from "../lib/quotes";
+import {
   advanceCustomerMemory,
   emptyCustomerMemoryState,
   findCustomer,
@@ -114,6 +124,7 @@ export default function Page() {
     [search, setSearch] = useState(""),
     [draft, setDraft] = useState<Task | null>(null),
     [person, setPerson] = useState<Person | null>(null),
+    [quoteDraft, setQuoteDraft] = useState<Quote | null>(null),
     [text, setText] = useState(""),
     [notice, setNotice] = useState(""),
     [storageError, setStorageError] = useState(false),
@@ -131,7 +142,8 @@ export default function Page() {
     [speechDetected, setSpeechDetected] = useState(false),
     [microphoneStarting, setMicrophoneStarting] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState),
-    [customerMemory, setCustomerMemory] = useState(emptyCustomerMemoryState);
+    [customerMemory, setCustomerMemory] = useState(emptyCustomerMemoryState),
+    [quoteMemory, setQuoteMemory] = useState(emptyQuoteMemoryState);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -174,6 +186,15 @@ export default function Page() {
   const sessionActiveRef = useRef(false);
   const conversationRef = useRef(conversation);
   const customerMemoryRef = useRef(customerMemory);
+  const quoteMemoryRef = useRef(quoteMemory);
+  const pendingQuoteLinkRef = useRef<{
+    reminderId: string;
+    quoteIds: string[];
+  } | null>(null);
+  const selectedQuoteLinkRef = useRef<{
+    reminderId: string;
+    quoteId: string;
+  } | null>(null);
   const storeRef = useRef<Store | null>(store);
   useEffect(() => {
     conversationRef.current = conversation;
@@ -181,6 +202,9 @@ export default function Page() {
   useEffect(() => {
     customerMemoryRef.current = customerMemory;
   }, [customerMemory]);
+  useEffect(() => {
+    quoteMemoryRef.current = quoteMemory;
+  }, [quoteMemory]);
   useEffect(() => {
     storeRef.current = store;
   }, [store]);
@@ -197,7 +221,8 @@ export default function Page() {
             if (!localStorage.getItem(backupKey))
               localStorage.setItem(backupKey, raw);
           } catch {
-            // The migration is still safe in memory; persistence will report its own failure.
+            // Keep the migrated workspace in memory, but do not claim it is safely persisted.
+            setStorageError(true);
           }
         }
         setStore(migrated);
@@ -233,6 +258,7 @@ export default function Page() {
       if (e.key === "Escape") {
         setDraft(null);
         setPerson(null);
+        setQuoteDraft(null);
         setMenu(false);
       }
     }
@@ -240,7 +266,7 @@ export default function Page() {
     return () => window.removeEventListener("keydown", key);
   }, []);
   useEffect(() => {
-    if (!draft && !person) return;
+    if (!draft && !person && !quoteDraft) return;
     const previous = document.activeElement as HTMLElement | null;
     function trap(e: KeyboardEvent) {
       if (e.key !== "Tab") return;
@@ -267,7 +293,7 @@ export default function Page() {
       document.body.style.overflow = overflow;
       previous?.focus();
     };
-  }, [!!draft, !!person]);
+  }, [!!draft, !!person, !!quoteDraft]);
   useEffect(() => {
     return () => {
       if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
@@ -312,6 +338,9 @@ export default function Page() {
   const completedCustomerReminders = customerReminders.filter(
     (task) => task.completed,
   );
+  const customerQuotes = person
+    ? quotesForCustomer(store.quotes, person.id)
+    : [];
   const isOverdueReminder = (task: Task) =>
     Boolean(task.due) && new Date(task.due) < new Date();
   const voicePhase =
@@ -524,9 +553,80 @@ export default function Page() {
     }
     setStorageError(true);
     setVoiceError(
-      "LeadLoop couldn't save that customer information in this browser. Your pending change is still available to retry.",
+      "LeadLoop couldn't save that change in this browser. Your pending change is still available to retry.",
     );
     return false;
+  };
+  const handleQuoteInput = (
+    transcript: string,
+    turnId: number | null = null,
+  ) => {
+    const currentStore = storeRef.current;
+    if (!currentStore) return false;
+    const transition = advanceQuoteMemory({
+      state: quoteMemoryRef.current,
+      text: transcript,
+      people: currentStore.people,
+      quotes: currentStore.quotes,
+      createId: () => crypto.randomUUID(),
+    });
+    if (!transition.handled) return false;
+    if (transition.savedQuote) {
+      const nextStore = {
+        ...currentStore,
+        quotes: saveQuote(currentStore.quotes, transition.savedQuote),
+      };
+      if (!commitLocalStore(nextStore)) return true;
+      setNotice("Estimate saved on this device.");
+    }
+    quoteMemoryRef.current = transition.state;
+    setQuoteMemory(transition.state);
+    setAssistantMessage(transition.reply);
+    speakReply(transition.reply, false, sessionActiveRef.current, turnId);
+    return true;
+  };
+  const handlePendingQuoteLink = (
+    transcript: string,
+    turnId: number | null = null,
+  ) => {
+    const pending = pendingQuoteLinkRef.current;
+    const currentStore = storeRef.current;
+    const active = conversationRef.current.activeReminder;
+    if (
+      !pending ||
+      !currentStore ||
+      !active ||
+      active.id !== pending.reminderId
+    )
+      return false;
+    const selected = currentStore.quotes.find(
+      (quote) =>
+        pending.quoteIds.includes(quote.id) &&
+        transcript
+          .toLocaleLowerCase()
+          .includes(quote.serviceDescription.toLocaleLowerCase()),
+    );
+    if (!selected) {
+      const reply = "Which estimate should this reminder be linked to?";
+      setAssistantMessage(reply);
+      speakReply(reply, false, sessionActiveRef.current, turnId);
+      return true;
+    }
+    pendingQuoteLinkRef.current = null;
+    selectedQuoteLinkRef.current = {
+      reminderId: active.id,
+      quoteId: selected.id,
+    };
+    const next = {
+      ...conversationRef.current,
+      stage: "awaiting_confirmation" as const,
+    };
+    conversationRef.current = next;
+    setConversation(next);
+    const reply = `Okay, I’ll link this reminder to the ${selected.serviceDescription} estimate. Is that correct?`;
+    setAssistantMessage(reply);
+    speakReply(reply, true, sessionActiveRef.current, turnId);
+    return true;
   };
   const handleCustomerInput = (
     transcript: string,
@@ -564,6 +664,8 @@ export default function Page() {
     turnId: number | null = null,
   ) => {
     try {
+      if (handlePendingQuoteLink(transcript, turnId)) return;
+      if (handleQuoteInput(transcript, turnId)) return;
       if (handleCustomerInput(transcript, turnId)) return;
       const previous = conversationRef.current;
       const confirmingCustomerReminder =
@@ -581,6 +683,28 @@ export default function Page() {
           speakReply(reply, false, sessionActiveRef.current, turnId);
           return;
         }
+        if (lookup.kind === "one") {
+          const matches = matchingQuotesForReminder({
+            quotes: storeRef.current.quotes,
+            customerId: lookup.person.id,
+            title: previous.activeReminder!.title,
+            notes: previous.activeReminder!.notes,
+          });
+          const selected = selectedQuoteLinkRef.current;
+          if (
+            matches.length > 1 &&
+            (!selected || selected.reminderId !== previous.activeReminder!.id)
+          ) {
+            pendingQuoteLinkRef.current = {
+              reminderId: previous.activeReminder!.id,
+              quoteIds: matches.map((quote) => quote.id),
+            };
+            const reply = `I found more than one matching estimate for ${lookup.person.name}. Which service should this reminder be linked to?`;
+            setAssistantMessage(reply);
+            speakReply(reply, false, sessionActiveRef.current, turnId);
+            return;
+          }
+        }
       }
       const transition = advanceConversation({
         state: previous,
@@ -595,16 +719,34 @@ export default function Page() {
           : { kind: "none" as const };
         const savedTask =
           lookup.kind === "one"
-            ? {
-                ...transition.savedTask,
-                person: lookup.person.name,
-                personId: lookup.person.id,
-              }
+            ? (() => {
+                const quote = quoteForReminder({
+                  quotes: storeRef.current!.quotes,
+                  customerId: lookup.person.id,
+                  title: transition.savedTask!.title,
+                  notes: transition.savedTask!.notes,
+                });
+                return {
+                  ...transition.savedTask,
+                  person: lookup.person.name,
+                  personId: lookup.person.id,
+                  ...(selectedQuoteLinkRef.current?.reminderId ===
+                  transition.savedTask!.id
+                    ? { quoteId: selectedQuoteLinkRef.current.quoteId }
+                    : quote
+                      ? { quoteId: quote.id }
+                      : {}),
+                };
+              })()
             : transition.savedTask;
         setStore({
           ...storeRef.current,
           tasks: saveTask(storeRef.current.tasks, savedTask),
         });
+        if (
+          selectedQuoteLinkRef.current?.reminderId === transition.savedTask.id
+        )
+          selectedQuoteLinkRef.current = null;
       }
       conversationRef.current = transition.state;
       setConversation(transition.state);
@@ -639,7 +781,11 @@ export default function Page() {
       setVoiceError("Start a conversation before sending a reply.");
       return;
     }
-    if (handleCustomerInput(thought)) {
+    if (
+      handlePendingQuoteLink(thought) ||
+      handleQuoteInput(thought) ||
+      handleCustomerInput(thought)
+    ) {
       setText(thought);
       return;
     }
@@ -1963,11 +2109,28 @@ export default function Page() {
                       </div>
                     </dl>
                   )}
+                  {quoteMemory.pending && (
+                    <dl className="conversation-reminder customer-memory-review">
+                      <div>
+                        <dt>Estimate to confirm</dt>
+                        <dd>{quoteMemory.pending.quote.serviceDescription}</dd>
+                      </div>
+                      <div>
+                        <dt>Amount</dt>
+                        <dd>
+                          {quoteAmountLabel(
+                            quoteMemory.pending.quote.amountCents,
+                          )}
+                        </dd>
+                      </div>
+                    </dl>
+                  )}
                 </aside>
               </div>
               {(assistantMessage ||
                 activeReminder ||
                 customerMemory.pending ||
+                quoteMemory.pending ||
                 conversation.lastSavedReminder) && (
                 <section className="assistant-review" aria-live="polite">
                   <div className="assistant-message">
@@ -2425,6 +2588,7 @@ export default function Page() {
                           setStore({
                             tasks: [],
                             people: [],
+                            quotes: [],
                             name: "",
                             business: "",
                             timezone:
@@ -2607,6 +2771,165 @@ export default function Page() {
           </section>
         </div>
       )}
+      {quoteDraft && (
+        <div
+          className="modal-backdrop"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setQuoteDraft(null);
+          }}
+        >
+          <section
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="quote-dialog"
+          >
+            <div className="modal-heading">
+              <div>
+                <span className="eyebrow">CUSTOMER ESTIMATE</span>
+                <h2 id="quote-dialog">
+                  {store.quotes.some((quote) => quote.id === quoteDraft.id)
+                    ? "Edit estimate"
+                    : "Add estimate"}
+                </h2>
+              </div>
+              <button
+                autoFocus
+                className="icon-button"
+                aria-label="Close estimate editor"
+                onClick={() => setQuoteDraft(null)}
+              >
+                <X />
+              </button>
+            </div>
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                try {
+                  const existing = store.quotes.find(
+                    (quote) => quote.id === quoteDraft.id,
+                  );
+                  const timestamp = new Date().toISOString();
+                  const nextQuote = {
+                    ...quoteDraft,
+                    serviceDescription: quoteDraft.serviceDescription.trim(),
+                    notes: quoteDraft.notes.trim(),
+                    updatedAt: timestamp,
+                    statusHistory:
+                      existing && existing.status !== quoteDraft.status
+                        ? [
+                            ...existing.statusHistory,
+                            {
+                              id: crypto.randomUUID(),
+                              from: existing.status,
+                              to: quoteDraft.status,
+                              changedAt: timestamp,
+                            },
+                          ]
+                        : quoteDraft.statusHistory.length
+                          ? quoteDraft.statusHistory
+                          : [
+                              {
+                                id: crypto.randomUUID(),
+                                from: null,
+                                to: quoteDraft.status,
+                                changedAt: timestamp,
+                              },
+                            ],
+                  } satisfies Quote;
+                  setStore({
+                    ...store,
+                    quotes: saveQuote(store.quotes, nextQuote),
+                  });
+                  setQuoteDraft(null);
+                  setNotice("Estimate saved on this device.");
+                } catch (error) {
+                  setNotice((error as Error).message);
+                }
+              }}
+            >
+              <label className="field">
+                Service / job description
+                <input
+                  required
+                  value={quoteDraft.serviceDescription}
+                  onChange={(event) =>
+                    setQuoteDraft({
+                      ...quoteDraft,
+                      serviceDescription: event.target.value,
+                    })
+                  }
+                  placeholder="Driveway cleaning"
+                />
+              </label>
+              <label className="field">
+                Amount (USD)
+                <input
+                  required
+                  min="0.01"
+                  max="1000000"
+                  step="0.01"
+                  type="number"
+                  value={
+                    quoteDraft.amountCents
+                      ? (quoteDraft.amountCents / 100).toFixed(2)
+                      : ""
+                  }
+                  onChange={(event) => {
+                    const amount = Number(event.target.value);
+                    setQuoteDraft({
+                      ...quoteDraft,
+                      amountCents: Number.isFinite(amount)
+                        ? Math.round(amount * 100)
+                        : 0,
+                    });
+                  }}
+                  placeholder="250.00"
+                />
+              </label>
+              <label className="field">
+                Status
+                <select
+                  value={quoteDraft.status}
+                  onChange={(event) =>
+                    setQuoteDraft({
+                      ...quoteDraft,
+                      status: event.target.value as Quote["status"],
+                    })
+                  }
+                >
+                  <option value="draft">Draft</option>
+                  <option value="sent">Sent</option>
+                  <option value="accepted">Accepted</option>
+                  <option value="declined">Declined</option>
+                </select>
+              </label>
+              <label className="field">
+                Notes <span>(optional)</span>
+                <textarea
+                  rows={3}
+                  value={quoteDraft.notes}
+                  onChange={(event) =>
+                    setQuoteDraft({ ...quoteDraft, notes: event.target.value })
+                  }
+                />
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => setQuoteDraft(null)}
+                >
+                  Cancel
+                </button>
+                <button className="button primary" type="submit">
+                  <Check size={16} /> Save estimate
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
       {person && (
         <div className="modal-backdrop">
           <section
@@ -2684,6 +3007,80 @@ export default function Page() {
                   )}
                 </label>
               ))}
+              <section
+                className="customer-reminders"
+                aria-labelledby="quotes-heading"
+              >
+                <div className="customer-reminders-heading">
+                  <h3 id="quotes-heading">Quotes &amp; Estimates</h3>
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => {
+                      const timestamp = new Date().toISOString();
+                      setPerson(null);
+                      setQuoteDraft({
+                        id: crypto.randomUUID(),
+                        customerId: person.id,
+                        serviceDescription: "",
+                        amountCents: 0,
+                        currency: "USD",
+                        status: "draft",
+                        notes: "",
+                        createdAt: timestamp,
+                        updatedAt: timestamp,
+                        statusHistory: [],
+                      });
+                    }}
+                  >
+                    <Plus size={14} /> Add estimate
+                  </button>
+                </div>
+                {customerQuotes.length ? (
+                  <div className="customer-reminder-list">
+                    {customerQuotes.map((quote) => {
+                      const relatedReminders = store.tasks.filter(
+                        (task) => task.quoteId === quote.id,
+                      );
+                      return (
+                        <article className="customer-reminder" key={quote.id}>
+                          <div className="customer-reminder-copy">
+                            <strong>{quote.serviceDescription}</strong>
+                            <small>
+                              {quoteAmountLabel(quote.amountCents)} ·{" "}
+                              {quote.status}
+                            </small>
+                            {quote.notes && <small>{quote.notes}</small>}
+                            {relatedReminders.length > 0 && (
+                              <div className="quote-related-reminders">
+                                {relatedReminders.map((task) => (
+                                  <small key={task.id}>
+                                    Reminder: {task.title}
+                                  </small>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            className="button secondary"
+                            onClick={() => {
+                              setPerson(null);
+                              setQuoteDraft({ ...quote });
+                            }}
+                          >
+                            <Pencil size={14} /> Edit estimate
+                          </button>
+                        </article>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <p className="customer-reminders-empty">
+                    No estimates for this customer yet.
+                  </p>
+                )}
+              </section>
               <section
                 className="customer-reminders"
                 aria-labelledby="customer-reminders-heading"
