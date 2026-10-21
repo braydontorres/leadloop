@@ -92,6 +92,25 @@ import {
   calendarFromLegacy,
   resolveCalendarExpression,
 } from "../lib/calendar-expression";
+import { getSupabaseBrowserClient } from "../lib/cloud/supabase-browser";
+import {
+  createSupabaseWorkspaceRepository,
+  type CloudWorkspaceSummary,
+  type WorkspaceRepository,
+} from "../lib/cloud/repository";
+import {
+  currentAuth,
+  sendPasswordRecovery,
+  signInWithEmail,
+  signOut,
+  signUpWithEmail,
+  updatePassword,
+} from "../lib/cloud/auth";
+import {
+  importApprovedLocalWorkspace,
+  previewLocalCloudImport,
+} from "../lib/cloud/local-import";
+import type { CloudImportPreview } from "../lib/cloud/types";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -143,7 +162,32 @@ export default function Page() {
     [microphoneStarting, setMicrophoneStarting] = useState(false),
     [conversation, setConversation] = useState(emptyConversationState),
     [customerMemory, setCustomerMemory] = useState(emptyCustomerMemoryState),
-    [quoteMemory, setQuoteMemory] = useState(emptyQuoteMemoryState);
+    [quoteMemory, setQuoteMemory] = useState(emptyQuoteMemoryState),
+    [cloudClient] = useState(() => getSupabaseBrowserClient()),
+    [cloudRepository, setCloudRepository] =
+      useState<WorkspaceRepository | null>(null),
+    [cloudWorkspaceId, setCloudWorkspaceId] = useState<string | null>(null),
+    [cloudLoadedWorkspaceId, setCloudLoadedWorkspaceId] = useState<
+      string | null
+    >(null),
+    [cloudUserEmail, setCloudUserEmail] = useState(""),
+    [cloudWorkspaces, setCloudWorkspaces] = useState<CloudWorkspaceSummary[]>(
+      [],
+    ),
+    [cloudEmail, setCloudEmail] = useState(""),
+    [cloudPassword, setCloudPassword] = useState(""),
+    [cloudMode, setCloudMode] = useState<
+      "sign_in" | "sign_up" | "recover" | "new_password"
+    >("sign_in"),
+    [cloudBusy, setCloudBusy] = useState(false),
+    [cloudError, setCloudError] = useState(""),
+    [cloudSyncState, setCloudSyncState] = useState<
+      "idle" | "saving" | "saved" | "error"
+    >("idle"),
+    [cloudImportPreview, setCloudImportPreview] =
+      useState<CloudImportPreview | null>(null),
+    [newWorkspaceName, setNewWorkspaceName] = useState(""),
+    [newWorkspaceBusiness, setNewWorkspaceBusiness] = useState("");
   const recorderRef = useRef<MediaRecorder | null>(null);
   const discardRecordingRef = useRef(false);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -196,6 +240,11 @@ export default function Page() {
     quoteId: string;
   } | null>(null);
   const storeRef = useRef<Store | null>(store);
+  const localStoreRef = useRef<Store | null>(null);
+  const cloudSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const cloudLoadGenerationRef = useRef(0);
+  const cloudSyncGenerationRef = useRef(0);
+  const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
@@ -225,21 +274,95 @@ export default function Page() {
             setStorageError(true);
           }
         }
+        localStoreRef.current = migrated;
         setStore(migrated);
-      } else setStore(sampleStore());
+      } else {
+        const seeded = sampleStore();
+        localStoreRef.current = seeded;
+        setStore(seeded);
+      }
     } catch {
       setStorageError(true);
-      setStore(sampleStore());
+      const seeded = sampleStore();
+      localStoreRef.current = seeded;
+      setStore(seeded);
     }
   }, []);
   useEffect(() => {
-    if (!store || storageError) return;
+    if (!store || storageError || cloudWorkspaceId) return;
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      localStoreRef.current = store;
     } catch {
       setStorageError(true);
     }
-  }, [store, storageError]);
+  }, [store, storageError, cloudWorkspaceId]);
+  useEffect(() => {
+    if (!cloudClient) return;
+    const repository = createSupabaseWorkspaceRepository(cloudClient);
+    setCloudRepository(repository);
+    const refresh = async () => {
+      try {
+        const auth = await currentAuth(cloudClient);
+        setCloudUserEmail(auth.user?.email ?? "");
+        if (!auth.user) {
+          cloudSyncGenerationRef.current += 1;
+          if (cloudSyncTimerRef.current)
+            clearTimeout(cloudSyncTimerRef.current);
+          setCloudWorkspaces([]);
+          setCloudWorkspaceId(null);
+          setCloudLoadedWorkspaceId(null);
+          setCloudSyncState("idle");
+          const local = localStoreRef.current;
+          if (local) setStore(local);
+          return;
+        }
+        setCloudWorkspaces(await repository.listWorkspaces());
+      } catch (error) {
+        setCloudError((error as Error).message);
+      }
+    };
+    void refresh();
+    const { data } = cloudClient.auth.onAuthStateChange((event, session) => {
+      setCloudUserEmail(session?.user.email ?? "");
+      if (event === "PASSWORD_RECOVERY") setCloudMode("new_password");
+      void refresh();
+    });
+    return () => data.subscription.unsubscribe();
+  }, [cloudClient]);
+  useEffect(() => {
+    if (
+      !store ||
+      !cloudRepository ||
+      !cloudWorkspaceId ||
+      cloudLoadedWorkspaceId !== cloudWorkspaceId
+    )
+      return;
+    const generation = ++cloudSyncGenerationRef.current;
+    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    setCloudSyncState("saving");
+    cloudSyncTimerRef.current = setTimeout(() => {
+      const save = async () => {
+        try {
+          await cloudRepository.saveStore(cloudWorkspaceId, store);
+          if (generation === cloudSyncGenerationRef.current)
+            setCloudSyncState("saved");
+        } catch (error) {
+          if (generation !== cloudSyncGenerationRef.current) return;
+          setCloudSyncState("error");
+          setCloudError(`Cloud save failed: ${(error as Error).message}`);
+        }
+      };
+      // Serialize snapshots. A delayed earlier request can never finish after
+      // a newer snapshot and restore stale customer, quote, or task data.
+      cloudSaveQueueRef.current = cloudSaveQueueRef.current
+        .catch(() => undefined)
+        .then(save);
+    }, 350);
+    return () => {
+      if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    };
+  }, [store, cloudRepository, cloudWorkspaceId, cloudLoadedWorkspaceId]);
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(""), 4500);
@@ -367,6 +490,150 @@ export default function Page() {
     setSearch("");
     setMenu(false);
   };
+  const activateCloudWorkspace = async (workspaceId: string) => {
+    if (!cloudRepository) return;
+    const generation = ++cloudLoadGenerationRef.current;
+    cloudSyncGenerationRef.current += 1;
+    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    setCloudBusy(true);
+    setCloudError("");
+    setCloudLoadedWorkspaceId(null);
+    try {
+      const cloudStore = await cloudRepository.loadStore(workspaceId);
+      if (generation !== cloudLoadGenerationRef.current) return;
+      setStore(cloudStore);
+      storeRef.current = cloudStore;
+      setCloudWorkspaceId(workspaceId);
+      setCloudLoadedWorkspaceId(workspaceId);
+      setCloudImportPreview(null);
+      setCloudSyncState("saved");
+      setNotice(
+        "Cloud workspace loaded. Local browser data was left unchanged.",
+      );
+    } catch (error) {
+      setCloudError(
+        `Could not load this workspace: ${(error as Error).message}`,
+      );
+    } finally {
+      if (generation === cloudLoadGenerationRef.current) setCloudBusy(false);
+    }
+  };
+  const submitCloudAuth = async () => {
+    if (!cloudClient) return;
+    setCloudBusy(true);
+    setCloudError("");
+    try {
+      const redirectTo = window.location.origin;
+      if (cloudMode === "sign_up") {
+        await signUpWithEmail(
+          cloudClient,
+          cloudEmail.trim(),
+          cloudPassword,
+          redirectTo,
+        );
+        setNotice("Check your email to confirm your account, then sign in.");
+      } else if (cloudMode === "recover") {
+        await sendPasswordRecovery(cloudClient, cloudEmail.trim(), redirectTo);
+        setNotice(
+          "Password reset email sent. Open it in this browser to choose a new password.",
+        );
+      } else if (cloudMode === "new_password") {
+        await updatePassword(cloudClient, cloudPassword);
+        setCloudMode("sign_in");
+        setCloudPassword("");
+        setNotice(
+          "Password updated. You can continue with your cloud workspace.",
+        );
+      } else {
+        await signInWithEmail(cloudClient, cloudEmail.trim(), cloudPassword);
+        setCloudPassword("");
+      }
+    } catch (error) {
+      setCloudError((error as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+  const createCloudWorkspace = async () => {
+    if (!cloudRepository) return;
+    setCloudBusy(true);
+    setCloudError("");
+    try {
+      const created = await cloudRepository.createWorkspace({
+        name: newWorkspaceName || newWorkspaceBusiness || "LeadLoop workspace",
+        businessName: newWorkspaceBusiness,
+        ownerName: store?.name ?? "",
+      });
+      setCloudWorkspaces(await cloudRepository.listWorkspaces());
+      await activateCloudWorkspace(created.id);
+    } catch (error) {
+      setCloudError((error as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+  const previewCloudImport = async () => {
+    const local = localStoreRef.current;
+    if (!local) return;
+    try {
+      setCloudImportPreview(await previewLocalCloudImport(local));
+      setCloudError("");
+    } catch (error) {
+      setCloudError((error as Error).message);
+    }
+  };
+  const confirmCloudImport = async () => {
+    const local = localStoreRef.current;
+    if (!local || !cloudRepository || !cloudWorkspaceId || !cloudImportPreview)
+      return;
+    if (
+      !window.confirm(
+        "Import this preview into the selected cloud workspace? Browser data will remain on this device.",
+      )
+    )
+      return;
+    setCloudBusy(true);
+    setCloudError("");
+    try {
+      const outcome = await importApprovedLocalWorkspace({
+        storage: localStorage,
+        workspaceId: cloudWorkspaceId,
+        store: local,
+        approved: true,
+        gateway: cloudRepository,
+      });
+      await activateCloudWorkspace(cloudWorkspaceId);
+      setNotice(
+        outcome.result.duplicate
+          ? "This browser backup was already imported and verified."
+          : "Local data imported and verified in the cloud workspace.",
+      );
+      setCloudImportPreview(null);
+    } catch (error) {
+      setCloudError((error as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
+  const leaveCloudAccount = async () => {
+    if (!cloudClient) return;
+    setCloudBusy(true);
+    try {
+      await signOut(cloudClient);
+      cloudSyncGenerationRef.current += 1;
+      if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+      const local = localStoreRef.current;
+      setCloudWorkspaceId(null);
+      setCloudLoadedWorkspaceId(null);
+      setCloudWorkspaces([]);
+      if (local) setStore(local);
+      setNotice("Signed out. Your browser-local workspace is available again.");
+    } catch (error) {
+      setCloudError((error as Error).message);
+    } finally {
+      setCloudBusy(false);
+    }
+  };
   const newTask = () =>
     setDraft({
       id: crypto.randomUUID(),
@@ -439,7 +706,11 @@ export default function Page() {
       });
       setDraft(null);
       setText("");
-      setNotice("Task saved on this device.");
+      setNotice(
+        cloudWorkspaceId
+          ? "Reminder queued for cloud save."
+          : "Task saved on this device.",
+      );
     } catch (e) {
       setNotice((e as Error).message);
     }
@@ -545,6 +816,11 @@ export default function Page() {
     }
   };
   const commitLocalStore = (next: Store) => {
+    if (cloudWorkspaceId) {
+      storeRef.current = next;
+      setStore(next);
+      return true;
+    }
     if (persistStore(localStorage, next)) {
       storeRef.current = next;
       setStore(next);
@@ -577,7 +853,11 @@ export default function Page() {
         quotes: saveQuote(currentStore.quotes, transition.savedQuote),
       };
       if (!commitLocalStore(nextStore)) return true;
-      setNotice("Estimate saved on this device.");
+      setNotice(
+        cloudWorkspaceId
+          ? "Estimate queued for cloud save."
+          : "Estimate saved on this device.",
+      );
     }
     quoteMemoryRef.current = transition.state;
     setQuoteMemory(transition.state);
@@ -649,7 +929,11 @@ export default function Page() {
       if (!commitLocalStore(nextStore)) return true;
       customerMemoryRef.current = transition.state;
       setCustomerMemory(transition.state);
-      setNotice("Customer information saved on this device.");
+      setNotice(
+        cloudWorkspaceId
+          ? "Customer change queued for cloud save."
+          : "Customer information saved on this device.",
+      );
     } else {
       customerMemoryRef.current = transition.state;
       setCustomerMemory(transition.state);
@@ -771,7 +1055,12 @@ export default function Page() {
           turnId,
         );
       }
-      if (transition.savedTask) setNotice("Reminder saved on this device.");
+      if (transition.savedTask)
+        setNotice(
+          cloudWorkspaceId
+            ? "Reminder queued for cloud save."
+            : "Reminder saved on this device.",
+        );
     } catch (error) {
       setVoiceError((error as Error).message);
     }
@@ -1231,7 +1520,6 @@ export default function Page() {
     void startRecording(activeSessionIdRef.current);
   };
   const startRecording = async (sessionId = activeSessionIdRef.current) => {
-    setVoiceError("");
     setDemoMode(false);
     if (
       !sessionActiveRef.current ||
@@ -1570,7 +1858,7 @@ export default function Page() {
           <div className="header-right">
             <span className="demo-badge">
               <span />
-              Local demo
+              {cloudWorkspaceId ? "Cloud workspace" : "Local demo"}
             </span>
             <button
               aria-label="View reminders"
@@ -2532,26 +2820,260 @@ export default function Page() {
                     <small>New workspaces use Monday through Friday.</small>
                   </section>
                   <section className="card settings-card">
+                    <h2>Cloud account</h2>
+                    {!cloudClient && (
+                      <div className="status-line">
+                        <ShieldCheck size={20} />
+                        <span>
+                          <strong>Local demo workspace</strong>
+                          <p>
+                            Add the Supabase URL and publishable anon key to
+                            enable optional private cloud accounts. Your browser
+                            data stays on this device until you explicitly
+                            import it.
+                          </p>
+                        </span>
+                      </div>
+                    )}
+                    {cloudClient &&
+                      (!cloudUserEmail || cloudMode === "new_password") && (
+                        <>
+                          <p>
+                            Sign in to use an authenticated workspace. LeadLoop
+                            never sends browser data to the cloud until you
+                            approve an import.
+                          </p>
+                          {cloudMode !== "new_password" && (
+                            <label className="field">
+                              Email
+                              <input
+                                type="email"
+                                value={cloudEmail}
+                                onChange={(event) =>
+                                  setCloudEmail(event.target.value)
+                                }
+                                autoComplete="email"
+                              />
+                            </label>
+                          )}
+                          {cloudMode !== "recover" && (
+                            <label className="field">
+                              Password
+                              <input
+                                type="password"
+                                value={cloudPassword}
+                                onChange={(event) =>
+                                  setCloudPassword(event.target.value)
+                                }
+                                autoComplete={
+                                  cloudMode === "sign_up"
+                                    ? "new-password"
+                                    : "current-password"
+                                }
+                              />
+                            </label>
+                          )}
+                          <button
+                            className="button"
+                            disabled={
+                              cloudBusy ||
+                              (cloudMode !== "new_password" && !cloudEmail) ||
+                              (cloudMode !== "recover" &&
+                                cloudPassword.length < 8)
+                            }
+                            onClick={submitCloudAuth}
+                          >
+                            {cloudBusy
+                              ? "Working…"
+                              : cloudMode === "sign_up"
+                                ? "Create account"
+                                : cloudMode === "recover"
+                                  ? "Send reset email"
+                                  : cloudMode === "new_password"
+                                    ? "Set new password"
+                                    : "Sign in"}
+                          </button>
+                          {cloudMode !== "new_password" && (
+                            <div className="modal-actions">
+                              <button
+                                className="text-link"
+                                onClick={() =>
+                                  setCloudMode(
+                                    cloudMode === "sign_in"
+                                      ? "sign_up"
+                                      : "sign_in",
+                                  )
+                                }
+                              >
+                                {cloudMode === "sign_in"
+                                  ? "Create an account"
+                                  : "I already have an account"}
+                              </button>
+                              <button
+                                className="text-link"
+                                onClick={() => setCloudMode("recover")}
+                              >
+                                Forgot password?
+                              </button>
+                            </div>
+                          )}
+                          {cloudError && (
+                            <p className="error-message" role="alert">
+                              {cloudError}
+                            </p>
+                          )}
+                        </>
+                      )}
+                    {cloudClient &&
+                      cloudUserEmail &&
+                      cloudMode !== "new_password" && (
+                        <>
+                          <p>
+                            Signed in as <strong>{cloudUserEmail}</strong>.
+                          </p>
+                          {cloudWorkspaces.length > 0 && (
+                            <label className="field">
+                              Cloud workspace
+                              <select
+                                value={cloudWorkspaceId ?? ""}
+                                onChange={(event) =>
+                                  event.target.value &&
+                                  void activateCloudWorkspace(
+                                    event.target.value,
+                                  )
+                                }
+                              >
+                                <option value="">Choose a workspace</option>
+                                {cloudWorkspaces.map((workspace) => (
+                                  <option
+                                    key={workspace.id}
+                                    value={workspace.id}
+                                  >
+                                    {workspace.businessName || workspace.name} ·{" "}
+                                    {workspace.role}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                          )}
+                          {!cloudWorkspaceId && (
+                            <>
+                              <label className="field">
+                                Workspace name
+                                <input
+                                  value={newWorkspaceName}
+                                  onChange={(event) =>
+                                    setNewWorkspaceName(event.target.value)
+                                  }
+                                  placeholder="LeadLoop workspace"
+                                />
+                              </label>
+                              <label className="field">
+                                Business name
+                                <input
+                                  value={newWorkspaceBusiness}
+                                  onChange={(event) =>
+                                    setNewWorkspaceBusiness(event.target.value)
+                                  }
+                                  placeholder="My business"
+                                />
+                              </label>
+                              <button
+                                className="button"
+                                disabled={cloudBusy}
+                                onClick={createCloudWorkspace}
+                              >
+                                {cloudBusy ? "Creating…" : "Create workspace"}
+                              </button>
+                            </>
+                          )}
+                          {cloudWorkspaceId && (
+                            <>
+                              <div className="status-line">
+                                <ShieldCheck size={20} />
+                                <span>
+                                  <strong>Cloud sync · {cloudSyncState}</strong>
+                                  <p>
+                                    {cloudSyncState === "saving"
+                                      ? "Saving changes securely…"
+                                      : cloudSyncState === "error"
+                                        ? "A cloud save failed. Your visible change has not been confirmed as saved."
+                                        : "Customers, estimates, reminders, and preferences use this workspace."}
+                                  </p>
+                                </span>
+                              </div>
+                              {cloudWorkspaces.find(
+                                (workspace) =>
+                                  workspace.id === cloudWorkspaceId,
+                              )?.role === "owner" ? (
+                                <button
+                                  className="button secondary"
+                                  disabled={cloudBusy}
+                                  onClick={previewCloudImport}
+                                >
+                                  Preview local-data import
+                                </button>
+                              ) : (
+                                <p>
+                                  Only this workspace’s owner can import
+                                  browser-local data.
+                                </p>
+                              )}
+                              {cloudImportPreview && (
+                                <div className="status-line">
+                                  <Download size={20} />
+                                  <span>
+                                    <strong>Import preview</strong>
+                                    <p>
+                                      {cloudImportPreview.counts.customers}{" "}
+                                      customers,{" "}
+                                      {cloudImportPreview.counts.quotes}{" "}
+                                      estimates, and{" "}
+                                      {cloudImportPreview.counts.tasks}{" "}
+                                      reminders.{" "}
+                                      {cloudImportPreview.errors.join(" ") ||
+                                        cloudImportPreview.warnings.join(" ") ||
+                                        "IDs and links are ready for review."}
+                                    </p>
+                                    <button
+                                      className="button"
+                                      disabled={
+                                        cloudBusy ||
+                                        cloudImportPreview.errors.length > 0
+                                      }
+                                      onClick={confirmCloudImport}
+                                    >
+                                      Approve and import
+                                    </button>
+                                  </span>
+                                </div>
+                              )}
+                            </>
+                          )}
+                          {cloudError && (
+                            <p className="error-message" role="alert">
+                              {cloudError}
+                            </p>
+                          )}
+                          <button
+                            className="text-link"
+                            disabled={cloudBusy}
+                            onClick={leaveCloudAccount}
+                          >
+                            Sign out
+                          </button>
+                        </>
+                      )}
+                  </section>
+                  <section className="card settings-card">
                     <h2>Accounts & reminders</h2>
-                    <div className="status-line">
-                      <ShieldCheck size={20} />
-                      <span>
-                        <strong>Local demo workspace</strong>
-                        <p>
-                          Customer records, notes, and reminders are stored in
-                          this browser only. There is no sign-in or cloud backup
-                          yet; use sample information on shared devices.
-                        </p>
-                      </span>
-                    </div>
                     <div className="status-line">
                       <Bell size={20} />
                       <span>
                         <strong>Email reminders · Not connected</strong>
                         <p>
                           Tasks are saved, but notifications will not be sent.
-                          Authentication and scheduled delivery are planned for
-                          Phases 3–4.
+                          Scheduled delivery is a later phase.
                         </p>
                       </span>
                     </div>
@@ -2842,7 +3364,11 @@ export default function Page() {
                     quotes: saveQuote(store.quotes, nextQuote),
                   });
                   setQuoteDraft(null);
-                  setNotice("Estimate saved on this device.");
+                  setNotice(
+                    cloudWorkspaceId
+                      ? "Estimate queued for cloud save."
+                      : "Estimate saved on this device.",
+                  );
                 } catch (error) {
                   setNotice((error as Error).message);
                 }

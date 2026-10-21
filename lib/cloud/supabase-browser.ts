@@ -9,7 +9,11 @@ export function readSupabaseBrowserConfig(
   env: Record<string, string | undefined> = process.env,
 ): SupabaseBrowserConfig | null {
   const url = env.NEXT_PUBLIC_SUPABASE_URL?.trim();
-  const anonKey = env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  // Supabase calls this the publishable key in newer projects; older projects
+  // expose the same browser-safe credential as an anon key.
+  const anonKey =
+    env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim() ||
+    env.NEXT_PUBLIC_SUPABASE_ANON_KEY?.trim();
   if (!url || !anonKey) return null;
   try {
     new URL(url);
