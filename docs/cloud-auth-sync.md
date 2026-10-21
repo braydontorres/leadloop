@@ -6,11 +6,13 @@ LeadLoop can run in either browser-local mode or authenticated cloud mode. It re
 
 1. In the Supabase project, enable Email auth and Email confirmation.
 2. Add the web origins to Authentication URL Configuration, including `http://localhost:3000` for development and the production site URL when it exists.
-3. Apply the already-deployed cloud foundation migration first, followed by the new Phase 3A.2 migration:
+3. Apply the already-deployed cloud foundation migration, the Phase 3A.2 migration, and the additive authenticated-role grant migration `20261022000000_authenticated_workspace_grants.sql`:
 
    ```bash
    supabase db push
    ```
+
+   The grant migration is required even though Row Level Security is already enabled: PostgreSQL must grant the `authenticated` role table access before RLS can evaluate its workspace policies. It grants no bypass of RLS, and keeps workspace creation in the `create_workspace` RPC.
 
 4. Create `.env.local` in the web project (do not commit it):
 
