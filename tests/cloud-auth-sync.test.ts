@@ -16,7 +16,15 @@ import {
   cloudRecordRemovals,
   storeFromCloudRows,
   storeToCloudRows,
+  type CloudWorkspaceSummary,
 } from "../lib/cloud/repository";
+
+import {
+  chooseWorkspaceRestoreTarget,
+  clearSelectedCloudWorkspace,
+  readSelectedCloudWorkspace,
+  saveSelectedCloudWorkspace,
+} from "../lib/cloud/workspace-selection";
 import {
   getSupabaseBrowserClient,
   getSupabaseBrowserConfigurationError,
@@ -353,4 +361,82 @@ test("cloud deletion candidates are limited to records this browser loaded", () 
     history: [],
     tasks: ["loaded-task"],
   });
+});
+
+function selectionStorage({ fail = false }: { fail?: boolean } = {}) {
+  const values = new Map<string, string>();
+  return {
+    getItem(key: string) {
+      if (fail) throw new Error("storage unavailable");
+      return values.get(key) ?? null;
+    },
+    setItem(key: string, value: string) {
+      if (fail) throw new Error("storage unavailable");
+      values.set(key, value);
+    },
+    removeItem(key: string) {
+      if (fail) throw new Error("storage unavailable");
+      values.delete(key);
+    },
+  };
+}
+
+const workspace = (id: string): CloudWorkspaceSummary => ({
+  id,
+  name: id,
+  businessName: id,
+  ownerName: "Owner",
+  role: "owner",
+});
+
+test("cloud workspace selection is scoped to the authenticated user across refresh and account switching", () => {
+  const storage = selectionStorage();
+  saveSelectedCloudWorkspace(storage, "user-a", "workspace-a");
+  saveSelectedCloudWorkspace(storage, "user-b", "workspace-b");
+
+  assert.equal(readSelectedCloudWorkspace(storage, "user-a"), "workspace-a");
+  assert.equal(readSelectedCloudWorkspace(storage, "user-b"), "workspace-b");
+  assert.deepEqual(
+    chooseWorkspaceRestoreTarget([workspace("workspace-a")], "workspace-a"),
+    { kind: "saved", workspaceId: "workspace-a" },
+  );
+  assert.deepEqual(
+    chooseWorkspaceRestoreTarget([workspace("workspace-b")], "workspace-a"),
+    { kind: "only_workspace", workspaceId: "workspace-b" },
+  );
+});
+
+test("cloud restore selects exactly one authorized workspace and never guesses among several", () => {
+  assert.deepEqual(chooseWorkspaceRestoreTarget([workspace("only")], null), {
+    kind: "only_workspace",
+    workspaceId: "only",
+  });
+  assert.deepEqual(
+    chooseWorkspaceRestoreTarget(
+      [workspace("first"), workspace("second")],
+      null,
+    ),
+    { kind: "selection_required" },
+  );
+  assert.deepEqual(
+    chooseWorkspaceRestoreTarget(
+      [workspace("first"), workspace("second")],
+      "revoked-workspace",
+    ),
+    { kind: "selection_required" },
+  );
+});
+
+test("revoked selections are removable while unavailable storage cannot block cloud restoration", () => {
+  const storage = selectionStorage();
+  saveSelectedCloudWorkspace(storage, "user-a", "revoked-workspace");
+  clearSelectedCloudWorkspace(storage, "user-a");
+  assert.equal(readSelectedCloudWorkspace(storage, "user-a"), null);
+
+  const unavailable = selectionStorage({ fail: true });
+  assert.doesNotThrow(() =>
+    saveSelectedCloudWorkspace(unavailable, "user-a", "workspace-a"),
+  );
+  assert.equal(readSelectedCloudWorkspace(unavailable, "user-a"), null);
+  assert.doesNotThrow(() => clearSelectedCloudWorkspace(unavailable, "user-a"));
 });

@@ -117,6 +117,12 @@ import {
   previewLocalCloudImport,
 } from "../lib/cloud/local-import";
 import type { CloudImportPreview } from "../lib/cloud/types";
+import {
+  chooseWorkspaceRestoreTarget,
+  clearSelectedCloudWorkspace,
+  readSelectedCloudWorkspace,
+  saveSelectedCloudWorkspace,
+} from "../lib/cloud/workspace-selection";
 type Screen = "Home" | "Capture" | "Tasks" | "People" | "Settings";
 const nav = [
   { name: "Home", icon: Home },
@@ -180,6 +186,7 @@ export default function Page() {
       string | null
     >(null),
     [cloudUserEmail, setCloudUserEmail] = useState(""),
+    [cloudRestoring, setCloudRestoring] = useState(Boolean(cloudClient)),
     [cloudWorkspaces, setCloudWorkspaces] = useState<CloudWorkspaceSummary[]>(
       [],
     ),
@@ -252,9 +259,83 @@ export default function Page() {
   const localStoreRef = useRef<Store | null>(null);
   const cloudSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cloudLoadGenerationRef = useRef(0);
+  const cloudAuthGenerationRef = useRef(0);
   const cloudSyncGenerationRef = useRef(0);
+  const cloudUserIdRef = useRef("");
+  const cloudLoadedWorkspaceIdRef = useRef<string | null>(null);
+  const cloudSkipNextSaveRef = useRef<string | null>(null);
   const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const cloudBaselineStoreRef = useRef<Store | null>(null);
+  const activateCloudWorkspace = async (
+    workspaceId: string,
+    options: {
+      repository?: WorkspaceRepository | null;
+      userId?: string;
+      authGeneration?: number;
+      announce?: boolean;
+    } = {},
+  ) => {
+    const repository = options.repository ?? cloudRepository;
+    const userId = options.userId ?? cloudUserIdRef.current;
+    if (
+      !repository ||
+      !userId ||
+      (options.authGeneration !== undefined &&
+        options.authGeneration !== cloudAuthGenerationRef.current)
+    )
+      return false;
+    const generation = ++cloudLoadGenerationRef.current;
+    const previousLoadedWorkspaceId = cloudLoadedWorkspaceIdRef.current;
+    cloudSyncGenerationRef.current += 1;
+    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    setCloudBusy(true);
+    setCloudError("");
+    cloudLoadedWorkspaceIdRef.current = null;
+    setCloudLoadedWorkspaceId(null);
+    try {
+      const cloudStore = await repository.loadStore(workspaceId);
+      if (
+        generation !== cloudLoadGenerationRef.current ||
+        cloudUserIdRef.current !== userId ||
+        (options.authGeneration !== undefined &&
+          options.authGeneration !== cloudAuthGenerationRef.current)
+      )
+        return false;
+      cloudBaselineStoreRef.current = cloudStore;
+      cloudSkipNextSaveRef.current = workspaceId;
+      cloudLoadedWorkspaceIdRef.current = workspaceId;
+      setCloudWorkspaceId(workspaceId);
+      setCloudLoadedWorkspaceId(workspaceId);
+      setStore(cloudStore);
+      storeRef.current = cloudStore;
+      setCloudImportPreview(null);
+      setCloudSyncState("saved");
+      saveSelectedCloudWorkspace(localStorage, userId, workspaceId);
+      if (options.announce !== false)
+        setNotice(
+          "Cloud workspace loaded. Local browser data was left unchanged.",
+        );
+      return true;
+    } catch (error) {
+      if (
+        generation === cloudLoadGenerationRef.current &&
+        cloudUserIdRef.current === userId &&
+        (options.authGeneration === undefined ||
+          options.authGeneration === cloudAuthGenerationRef.current)
+      ) {
+        // A failed manual switch leaves the previously loaded cloud store
+        // authoritative instead of exposing a half-selected workspace.
+        cloudLoadedWorkspaceIdRef.current = previousLoadedWorkspaceId;
+        setCloudLoadedWorkspaceId(previousLoadedWorkspaceId);
+        setCloudError(
+          `Could not load this workspace: ${(error as Error).message}`,
+        );
+      }
+      return false;
+    } finally {
+      if (generation === cloudLoadGenerationRef.current) setCloudBusy(false);
+    }
+  };
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
@@ -373,31 +454,125 @@ export default function Page() {
     if (!cloudClient) return;
     const repository = createSupabaseWorkspaceRepository(cloudClient);
     setCloudRepository(repository);
+    const returnToLocalWorkspace = () => {
+      cloudLoadGenerationRef.current += 1;
+      cloudSyncGenerationRef.current += 1;
+      if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+      cloudBaselineStoreRef.current = null;
+      cloudSkipNextSaveRef.current = null;
+      setCloudWorkspaces([]);
+      cloudLoadedWorkspaceIdRef.current = null;
+      setCloudWorkspaceId(null);
+      setCloudLoadedWorkspaceId(null);
+      setCloudSyncState("idle");
+      const local = localStoreRef.current;
+      if (local) setStore(local);
+    };
     const refresh = async () => {
+      const generation = ++cloudAuthGenerationRef.current;
+      setCloudRestoring(true);
       try {
         const auth = await currentAuth(cloudClient);
-        setCloudUserEmail(auth.user?.email ?? "");
-        if (!auth.user) {
-          cloudSyncGenerationRef.current += 1;
-          if (cloudSyncTimerRef.current)
-            clearTimeout(cloudSyncTimerRef.current);
-          setCloudWorkspaces([]);
-          setCloudWorkspaceId(null);
-          setCloudLoadedWorkspaceId(null);
-          cloudBaselineStoreRef.current = null;
-          setCloudSyncState("idle");
-          const local = localStoreRef.current;
-          if (local) setStore(local);
+        if (generation !== cloudAuthGenerationRef.current) return;
+        const user = auth.user;
+        if (!user) {
+          cloudUserIdRef.current = "";
+          setCloudUserEmail("");
+          returnToLocalWorkspace();
           return;
         }
-        setCloudWorkspaces(await repository.listWorkspaces());
+        const isDifferentUser = cloudUserIdRef.current !== user.id;
+        if (isDifferentUser) returnToLocalWorkspace();
+        cloudUserIdRef.current = user.id;
+        setCloudUserEmail(user.email ?? "");
+        const workspaces = await repository.listWorkspaces();
+        if (
+          generation !== cloudAuthGenerationRef.current ||
+          cloudUserIdRef.current !== user.id
+        )
+          return;
+        setCloudWorkspaces(workspaces);
+        const savedWorkspaceId = readSelectedCloudWorkspace(
+          localStorage,
+          user.id,
+        );
+        const target = chooseWorkspaceRestoreTarget(
+          workspaces,
+          savedWorkspaceId,
+        );
+        if (target.kind !== "selection_required") {
+          const restored = await activateCloudWorkspace(target.workspaceId, {
+            repository,
+            userId: user.id,
+            authGeneration: generation,
+            announce: false,
+          });
+          if (!restored && generation === cloudAuthGenerationRef.current) {
+            // A load can fail after the membership list was read. Check once
+            // more before clearing the preference: a transient network error
+            // keeps the remembered workspace available for a later retry.
+            try {
+              const currentWorkspaces = await repository.listWorkspaces();
+              if (generation !== cloudAuthGenerationRef.current) return;
+              setCloudWorkspaces(currentWorkspaces);
+              if (
+                !currentWorkspaces.some(
+                  (workspace) => workspace.id === target.workspaceId,
+                )
+              ) {
+                clearSelectedCloudWorkspace(localStorage, user.id);
+                const fallback = chooseWorkspaceRestoreTarget(
+                  currentWorkspaces,
+                  null,
+                );
+                if (fallback.kind !== "selection_required") {
+                  await activateCloudWorkspace(fallback.workspaceId, {
+                    repository,
+                    userId: user.id,
+                    authGeneration: generation,
+                    announce: false,
+                  });
+                  return;
+                }
+                returnToLocalWorkspace();
+                cloudUserIdRef.current = user.id;
+                setCloudUserEmail(user.email ?? "");
+                setCloudWorkspaces(currentWorkspaces);
+                setNotice(
+                  "Your previous cloud workspace is no longer available. Choose an authorized workspace.",
+                );
+              }
+            } catch {
+              // The original load error remains visible. Do not erase a valid
+              // remembered choice when the follow-up authorization check fails.
+            }
+            setScreen("Settings");
+          }
+          return;
+        }
+        if (savedWorkspaceId)
+          clearSelectedCloudWorkspace(localStorage, user.id);
+        returnToLocalWorkspace();
+        cloudUserIdRef.current = user.id;
+        setCloudUserEmail(user.email ?? "");
+        setCloudWorkspaces(workspaces);
+        setScreen("Settings");
+        if (savedWorkspaceId)
+          setNotice(
+            "Your previous cloud workspace is no longer available. Choose an authorized workspace.",
+          );
       } catch (error) {
-        setCloudError((error as Error).message);
+        if (generation === cloudAuthGenerationRef.current)
+          setCloudError(
+            `Could not restore cloud workspaces: ${(error as Error).message}`,
+          );
+      } finally {
+        if (generation === cloudAuthGenerationRef.current)
+          setCloudRestoring(false);
       }
     };
     void refresh();
-    const { data } = cloudClient.auth.onAuthStateChange((event, session) => {
-      setCloudUserEmail(session?.user.email ?? "");
+    const { data } = cloudClient.auth.onAuthStateChange((event) => {
       if (event === "PASSWORD_RECOVERY") setCloudMode("new_password");
       void refresh();
     });
@@ -407,10 +582,15 @@ export default function Page() {
     if (
       !store ||
       !cloudRepository ||
+      cloudRestoring ||
       !cloudWorkspaceId ||
       cloudLoadedWorkspaceId !== cloudWorkspaceId
     )
       return;
+    if (cloudSkipNextSaveRef.current === cloudWorkspaceId) {
+      cloudSkipNextSaveRef.current = null;
+      return;
+    }
     const generation = ++cloudSyncGenerationRef.current;
     const baseline = cloudBaselineStoreRef.current;
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
@@ -438,7 +618,13 @@ export default function Page() {
     return () => {
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     };
-  }, [store, cloudRepository, cloudWorkspaceId, cloudLoadedWorkspaceId]);
+  }, [
+    store,
+    cloudRepository,
+    cloudRestoring,
+    cloudWorkspaceId,
+    cloudLoadedWorkspaceId,
+  ]);
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(""), 4500);
@@ -508,11 +694,15 @@ export default function Page() {
       recorderRef.current?.stream.getTracks().forEach((track) => track.stop());
     };
   }, []);
-  if (!store)
+  if (!store || cloudRestoring)
     return (
-      <main className="loading">
+      <main className="loading" aria-live="polite">
         <AudioLines size={32} />
-        <p>Getting your day ready…</p>
+        <p>
+          {cloudRestoring
+            ? "Restoring your cloud workspace…"
+            : "Getting your day ready…"}
+        </p>
       </main>
     );
   const timezone = store.timezone,
@@ -565,35 +755,6 @@ export default function Page() {
     setScreen(s);
     setSearch("");
     setMenu(false);
-  };
-  const activateCloudWorkspace = async (workspaceId: string) => {
-    if (!cloudRepository) return;
-    const generation = ++cloudLoadGenerationRef.current;
-    cloudSyncGenerationRef.current += 1;
-    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
-    setCloudBusy(true);
-    setCloudError("");
-    setCloudLoadedWorkspaceId(null);
-    try {
-      const cloudStore = await cloudRepository.loadStore(workspaceId);
-      if (generation !== cloudLoadGenerationRef.current) return;
-      setStore(cloudStore);
-      storeRef.current = cloudStore;
-      cloudBaselineStoreRef.current = cloudStore;
-      setCloudWorkspaceId(workspaceId);
-      setCloudLoadedWorkspaceId(workspaceId);
-      setCloudImportPreview(null);
-      setCloudSyncState("saved");
-      setNotice(
-        "Cloud workspace loaded. Local browser data was left unchanged.",
-      );
-    } catch (error) {
-      setCloudError(
-        `Could not load this workspace: ${(error as Error).message}`,
-      );
-    } finally {
-      if (generation === cloudLoadGenerationRef.current) setCloudBusy(false);
-    }
   };
   const submitCloudAuth = async () => {
     if (!cloudClient) return;
@@ -701,13 +862,20 @@ export default function Page() {
     setCloudBusy(true);
     try {
       await signOut(cloudClient);
+      cloudAuthGenerationRef.current += 1;
+      cloudLoadGenerationRef.current += 1;
       cloudSyncGenerationRef.current += 1;
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
-      const local = localStoreRef.current;
+      cloudUserIdRef.current = "";
+      cloudBaselineStoreRef.current = null;
+      cloudSkipNextSaveRef.current = null;
+      setCloudUserEmail("");
+      cloudLoadedWorkspaceIdRef.current = null;
       setCloudWorkspaceId(null);
       setCloudLoadedWorkspaceId(null);
       setCloudWorkspaces([]);
-      cloudBaselineStoreRef.current = null;
+      setCloudSyncState("idle");
+      const local = localStoreRef.current;
       if (local) setStore(local);
       setNotice("Signed out. Your browser-local workspace is available again.");
     } catch (error) {
