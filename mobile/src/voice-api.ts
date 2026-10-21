@@ -1,6 +1,14 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { File } from "expo-file-system";
+import { fetch as expoFetch } from "expo/fetch";
 import type { IntentResult } from "../../lib/conversation-machine";
 import { mobileVoiceConfig } from "./config";
+import {
+  isVoiceTimeout,
+  voiceHttpError,
+  voiceTimeoutError,
+} from "./voice-response";
+import { appendExpoAudioFile } from "./voice-upload";
 
 const config = mobileVoiceConfig(process.env);
 const REQUEST_TIMEOUT_MS = 35_000;
@@ -29,15 +37,14 @@ export async function uploadMobileVoiceTurn(input: {
   body.append("timeZone", input.timeZone);
   body.append("durationMs", String(Math.max(0, Math.round(input.durationMs))));
   body.append("context", JSON.stringify(input.context));
-  body.append("audio", {
-    uri: input.audioUri,
-    name: "leadloop-voice-turn.m4a",
-    type: "audio/m4a",
-  } as unknown as Blob);
+  const audioFile = new File(input.audioUri);
+  appendExpoAudioFile(body, audioFile);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(`${config.apiBaseUrl}/api/mobile/voice`, {
+    // Expo's fetch recognizes FileSystem File and generates the multipart
+    // boundary itself. Do not set Content-Type manually.
+    const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/voice`, {
       method: "POST",
       headers: { Authorization: `Bearer ${data.session.access_token}` },
       body,
@@ -50,12 +57,10 @@ export async function uploadMobileVoiceTurn(input: {
       result?: IntentResult;
     };
     if (!response.ok) {
-      const retry = payload.retryAfterSeconds
-        ? ` Try again in ${payload.retryAfterSeconds} seconds.`
-        : "";
-      throw new Error(
-        (payload.error || "LeadLoop could not process that recording.") + retry,
-      );
+      throw voiceHttpError({
+        message: payload.error,
+        retryAfterSeconds: payload.retryAfterSeconds,
+      });
     }
     if (!payload.transcript || !payload.result)
       throw new Error(
@@ -63,10 +68,7 @@ export async function uploadMobileVoiceTurn(input: {
       );
     return { transcript: payload.transcript, result: payload.result };
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError")
-      throw new Error(
-        "Voice processing timed out. Your reminder was not changed; try again.",
-      );
+    if (isVoiceTimeout(error)) throw voiceTimeoutError();
     throw error;
   } finally {
     clearTimeout(timer);
