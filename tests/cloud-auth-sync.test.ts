@@ -93,6 +93,13 @@ test("browser cloud configuration accepts only public Supabase values", () => {
     }),
     { url: "https://example.supabase.co", anonKey: "publishable-key" },
   );
+  assert.deepEqual(
+    readSupabaseBrowserConfig({
+      NEXT_PUBLIC_SUPABASE_URL: "https://legacy.supabase.co",
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: "legacy-anon-key",
+    }),
+    { url: "https://legacy.supabase.co", anonKey: "legacy-anon-key" },
+  );
   assert.equal(readSupabaseBrowserConfig({}), null);
   assert.throws(
     () =>
@@ -102,6 +109,32 @@ test("browser cloud configuration accepts only public Supabase values", () => {
       }),
     /valid URL/,
   );
+});
+
+test("default browser configuration reads statically named public variables", () => {
+  const names = [
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+  ] as const;
+  const before = Object.fromEntries(
+    names.map((name) => [name, process.env[name]]),
+  );
+  try {
+    process.env.NEXT_PUBLIC_SUPABASE_URL = "https://default.supabase.co";
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "default-public-key";
+    delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    assert.deepEqual(readSupabaseBrowserConfig(), {
+      url: "https://default.supabase.co",
+      anonKey: "default-public-key",
+    });
+  } finally {
+    for (const name of names) {
+      const value = before[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test("cloud row mapper preserves customer, quote, reminder IDs, links, dates, and timezone", () => {
