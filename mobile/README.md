@@ -1,6 +1,6 @@
 # LeadLoop iPhone MVP
 
-This is the Expo/React Native client for LeadLoop. It uses the same Supabase
+This is the Expo SDK 57 / React Native client for LeadLoop. It uses the same Supabase
 project, workspace membership, customers, and task tables as the Next.js app.
 The publishable Supabase key is protected by the existing database RLS rules;
 this app never contains a service-role or OpenAI key.
@@ -55,7 +55,7 @@ future-milestone work; the mobile app does not claim those features work.
    and tap **Stop**. This confirms native capture; it does not yet transcribe
    the recording. Use **Create a typed reminder** to persist a reminder.
 
-Expo Go is compatible with this MVP. A custom development build is only needed
+Expo Go supporting SDK 57 is compatible with this MVP. A custom development build is only needed
 when adding native transcription, Siri/App Intents, or notification modules.
 
 ## Verification
