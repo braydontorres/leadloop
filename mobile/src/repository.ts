@@ -1,6 +1,11 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Person, Task } from "../../lib/tasks";
 import type { Quote, QuoteStatus } from "../../lib/quotes";
+import {
+  cloudDiagnostic,
+  logCloudDiagnostic,
+  MobileRepositoryError,
+} from "./cloud-diagnostics";
 
 export type MobileWorkspace = {
   id: string;
@@ -17,12 +22,12 @@ export type MobileWorkspaceData = {
 };
 
 type DatabaseError = { message?: string; code?: string };
-function fail(error: DatabaseError | null) {
+function fail(operation: string, error: DatabaseError | null) {
   if (!error) return;
-  throw new Error(
-    error.code
-      ? `${error.code}: ${error.message || "Cloud request failed."}`
-      : error.message || "Cloud request failed.",
+  throw new MobileRepositoryError(
+    operation,
+    error.code ?? null,
+    error.message || "Cloud request failed.",
   );
 }
 
@@ -81,7 +86,7 @@ export async function listMobileWorkspaces(client: SupabaseClient) {
     .from("workspace_members")
     .select("workspace_id, role, workspaces(id, name, business_name)")
     .order("created_at");
-  fail(error);
+  fail("workspace_list", error);
   return (data ?? []).flatMap((row: any) => {
     const workspace = Array.isArray(row.workspaces)
       ? row.workspaces[0]
@@ -126,18 +131,34 @@ export async function loadMobileWorkspace(
       .eq("workspace_id", workspace.id)
       .order("due", { ascending: true, nullsFirst: false }),
   ]);
-  fail(preferenceResult.error);
-  fail(customersResult.error);
-  fail(interactionsResult.error);
-  fail(quotesResult.error);
-  fail(tasksResult.error);
+  fail("workspace_preferences", preferenceResult.error);
+  fail("customers", customersResult.error);
+  fail("customer_interactions", interactionsResult.error);
+  fail("tasks", tasksResult.error);
+  // Quotes enrich a reminder link but are not required to restore the
+  // workspace. A broken optional quote query must never make existing tasks
+  // look unauthorized or erase an otherwise usable workspace.
+  if (quotesResult.error)
+    logCloudDiagnostic(
+      cloudDiagnostic(
+        "quotes_optional",
+        new MobileRepositoryError(
+          "quotes",
+          quotesResult.error.code ?? null,
+          quotesResult.error.message,
+        ),
+      ),
+    );
+  const quotes = quotesResult.error
+    ? []
+    : (quotesResult.data ?? []).map(quoteFrom);
   return {
     workspace,
     timezone: preferenceResult.data?.timezone ?? "America/Chicago",
     people: (customersResult.data ?? []).map((person) =>
       personFrom(person, interactionsResult.data ?? []),
     ),
-    quotes: (quotesResult.data ?? []).map(quoteFrom),
+    quotes,
     tasks: (tasksResult.data ?? []).map(taskFrom),
   };
 }
@@ -163,7 +184,7 @@ export async function createMobileTask(
     },
     { onConflict: "workspace_id,id" },
   );
-  fail(error);
+  fail("task_create", error);
 }
 
 export async function setMobileTaskCompleted(
@@ -177,5 +198,5 @@ export async function setMobileTaskCompleted(
     .update({ completed })
     .eq("workspace_id", workspaceId)
     .eq("id", taskId);
-  fail(error);
+  fail("task_complete", error);
 }

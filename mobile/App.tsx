@@ -50,6 +50,7 @@ import {
 import { errorMessage, taskDateTimeLabel } from "./src/format";
 import { uploadMobileVoiceTurn } from "./src/voice-api";
 import { linkVoiceTask } from "./src/voice-task-link";
+import { cloudDiagnostic, logCloudDiagnostic } from "./src/cloud-diagnostics";
 
 type Tab = "today" | "capture" | "people";
 const COLORS = {
@@ -112,6 +113,7 @@ function MobileApp() {
   } | null>(null);
   const voiceTurnRef = useRef(0);
   const workspaceRequestRef = useRef(0);
+  const restoreRequestRef = useRef(0);
 
   useEffect(() => {
     conversationRef.current = conversation;
@@ -129,7 +131,7 @@ function MobileApp() {
   }, [openTasks, timezone]);
 
   const chooseWorkspace = useCallback(
-    async (workspace: MobileWorkspace, userId = sessionUserId) => {
+    async (workspace: MobileWorkspace, userId: string) => {
       if (!client || !userId) return;
       const requestId = ++workspaceRequestRef.current;
       setBusy(true);
@@ -141,10 +143,12 @@ function MobileApp() {
         if (requestId !== workspaceRequestRef.current) return;
         setData(next);
         setShowWorkspacePicker(false);
+        setError("");
       } catch (reason) {
         if (requestId !== workspaceRequestRef.current) return;
-        const message = reason instanceof Error ? reason.message : "";
-        if (/42501|permission denied|not allowed/i.test(message)) {
+        const diagnostic = cloudDiagnostic("workspace_load", reason);
+        logCloudDiagnostic(diagnostic);
+        if (diagnostic.kind === "access") {
           // A failed read alone is not proof that access was revoked. Confirm
           // it with a fresh membership list before changing the active view.
           try {
@@ -164,12 +168,16 @@ function MobileApp() {
             // Network and auth-refresh errors keep the existing workspace.
           }
         }
-        setError(errorMessage(reason));
+        if (diagnostic.kind === "access")
+          setError(
+            "LeadLoop could not reload this workspace. Your current cloud data remains available; check your connection and retry.",
+          );
+        else setError(errorMessage(reason));
       } finally {
         if (requestId === workspaceRequestRef.current) setBusy(false);
       }
     },
-    [client, sessionUserId],
+    [client],
   );
 
   const restore = useCallback(async () => {
@@ -177,11 +185,13 @@ function MobileApp() {
       setLoading(false);
       return;
     }
+    const restoreId = ++restoreRequestRef.current;
     setLoading(true);
     setError("");
     try {
       const { data: auth, error: authError } = await client.auth.getSession();
       if (authError) throw authError;
+      if (restoreId !== restoreRequestRef.current) return;
       const user = auth.session?.user ?? null;
       setSessionUserId(user?.id ?? null);
       if (!user) {
@@ -190,6 +200,7 @@ function MobileApp() {
         return;
       }
       const available = await listMobileWorkspaces(client);
+      if (restoreId !== restoreRequestRef.current) return;
       setWorkspaces(available);
       const remembered = await savedMobileWorkspace(user.id);
       const workspace =
@@ -201,9 +212,11 @@ function MobileApp() {
         setShowWorkspacePicker(true);
       }
     } catch (reason) {
+      if (restoreId !== restoreRequestRef.current) return;
+      logCloudDiagnostic(cloudDiagnostic("workspace_restore", reason));
       setError(errorMessage(reason));
     } finally {
-      setLoading(false);
+      if (restoreId === restoreRequestRef.current) setLoading(false);
     }
   }, [chooseWorkspace, client]);
 
@@ -214,6 +227,8 @@ function MobileApp() {
       (_event, session) => {
         setSessionUserId(session?.user.id ?? null);
         if (!session) {
+          restoreRequestRef.current += 1;
+          workspaceRequestRef.current += 1;
           setData(null);
           setWorkspaces([]);
         }
@@ -250,6 +265,7 @@ function MobileApp() {
       const { error: signOutError } = await client.auth.signOut();
       if (signOutError) throw signOutError;
       if (userId) await clearMobileWorkspace(userId);
+      restoreRequestRef.current += 1;
       workspaceRequestRef.current += 1;
       setData(null);
       setWorkspaces([]);
@@ -263,8 +279,8 @@ function MobileApp() {
   };
 
   const reloadWorkspace = async () => {
-    if (!data || !client) return;
-    await chooseWorkspace(data.workspace);
+    if (!data || !client || !sessionUserId) return;
+    await chooseWorkspace(data.workspace, sessionUserId);
   };
 
   const toggleCompleted = async (task: Task) => {
@@ -592,7 +608,9 @@ function MobileApp() {
             <Pressable
               key={workspace.id}
               style={styles.workspaceRow}
-              onPress={() => void chooseWorkspace(workspace)}
+              onPress={() =>
+                sessionUserId && void chooseWorkspace(workspace, sessionUserId)
+              }
             >
               <View>
                 <Text style={styles.cardTitle}>{workspace.businessName}</Text>
