@@ -23,7 +23,11 @@ export type WorkspaceRepository = {
     ownerName: string;
   }): Promise<CloudWorkspaceSummary>;
   loadStore(workspaceId: string): Promise<Store>;
-  saveStore(workspaceId: string, store: Store): Promise<void>;
+  saveStore(
+    workspaceId: string,
+    store: Store,
+    baseline?: Store | null,
+  ): Promise<void>;
 } & LocalImportGateway;
 
 type DbError = { message?: string; code?: string };
@@ -205,18 +209,13 @@ async function rows(
   fail(error);
   return data ?? [];
 }
-async function deleteAbsent(
+async function deleteIds(
   client: SupabaseClient,
   table: string,
   workspaceId: string,
   ids: string[],
 ) {
-  const existing = await rows(client, table, workspaceId);
-  const keep = new Set(ids);
-  const absent = existing
-    .map((row: any) => row.id as string)
-    .filter((id) => !keep.has(id));
-  for (const group of chunks(absent)) {
+  for (const group of chunks(ids)) {
     const { error } = await client
       .from(table)
       .delete()
@@ -224,6 +223,36 @@ async function deleteAbsent(
       .in("id", group);
     fail(error);
   }
+}
+
+function storeIds(store: Store) {
+  return {
+    customers: store.people.map((person) => person.id),
+    interactions: store.people.flatMap((person) =>
+      person.interactions.map((entry) => entry.id),
+    ),
+    quotes: store.quotes.map((quote) => quote.id),
+    history: store.quotes.flatMap((quote) =>
+      quote.statusHistory.map((entry) => entry.id),
+    ),
+    tasks: store.tasks.map((task) => task.id),
+  };
+}
+
+export function cloudRecordRemovals(baseline: Store, current: Store) {
+  const before = storeIds(baseline);
+  const after = storeIds(current);
+  const removed = (known: string[], present: string[]) => {
+    const currentIds = new Set(present);
+    return known.filter((id) => !currentIds.has(id));
+  };
+  return {
+    customers: removed(before.customers, after.customers),
+    interactions: removed(before.interactions, after.interactions),
+    quotes: removed(before.quotes, after.quotes),
+    history: removed(before.history, after.history),
+    tasks: removed(before.tasks, after.tasks),
+  };
 }
 async function upsertRows(
   client: SupabaseClient,
@@ -335,8 +364,9 @@ export function createSupabaseWorkspaceRepository(
         tasks: taskRows,
       });
     },
-    async saveStore(workspaceId, store) {
-      // Dependency order preserves customer/quote/task links; removals run in reverse.
+    async saveStore(workspaceId, store, baseline) {
+      // Dependency order preserves customer/quote/task links; known removals
+      // run in reverse after all current values were written.
       const { customers, interactions, quotes, history, tasks } =
         storeToCloudRows(workspaceId, store);
       await upsertRows(client, "customers", customers);
@@ -364,36 +394,26 @@ export function createSupabaseWorkspaceRepository(
           { onConflict: "workspace_id" },
         );
       fail(preferencesError);
-      await deleteAbsent(
-        client,
-        "quote_status_history",
-        workspaceId,
-        history.map((row) => String(row.id)),
-      );
-      await deleteAbsent(
-        client,
-        "customer_interactions",
-        workspaceId,
-        interactions.map((row) => String(row.id)),
-      );
-      await deleteAbsent(
-        client,
-        "tasks",
-        workspaceId,
-        tasks.map((row) => String(row.id)),
-      );
-      await deleteAbsent(
-        client,
-        "quotes",
-        workspaceId,
-        quotes.map((row) => String(row.id)),
-      );
-      await deleteAbsent(
-        client,
-        "customers",
-        workspaceId,
-        customers.map((row) => String(row.id)),
-      );
+      // Never erase an ID this browser did not originally load. That protects
+      // records created by another client after this workspace was opened.
+      if (baseline) {
+        const removed = cloudRecordRemovals(baseline, store);
+        await deleteIds(
+          client,
+          "quote_status_history",
+          workspaceId,
+          removed.history,
+        );
+        await deleteIds(
+          client,
+          "customer_interactions",
+          workspaceId,
+          removed.interactions,
+        );
+        await deleteIds(client, "tasks", workspaceId, removed.tasks);
+        await deleteIds(client, "quotes", workspaceId, removed.quotes);
+        await deleteIds(client, "customers", workspaceId, removed.customers);
+      }
     },
     async prepareImport({ workspaceId, sourceDigest, snapshotJson }) {
       const { data, error } = await client.rpc("prepare_local_import", {

@@ -245,6 +245,7 @@ export default function Page() {
   const cloudLoadGenerationRef = useRef(0);
   const cloudSyncGenerationRef = useRef(0);
   const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const cloudBaselineStoreRef = useRef<Store | null>(null);
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
@@ -312,6 +313,7 @@ export default function Page() {
           setCloudWorkspaces([]);
           setCloudWorkspaceId(null);
           setCloudLoadedWorkspaceId(null);
+          cloudBaselineStoreRef.current = null;
           setCloudSyncState("idle");
           const local = localStoreRef.current;
           if (local) setStore(local);
@@ -339,14 +341,17 @@ export default function Page() {
     )
       return;
     const generation = ++cloudSyncGenerationRef.current;
+    const baseline = cloudBaselineStoreRef.current;
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     setCloudSyncState("saving");
     cloudSyncTimerRef.current = setTimeout(() => {
       const save = async () => {
         try {
-          await cloudRepository.saveStore(cloudWorkspaceId, store);
-          if (generation === cloudSyncGenerationRef.current)
+          await cloudRepository.saveStore(cloudWorkspaceId, store, baseline);
+          if (generation === cloudSyncGenerationRef.current) {
+            cloudBaselineStoreRef.current = store;
             setCloudSyncState("saved");
+          }
         } catch (error) {
           if (generation !== cloudSyncGenerationRef.current) return;
           setCloudSyncState("error");
@@ -503,6 +508,7 @@ export default function Page() {
       if (generation !== cloudLoadGenerationRef.current) return;
       setStore(cloudStore);
       storeRef.current = cloudStore;
+      cloudBaselineStoreRef.current = cloudStore;
       setCloudWorkspaceId(workspaceId);
       setCloudLoadedWorkspaceId(workspaceId);
       setCloudImportPreview(null);
@@ -626,6 +632,7 @@ export default function Page() {
       setCloudWorkspaceId(null);
       setCloudLoadedWorkspaceId(null);
       setCloudWorkspaces([]);
+      cloudBaselineStoreRef.current = null;
       if (local) setStore(local);
       setNotice("Signed out. Your browser-local workspace is available again.");
     } catch (error) {

@@ -9,7 +9,11 @@ import {
   signUpWithEmail,
   updatePassword,
 } from "../lib/cloud/auth";
-import { storeFromCloudRows, storeToCloudRows } from "../lib/cloud/repository";
+import {
+  cloudRecordRemovals,
+  storeFromCloudRows,
+  storeToCloudRows,
+} from "../lib/cloud/repository";
 import { readSupabaseBrowserConfig } from "../lib/cloud/supabase-browser";
 import { sampleStore } from "../lib/tasks";
 
@@ -173,4 +177,27 @@ test("cloud row mapper preserves customer, quote, reminder IDs, links, dates, an
     ...rows,
   });
   assert.deepEqual(restored, source);
+});
+
+test("cloud deletion candidates are limited to records this browser loaded", () => {
+  const baseline = sampleStore();
+  const existingTask = {
+    id: "loaded-task",
+    title: "Loaded task",
+    person: "",
+    due: "",
+    completed: false,
+    notes: "",
+  };
+  baseline.tasks = [existingTask];
+  // A task created remotely after this browser loaded never appears in the
+  // baseline, so it cannot become a delete candidate for this snapshot.
+  const current = { ...baseline, tasks: [] };
+  assert.deepEqual(cloudRecordRemovals(baseline, current), {
+    customers: [],
+    interactions: [],
+    quotes: [],
+    history: [],
+    tasks: ["loaded-task"],
+  });
 });
