@@ -5,6 +5,7 @@ export type CloudDiagnostic = {
   operation: string;
   code: string | null;
   kind: CloudFailureKind;
+  outcome: "failed" | "succeeded";
 };
 
 export class MobileRepositoryError extends Error {
@@ -25,17 +26,47 @@ export function cloudDiagnostic(
   const message = error instanceof Error ? error.message : "";
   const known = error instanceof MobileRepositoryError ? error : null;
   const code = known?.code ?? /\b([A-Z0-9]{5})\b/.exec(message)?.[1] ?? null;
+  const operationName = known?.operation ?? operation;
   if (/network|fetch|offline|timed? out|reach/i.test(message))
-    return { operation, code, kind: "network" };
+    return {
+      operation: operationName,
+      code,
+      kind: "network",
+      outcome: "failed",
+    };
   if (/jwt|session|token|unauthenticated|401/i.test(message))
-    return { operation, code, kind: "authentication" };
+    return {
+      operation: operationName,
+      code,
+      kind: "authentication",
+      outcome: "failed",
+    };
   if (
     /42501|permission denied|row-level security|not allowed|403/i.test(message)
   )
-    return { operation, code, kind: "access" };
+    return {
+      operation: operationName,
+      code,
+      kind: "access",
+      outcome: "failed",
+    };
   if (known || /PGRST|schema|relation|column/i.test(message))
-    return { operation, code, kind: "data" };
-  return { operation, code, kind: "unknown" };
+    return {
+      operation: operationName,
+      code,
+      kind: "data",
+      outcome: "failed",
+    };
+  return {
+    operation: operationName,
+    code,
+    kind: "unknown",
+    outcome: "failed",
+  };
+}
+
+export function cloudSuccess(operation: string): CloudDiagnostic {
+  return { operation, code: null, kind: "unknown", outcome: "succeeded" };
 }
 
 /** Logs only operation metadata: never a token, query, or customer record. */

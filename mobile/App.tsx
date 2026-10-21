@@ -50,7 +50,12 @@ import {
 import { errorMessage, taskDateTimeLabel } from "./src/format";
 import { uploadMobileVoiceTurn } from "./src/voice-api";
 import { linkVoiceTask } from "./src/voice-task-link";
-import { cloudDiagnostic, logCloudDiagnostic } from "./src/cloud-diagnostics";
+import {
+  cloudDiagnostic,
+  cloudSuccess,
+  logCloudDiagnostic,
+  type CloudDiagnostic,
+} from "./src/cloud-diagnostics";
 
 type Tab = "today" | "capture" | "people";
 const COLORS = {
@@ -114,6 +119,14 @@ function MobileApp() {
   const voiceTurnRef = useRef(0);
   const workspaceRequestRef = useRef(0);
   const restoreRequestRef = useRef(0);
+  const [cloudDiagnostics, setCloudDiagnostics] = useState<CloudDiagnostic[]>(
+    [],
+  );
+
+  const recordCloudDiagnostic = useCallback((diagnostic: CloudDiagnostic) => {
+    logCloudDiagnostic(diagnostic);
+    setCloudDiagnostics((current) => [diagnostic, ...current].slice(0, 12));
+  }, []);
 
   useEffect(() => {
     conversationRef.current = conversation;
@@ -144,10 +157,12 @@ function MobileApp() {
         setData(next);
         setShowWorkspacePicker(false);
         setError("");
+        next.diagnostics.forEach(recordCloudDiagnostic);
+        recordCloudDiagnostic(cloudSuccess("workspace_load"));
       } catch (reason) {
         if (requestId !== workspaceRequestRef.current) return;
         const diagnostic = cloudDiagnostic("workspace_load", reason);
-        logCloudDiagnostic(diagnostic);
+        recordCloudDiagnostic(diagnostic);
         if (diagnostic.kind === "access") {
           // A failed read alone is not proof that access was revoked. Confirm
           // it with a fresh membership list before changing the active view.
@@ -177,7 +192,7 @@ function MobileApp() {
         if (requestId === workspaceRequestRef.current) setBusy(false);
       }
     },
-    [client],
+    [client, recordCloudDiagnostic],
   );
 
   const restore = useCallback(async () => {
@@ -192,6 +207,7 @@ function MobileApp() {
       const { data: auth, error: authError } = await client.auth.getSession();
       if (authError) throw authError;
       if (restoreId !== restoreRequestRef.current) return;
+      recordCloudDiagnostic(cloudSuccess("auth_session"));
       const user = auth.session?.user ?? null;
       setSessionUserId(user?.id ?? null);
       if (!user) {
@@ -201,6 +217,7 @@ function MobileApp() {
       }
       const available = await listMobileWorkspaces(client);
       if (restoreId !== restoreRequestRef.current) return;
+      recordCloudDiagnostic(cloudSuccess("workspace_list"));
       setWorkspaces(available);
       const remembered = await savedMobileWorkspace(user.id);
       const workspace =
@@ -213,12 +230,17 @@ function MobileApp() {
       }
     } catch (reason) {
       if (restoreId !== restoreRequestRef.current) return;
-      logCloudDiagnostic(cloudDiagnostic("workspace_restore", reason));
-      setError(errorMessage(reason));
+      const diagnostic = cloudDiagnostic("workspace_restore", reason);
+      recordCloudDiagnostic(diagnostic);
+      if (diagnostic.kind === "access")
+        setError(
+          "LeadLoop could not restore the workspace list. Your loaded cloud data remains available; tap Retry cloud connection.",
+        );
+      else setError(errorMessage(reason));
     } finally {
       if (restoreId === restoreRequestRef.current) setLoading(false);
     }
-  }, [chooseWorkspace, client]);
+  }, [chooseWorkspace, client, recordCloudDiagnostic]);
 
   useEffect(() => {
     void restore();
@@ -677,6 +699,10 @@ function MobileApp() {
             onConfirm={() => void confirmByButton()}
             onRetrySave={() => void retryPendingSave()}
             hasPendingSave={Boolean(pendingSave)}
+            onRetryCloud={() => void reloadWorkspace()}
+            diagnostics={cloudDiagnostics}
+            workspaceLoaded={Boolean(data)}
+            showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
               setDate(isoDateToday(timezone));
               setTime("09:00");
@@ -876,6 +902,10 @@ function Capture({
   onConfirm,
   onRetrySave,
   hasPendingSave,
+  onRetryCloud,
+  diagnostics,
+  workspaceLoaded,
+  showDiagnostics,
   onNewReminder,
 }: {
   isRecording: boolean;
@@ -890,8 +920,13 @@ function Capture({
   onConfirm(): void;
   onRetrySave(): void;
   hasPendingSave: boolean;
+  onRetryCloud(): void;
+  diagnostics: CloudDiagnostic[];
+  workspaceLoaded: boolean;
+  showDiagnostics: boolean;
   onNewReminder(): void;
 }) {
+  const [showPanel, setShowPanel] = useState(false);
   return (
     <ScrollView contentContainerStyle={styles.capture}>
       <Text style={styles.eyebrow}>VOICE CAPTURE</Text>
@@ -947,7 +982,42 @@ function Capture({
       {hasPendingSave ? (
         <PrimaryButton label="Retry cloud save" onPress={onRetrySave} />
       ) : null}
+      <PrimaryButton label="Retry cloud connection" onPress={onRetryCloud} />
       <PrimaryButton label="Create a typed reminder" onPress={onNewReminder} />
+      {showDiagnostics ? (
+        <View style={styles.diagnostics}>
+          <Pressable onPress={() => setShowPanel((visible) => !visible)}>
+            <Text style={styles.link}>
+              {showPanel
+                ? "Hide development diagnostics"
+                : "Show development diagnostics"}
+            </Text>
+          </Pressable>
+          {showPanel ? (
+            <>
+              <Text style={styles.meta}>
+                Workspace data: {workspaceLoaded ? "loaded" : "not loaded"}
+              </Text>
+              {diagnostics.length ? (
+                diagnostics.map((diagnostic, index) => (
+                  <Text
+                    key={`${diagnostic.operation}-${index}`}
+                    style={styles.diagnosticText}
+                  >
+                    {diagnostic.outcome} · {diagnostic.operation} ·{" "}
+                    {diagnostic.kind}
+                    {diagnostic.code ? ` · ${diagnostic.code}` : ""}
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.meta}>
+                  No cloud operation has completed yet.
+                </Text>
+              )}
+            </>
+          ) : null}
+        </View>
+      ) : null}
     </ScrollView>
   );
 }
@@ -1244,6 +1314,14 @@ const styles = StyleSheet.create({
     gap: 6,
     width: "100%",
   },
+  diagnostics: {
+    width: "100%",
+    backgroundColor: "#F2F0E7",
+    borderRadius: 14,
+    padding: 10,
+    gap: 5,
+  },
+  diagnosticText: { color: COLORS.ink, fontSize: 12, lineHeight: 18 },
   modal: { padding: 24, gap: 13, backgroundColor: COLORS.cream, flexGrow: 1 },
   modalHeader: {
     flexDirection: "row",

@@ -3,7 +3,7 @@ import type { Person, Task } from "../../lib/tasks";
 import type { Quote, QuoteStatus } from "../../lib/quotes";
 import {
   cloudDiagnostic,
-  logCloudDiagnostic,
+  type CloudDiagnostic,
   MobileRepositoryError,
 } from "./cloud-diagnostics";
 
@@ -19,6 +19,7 @@ export type MobileWorkspaceData = {
   people: Person[];
   quotes: Quote[];
   tasks: Task[];
+  diagnostics: CloudDiagnostic[];
 };
 
 type DatabaseError = { message?: string; code?: string };
@@ -138,17 +139,18 @@ export async function loadMobileWorkspace(
   // Quotes enrich a reminder link but are not required to restore the
   // workspace. A broken optional quote query must never make existing tasks
   // look unauthorized or erase an otherwise usable workspace.
-  if (quotesResult.error)
-    logCloudDiagnostic(
-      cloudDiagnostic(
-        "quotes_optional",
-        new MobileRepositoryError(
-          "quotes",
-          quotesResult.error.code ?? null,
-          quotesResult.error.message,
+  const diagnostics = quotesResult.error
+    ? [
+        cloudDiagnostic(
+          "quotes_optional",
+          new MobileRepositoryError(
+            "quotes_optional",
+            quotesResult.error.code ?? null,
+            quotesResult.error.message,
+          ),
         ),
-      ),
-    );
+      ]
+    : [];
   const quotes = quotesResult.error
     ? []
     : (quotesResult.data ?? []).map(quoteFrom);
@@ -160,6 +162,7 @@ export async function loadMobileWorkspace(
     ),
     quotes,
     tasks: (tasksResult.data ?? []).map(taskFrom),
+    diagnostics,
   };
 }
 
