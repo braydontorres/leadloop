@@ -104,13 +104,21 @@ import {
 import {
   authErrorMessage,
   authRedirectUrl,
+  clearPasswordRecoveryRequest,
+  clearPasswordRecoverySession,
   completeAuthCallback,
   currentAuth,
+  hasPasswordRecoveryRequest,
+  hasPasswordRecoverySession,
+  markPasswordRecoveryRequested,
+  markPasswordRecoverySession,
+  passwordRecoveryRedirectUrl,
   sendPasswordRecovery,
   signInWithEmail,
   signOut,
   signUpWithEmail,
   updatePassword,
+  validateNewPassword,
 } from "../lib/cloud/auth";
 import {
   importApprovedLocalWorkspace,
@@ -192,6 +200,8 @@ export default function Page() {
     ),
     [cloudEmail, setCloudEmail] = useState(""),
     [cloudPassword, setCloudPassword] = useState(""),
+    [cloudPasswordConfirmation, setCloudPasswordConfirmation] = useState(""),
+    [cloudRecoveryActive, setCloudRecoveryActive] = useState(false),
     [cloudMode, setCloudMode] = useState<
       "sign_in" | "sign_up" | "recover" | "new_password"
     >("sign_in"),
@@ -262,10 +272,43 @@ export default function Page() {
   const cloudAuthGenerationRef = useRef(0);
   const cloudSyncGenerationRef = useRef(0);
   const cloudUserIdRef = useRef("");
+  const cloudRecoveryActiveRef = useRef(false);
+  const authCallbackStartedRef = useRef(false);
+  const cloudRefreshRef = useRef<() => void | Promise<void>>(() => {});
   const cloudLoadedWorkspaceIdRef = useRef<string | null>(null);
   const cloudSkipNextSaveRef = useRef<string | null>(null);
   const cloudSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const cloudBaselineStoreRef = useRef<Store | null>(null);
+  const enterPasswordRecovery = (user: {
+    id: string;
+    email?: string | null;
+  }) => {
+    // A recovery session must not trigger workspace restoration or cloud writes.
+    cloudAuthGenerationRef.current += 1;
+    cloudLoadGenerationRef.current += 1;
+    cloudSyncGenerationRef.current += 1;
+    if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
+    cloudUserIdRef.current = user.id;
+    cloudRecoveryActiveRef.current = true;
+    markPasswordRecoverySession(localStorage, user.id);
+    clearPasswordRecoveryRequest(localStorage);
+    cloudBaselineStoreRef.current = null;
+    cloudSkipNextSaveRef.current = null;
+    cloudLoadedWorkspaceIdRef.current = null;
+    setCloudUserEmail(user.email ?? "");
+    setCloudRecoveryActive(true);
+    setCloudMode("new_password");
+    setCloudPassword("");
+    setCloudPasswordConfirmation("");
+    setCloudWorkspaces([]);
+    setCloudWorkspaceId(null);
+    setCloudLoadedWorkspaceId(null);
+    setCloudSyncState("idle");
+    setCloudRestoring(false);
+    setScreen("Settings");
+    const local = localStoreRef.current;
+    if (local) setStore(local);
+  };
   const activateCloudWorkspace = async (
     workspaceId: string,
     options: {
@@ -401,12 +444,22 @@ export default function Page() {
       Boolean(url.searchParams.get("error_description")) ||
       Boolean(fragment.get("error")) ||
       Boolean(fragment.get("error_description"));
-    if (!isAuthCallback) return;
+    if (!isAuthCallback || authCallbackStartedRef.current) return;
+    authCallbackStartedRef.current = true;
     let active = true;
+    const recoveryIntent =
+      url.searchParams.get("flow") === "recovery" ||
+      (!url.searchParams.get("type") &&
+        hasPasswordRecoveryRequest(sessionStorage));
     const clearCallbackUrl = () => {
-      ["auth_callback", "code", "type", "error", "error_description"].forEach(
-        (name) => url.searchParams.delete(name),
-      );
+      [
+        "auth_callback",
+        "code",
+        "type",
+        "flow",
+        "error",
+        "error_description",
+      ].forEach((name) => url.searchParams.delete(name));
       window.history.replaceState(
         {},
         document.title,
@@ -415,34 +468,40 @@ export default function Page() {
     };
     setCloudBusy(true);
     setCloudError("");
-    void completeAuthCallback(cloudClient, window.location.href)
-      .then(
-        (result) => {
-          if (!active) return;
-          clearCallbackUrl();
-          if (result.kind === "recovery") {
-            setCloudMode("new_password");
-            setNotice(
-              "Choose a new password to finish recovering your account.",
+    void completeAuthCallback(cloudClient, window.location.href, {
+      recoveryIntent,
+    })
+      .then((result) => {
+        if (!active) return;
+        clearCallbackUrl();
+        if (result.kind === "recovery") {
+          if (!result.session?.user)
+            throw new Error(
+              "This recovery link did not create a valid recovery session. Request a new link and open it in this browser.",
             );
-            return;
-          }
-          if (result.kind === "confirmation") {
-            setCloudMode("sign_in");
-            setCloudUserEmail(result.session?.user.email ?? "");
-            setNotice(
-              result.session
-                ? "Email confirmed. You are signed in."
-                : "Email confirmed. Sign in to continue.",
-            );
-          }
-        },
-        (error) => {
-          if (!active) return;
-          clearCallbackUrl();
-          setCloudError(authErrorMessage(error));
-        },
-      )
+          enterPasswordRecovery(result.session.user);
+          setNotice("Set a new password to finish recovering your account.");
+          return;
+        }
+        clearPasswordRecoveryRequest(sessionStorage);
+        if (result.kind === "confirmation") {
+          setCloudMode("sign_in");
+          setCloudUserEmail(result.session?.user.email ?? "");
+          setNotice(
+            result.session
+              ? "Email confirmed. You are signed in."
+              : "Email confirmed. Sign in to continue.",
+          );
+        }
+      })
+      .catch((error) => {
+        if (!active) return;
+        clearCallbackUrl();
+        clearPasswordRecoveryRequest(sessionStorage);
+        setCloudError(authErrorMessage(error));
+        setCloudMode("recover");
+        setScreen("Settings");
+      })
       .finally(() => {
         if (active) setCloudBusy(false);
       });
@@ -485,6 +544,10 @@ export default function Page() {
         if (isDifferentUser) returnToLocalWorkspace();
         cloudUserIdRef.current = user.id;
         setCloudUserEmail(user.email ?? "");
+        if (hasPasswordRecoverySession(sessionStorage, user.id)) {
+          enterPasswordRecovery(user);
+          return;
+        }
         const workspaces = await repository.listWorkspaces();
         if (
           generation !== cloudAuthGenerationRef.current ||
@@ -571,12 +634,20 @@ export default function Page() {
           setCloudRestoring(false);
       }
     };
+    cloudRefreshRef.current = refresh;
     void refresh();
-    const { data } = cloudClient.auth.onAuthStateChange((event) => {
-      if (event === "PASSWORD_RECOVERY") setCloudMode("new_password");
+    const { data } = cloudClient.auth.onAuthStateChange((event, session) => {
+      if (event === "PASSWORD_RECOVERY" && session?.user) {
+        enterPasswordRecovery(session.user);
+        return;
+      }
+      if (cloudRecoveryActiveRef.current) return;
       void refresh();
     });
-    return () => data.subscription.unsubscribe();
+    return () => {
+      cloudRefreshRef.current = () => {};
+      data.subscription.unsubscribe();
+    };
   }, [cloudClient]);
   useEffect(() => {
     if (
@@ -762,6 +833,9 @@ export default function Page() {
     setCloudError("");
     try {
       const redirectTo = authRedirectUrl(window.location.origin);
+      const recoveryRedirectTo = passwordRecoveryRedirectUrl(
+        window.location.origin,
+      );
       if (cloudMode === "sign_up") {
         const result = await signUpWithEmail(
           cloudClient,
@@ -776,15 +850,33 @@ export default function Page() {
             : "Check your email to confirm your account, then sign in.",
         );
       } else if (cloudMode === "recover") {
-        await sendPasswordRecovery(cloudClient, cloudEmail.trim(), redirectTo);
+        await sendPasswordRecovery(
+          cloudClient,
+          cloudEmail.trim(),
+          recoveryRedirectTo,
+        );
+        markPasswordRecoveryRequested(sessionStorage);
         setNotice(
           "Password reset email sent. Open it in this browser to choose a new password.",
         );
       } else if (cloudMode === "new_password") {
-        await updatePassword(cloudClient, cloudPassword);
+        if (!cloudRecoveryActiveRef.current)
+          throw new Error(
+            "Open a valid password recovery link before setting a new password.",
+          );
+        const password = validateNewPassword(
+          cloudPassword,
+          cloudPasswordConfirmation,
+        );
+        await updatePassword(cloudClient, password);
+        clearPasswordRecoverySession(sessionStorage);
+        cloudRecoveryActiveRef.current = false;
+        setCloudRecoveryActive(false);
         setCloudMode("sign_in");
         setCloudPassword("");
+        setCloudPasswordConfirmation("");
         setNotice("Password updated. You are signed in and can continue.");
+        void cloudRefreshRef.current();
       } else {
         await signInWithEmail(cloudClient, cloudEmail.trim(), cloudPassword);
         setCloudPassword("");
@@ -867,6 +959,10 @@ export default function Page() {
       cloudSyncGenerationRef.current += 1;
       if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
       cloudUserIdRef.current = "";
+      cloudRecoveryActiveRef.current = false;
+      clearPasswordRecoveryRequest(sessionStorage);
+      clearPasswordRecoverySession(sessionStorage);
+      setCloudRecoveryActive(false);
       cloudBaselineStoreRef.current = null;
       cloudSkipNextSaveRef.current = null;
       setCloudUserEmail("");
@@ -3070,7 +3166,11 @@ export default function Page() {
                     <small>New workspaces use Monday through Friday.</small>
                   </section>
                   <section className="card settings-card">
-                    <h2>Cloud account</h2>
+                    <h2>
+                      {cloudMode === "new_password"
+                        ? "Set new password"
+                        : "Cloud account"}
+                    </h2>
                     {!cloudClient && (
                       <div className="status-line">
                         <ShieldCheck size={20} />
@@ -3088,7 +3188,9 @@ export default function Page() {
                       </div>
                     )}
                     {cloudClient &&
-                      (!cloudUserEmail || cloudMode === "new_password") && (
+                      (!cloudUserEmail ||
+                        cloudMode === "new_password" ||
+                        cloudMode === "recover") && (
                         <>
                           <p>
                             {cloudMode === "new_password"
@@ -3110,7 +3212,9 @@ export default function Page() {
                           )}
                           {cloudMode !== "recover" && (
                             <label className="field">
-                              Password
+                              {cloudMode === "new_password"
+                                ? "New password"
+                                : "Password"}
                               <input
                                 type="password"
                                 value={cloudPassword}
@@ -3126,13 +3230,37 @@ export default function Page() {
                               />
                             </label>
                           )}
+                          {cloudMode === "new_password" && (
+                            <>
+                              <label className="field">
+                                Confirm new password
+                                <input
+                                  type="password"
+                                  value={cloudPasswordConfirmation}
+                                  onChange={(event) =>
+                                    setCloudPasswordConfirmation(
+                                      event.target.value,
+                                    )
+                                  }
+                                  autoComplete="new-password"
+                                />
+                              </label>
+                              <small>
+                                Use at least 8 characters. LeadLoop never stores
+                                your password.
+                              </small>
+                            </>
+                          )}
                           <button
                             className="button"
                             disabled={
                               cloudBusy ||
                               (cloudMode !== "new_password" && !cloudEmail) ||
                               (cloudMode !== "recover" &&
-                                cloudPassword.length < 8)
+                                cloudPassword.length < 8) ||
+                              (cloudMode === "new_password" &&
+                                (!cloudRecoveryActive ||
+                                  !cloudPasswordConfirmation))
                             }
                             onClick={submitCloudAuth}
                           >
@@ -3143,9 +3271,27 @@ export default function Page() {
                                 : cloudMode === "recover"
                                   ? "Send reset email"
                                   : cloudMode === "new_password"
-                                    ? "Set new password"
+                                    ? "Save new password"
                                     : "Sign in"}
                           </button>
+                          {cloudMode === "new_password" && (
+                            <div className="modal-actions">
+                              <button
+                                className="text-link"
+                                onClick={() => {
+                                  clearPasswordRecoverySession(sessionStorage);
+                                  cloudRecoveryActiveRef.current = false;
+                                  setCloudRecoveryActive(false);
+                                  setCloudPassword("");
+                                  setCloudPasswordConfirmation("");
+                                  setCloudMode("recover");
+                                  setCloudError("");
+                                }}
+                              >
+                                Request a new recovery link
+                              </button>
+                            </div>
+                          )}
                           {cloudMode !== "new_password" && (
                             <div className="modal-actions">
                               <button
@@ -3179,7 +3325,8 @@ export default function Page() {
                       )}
                     {cloudClient &&
                       cloudUserEmail &&
-                      cloudMode !== "new_password" && (
+                      cloudMode !== "new_password" &&
+                      cloudMode !== "recover" && (
                         <>
                           <p>
                             Signed in as <strong>{cloudUserEmail}</strong>.

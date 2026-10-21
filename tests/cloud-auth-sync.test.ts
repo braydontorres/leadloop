@@ -4,13 +4,21 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   authErrorMessage,
   authRedirectUrl,
+  clearPasswordRecoveryRequest,
+  clearPasswordRecoverySession,
   completeAuthCallback,
   currentAuth,
+  hasPasswordRecoveryRequest,
+  hasPasswordRecoverySession,
+  markPasswordRecoveryRequested,
+  markPasswordRecoverySession,
+  passwordRecoveryRedirectUrl,
   sendPasswordRecovery,
   signInWithEmail,
   signOut,
   signUpWithEmail,
   updatePassword,
+  validateNewPassword,
 } from "../lib/cloud/auth";
 import {
   cloudRecordRemovals,
@@ -148,6 +156,78 @@ test("confirmation and recovery callbacks exchange codes or legacy implicit toke
         "http://localhost:3000/?auth_callback=1&error_description=Link%20expired",
       ),
     /expired/,
+  );
+});
+
+test("code-only PKCE recovery callbacks require recovery intent and exchange once", async () => {
+  const recoverySession = {
+    user: { id: "recovery-user", email: "owner@example.test" },
+  } as any;
+  const { client, calls } = authClient({
+    exchangeCodeForSession: async (code: string) => {
+      calls.push({ operation: "exchangeCode", value: code });
+      return { data: { session: recoverySession }, error: null };
+    },
+  });
+  const result = await completeAuthCallback(
+    client,
+    "http://localhost:3000/?code=recovery-code",
+    { recoveryIntent: true },
+  );
+  assert.equal(result.kind, "recovery");
+  assert.equal(result.session, recoverySession);
+  assert.deepEqual(calls, [
+    { operation: "exchangeCode", value: "recovery-code" },
+  ]);
+  assert.match(
+    passwordRecoveryRedirectUrl("http://localhost:3000"),
+    /flow=recovery/,
+  );
+});
+
+function recoveryStorage() {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, value),
+    removeItem: (key: string) => values.delete(key),
+  };
+}
+
+test("recovery intent and validated session survive refresh without authorizing another account", () => {
+  const storage = recoveryStorage();
+  markPasswordRecoveryRequested(storage);
+  assert.equal(hasPasswordRecoveryRequest(storage), true);
+  clearPasswordRecoveryRequest(storage);
+  assert.equal(hasPasswordRecoveryRequest(storage), false);
+
+  markPasswordRecoverySession(storage, "recovery-user", 1_000);
+  assert.equal(
+    hasPasswordRecoverySession(storage, "recovery-user", 1_001),
+    true,
+  );
+  assert.equal(
+    hasPasswordRecoverySession(storage, "another-user", 1_001),
+    false,
+  );
+  assert.equal(
+    hasPasswordRecoverySession(storage, "recovery-user", 1_002),
+    false,
+  );
+  markPasswordRecoverySession(storage, "recovery-user", 1_000);
+  clearPasswordRecoverySession(storage);
+  assert.equal(
+    hasPasswordRecoverySession(storage, "recovery-user", 1_001),
+    false,
+  );
+
+  assert.equal(
+    validateNewPassword("new-password", "new-password"),
+    "new-password",
+  );
+  assert.throws(
+    () => validateNewPassword("new-password", "different-password"),
+    /do not match/,
   );
 });
 

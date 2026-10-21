@@ -6,6 +6,11 @@ export type AuthCallbackResult = {
   session: Session | null;
 };
 
+type RecoveryStorage = Pick<Storage, "getItem" | "removeItem" | "setItem">;
+const RECOVERY_REQUEST_KEY = "leadloop.cloud.password-recovery-request.v1";
+const RECOVERY_SESSION_KEY = "leadloop.cloud.password-recovery-session.v1";
+const RECOVERY_SESSION_LIFETIME_MS = 15 * 60 * 1000;
+
 type ProviderError = { message?: string; status?: number; code?: string };
 
 function normalizedEmail(email: string) {
@@ -72,6 +77,89 @@ export function authRedirectUrl(origin: string): string {
   return new URL("/", base.origin).toString();
 }
 
+/** Supabase preserves this non-secret flow hint alongside its PKCE code. */
+export function passwordRecoveryRedirectUrl(origin: string): string {
+  const url = new URL(authRedirectUrl(origin));
+  url.searchParams.set("auth_callback", "1");
+  url.searchParams.set("flow", "recovery");
+  return url.toString();
+}
+
+/** Records intent only; the provider session remains the authority. */
+export function markPasswordRecoveryRequested(storage: RecoveryStorage) {
+  try {
+    storage.setItem(RECOVERY_REQUEST_KEY, "1");
+  } catch {
+    // Private browsing can deny storage. The redirect flow hint still works.
+  }
+}
+
+export function hasPasswordRecoveryRequest(storage: RecoveryStorage) {
+  try {
+    return storage.getItem(RECOVERY_REQUEST_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function clearPasswordRecoveryRequest(storage: RecoveryStorage) {
+  try {
+    storage.removeItem(RECOVERY_REQUEST_KEY);
+  } catch {
+    // No local marker is required for server-side session security.
+  }
+}
+
+/** Keeps recovery UI available across a refresh only for its exchanged session. */
+export function markPasswordRecoverySession(
+  storage: RecoveryStorage,
+  userId: string,
+  now = Date.now(),
+) {
+  try {
+    storage.setItem(
+      RECOVERY_SESSION_KEY,
+      JSON.stringify({ userId, expiresAt: now + RECOVERY_SESSION_LIFETIME_MS }),
+    );
+  } catch {
+    // The active in-memory session still permits this recovery attempt.
+  }
+}
+
+export function hasPasswordRecoverySession(
+  storage: RecoveryStorage,
+  userId: string,
+  now = Date.now(),
+) {
+  try {
+    const raw = storage.getItem(RECOVERY_SESSION_KEY);
+    if (!raw) return false;
+    const value = JSON.parse(raw) as { userId?: unknown; expiresAt?: unknown };
+    const valid =
+      value.userId === userId &&
+      typeof value.expiresAt === "number" &&
+      value.expiresAt > now;
+    if (!valid) storage.removeItem(RECOVERY_SESSION_KEY);
+    return valid;
+  } catch {
+    return false;
+  }
+}
+
+export function clearPasswordRecoverySession(storage: RecoveryStorage) {
+  try {
+    storage.removeItem(RECOVERY_SESSION_KEY);
+  } catch {
+    // The provider session is still invalidated by sign-out or expiry.
+  }
+}
+
+export function validateNewPassword(password: string, confirmation: string) {
+  const value = requirePassword(password, "set");
+  if (value !== confirmation) throw new Error("New passwords do not match.");
+  return value;
+}
+
 export async function currentAuth(client: SupabaseClient): Promise<AuthState> {
   const { data, error } = await client.auth.getSession();
   fail(error);
@@ -129,6 +217,7 @@ export async function updatePassword(client: SupabaseClient, password: string) {
 export async function completeAuthCallback(
   client: SupabaseClient,
   href: string,
+  options: { recoveryIntent?: boolean } = {},
 ): Promise<AuthCallbackResult> {
   const url = new URL(href);
   const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
@@ -140,8 +229,11 @@ export async function completeAuthCallback(
   if (providerError)
     throw new Error(authErrorMessage({ message: providerError }));
   const type = url.searchParams.get("type") || fragment.get("type");
-  const kind =
-    type === "recovery" ? "recovery" : type ? "confirmation" : "none";
+  const recoveryIntent =
+    type === "recovery" ||
+    url.searchParams.get("flow") === "recovery" ||
+    options.recoveryIntent === true;
+  const kind = recoveryIntent ? "recovery" : type ? "confirmation" : "none";
   const code = url.searchParams.get("code");
   if (!code) {
     const accessToken = fragment.get("access_token");
