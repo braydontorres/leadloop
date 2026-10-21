@@ -273,7 +273,10 @@ export default function Page() {
   const cloudSyncGenerationRef = useRef(0);
   const cloudUserIdRef = useRef("");
   const cloudRecoveryActiveRef = useRef(false);
-  const authCallbackStartedRef = useRef(false);
+  const authCallbackRef = useRef<{
+    href: string;
+    promise: ReturnType<typeof completeAuthCallback>;
+  } | null>(null);
   const cloudRefreshRef = useRef<() => void | Promise<void>>(() => {});
   const cloudLoadedWorkspaceIdRef = useRef<string | null>(null);
   const cloudSkipNextSaveRef = useRef<string | null>(null);
@@ -290,8 +293,10 @@ export default function Page() {
     if (cloudSyncTimerRef.current) clearTimeout(cloudSyncTimerRef.current);
     cloudUserIdRef.current = user.id;
     cloudRecoveryActiveRef.current = true;
-    markPasswordRecoverySession(localStorage, user.id);
-    clearPasswordRecoveryRequest(localStorage);
+    // Recovery state is deliberately tab-scoped. It is only UI state; the
+    // Supabase recovery session remains the authority for password updates.
+    markPasswordRecoverySession(sessionStorage, user.id);
+    clearPasswordRecoveryRequest(sessionStorage);
     cloudBaselineStoreRef.current = null;
     cloudSkipNextSaveRef.current = null;
     cloudLoadedWorkspaceIdRef.current = null;
@@ -444,8 +449,7 @@ export default function Page() {
       Boolean(url.searchParams.get("error_description")) ||
       Boolean(fragment.get("error")) ||
       Boolean(fragment.get("error_description"));
-    if (!isAuthCallback || authCallbackStartedRef.current) return;
-    authCallbackStartedRef.current = true;
+    if (!isAuthCallback) return;
     let active = true;
     const recoveryIntent =
       url.searchParams.get("flow") === "recovery" ||
@@ -468,9 +472,22 @@ export default function Page() {
     };
     setCloudBusy(true);
     setCloudError("");
-    void completeAuthCallback(cloudClient, window.location.href, {
-      recoveryIntent,
-    })
+    // React Strict Mode intentionally runs effects twice in development. Keep
+    // one promise for this exact callback URL so its one-time PKCE code is
+    // exchanged once, while the replayed effect can still render its result.
+    const existingCallback = authCallbackRef.current;
+    const callbackPromise =
+      existingCallback?.href === window.location.href
+        ? existingCallback.promise
+        : completeAuthCallback(cloudClient, window.location.href, {
+            recoveryIntent,
+          });
+    if (existingCallback?.href !== window.location.href)
+      authCallbackRef.current = {
+        href: window.location.href,
+        promise: callbackPromise,
+      };
+    void callbackPromise
       .then((result) => {
         if (!active) return;
         clearCallbackUrl();

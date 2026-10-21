@@ -5,7 +5,7 @@ LeadLoop can run in either browser-local mode or authenticated cloud mode. It re
 ## Hosted project configuration
 
 1. In the Supabase project, enable Email auth and Email confirmation.
-2. Add the web origins to Authentication URL Configuration, including `http://localhost:3000` for development and the production site URL when it exists.
+2. Add the web origins to Authentication URL Configuration, including `http://localhost:3000/**` for development and the production site URL with `/**` when it exists. The wildcard permits Supabase's one-time PKCE `code` and LeadLoop's non-secret `auth_callback=1&flow=recovery` query parameters; it does not grant access to another origin.
 3. Apply the already-deployed cloud foundation migration, the Phase 3A.2 migration, and the additive authenticated-role grant migration `20261022000000_authenticated_workspace_grants.sql`:
 
    ```bash
@@ -29,7 +29,7 @@ LeadLoop can run in either browser-local mode or authenticated cloud mode. It re
 
 1. Open **Settings → Cloud account**.
 2. Create an account. With confirmation enabled, LeadLoop says to check email. The confirmation link exchanges its one-time code in the browser, removes it from the address bar, and either signs the user in or asks them to sign in.
-3. **Forgot password** sends a recovery email with a non-secret recovery-flow marker in its allowed browser redirect. LeadLoop exchanges the one-time PKCE code, verifies the resulting Supabase session, and opens the dedicated **Set new password** view with password confirmation. A short-lived browser session marker keeps that verified view open across a refresh; an expired, invalid, already-used, or cross-browser link asks the owner to request a new one.
+3. **Forgot password** sends a recovery email with a non-secret recovery-flow marker in its allowed browser redirect. LeadLoop exchanges the one-time PKCE code, verifies the resulting Supabase session, and opens the dedicated **Set new password** view with password confirmation. A short-lived, tab-scoped marker keeps that verified view open across a refresh; an expired, invalid, already-used, or cross-browser link asks the owner to request a new one.
 4. Create a workspace or select one the account belongs to. A new workspace defaults to `America/Chicago` and Monday–Friday, consistent with the existing local defaults. LeadLoop remembers the selected workspace only under that authenticated user’s browser-local key. On refresh it restores the saved workspace after confirming it is still authorized; with one available workspace it selects it automatically. Multiple available workspaces without a valid saved choice open Settings for an explicit selection.
 5. Browser data is **not** uploaded at sign-in or workspace creation. An owner can choose **Preview local-data import**, inspect the count and validation result, then choose **Approve and import**.
 6. The import creates a browser backup, preserves existing record IDs and links, uses the server-side SHA-256/idempotency/conflict checks, and leaves the original `leadloop.phase1.v1` browser payload untouched.

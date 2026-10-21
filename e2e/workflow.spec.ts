@@ -1750,3 +1750,89 @@ test("typed quote workflow confirms an estimate and shows it in the customer pro
   ).toBeVisible();
   await expect(page.getByText(/\$250.00 · draft/)).toBeVisible();
 });
+
+test("a Strict Mode PKCE recovery callback renders the password form once and saves a matching password", async ({
+  page,
+}) => {
+  let codeExchanges = 0;
+  let passwordSignIns = 0;
+  let passwordUpdates = 0;
+  const session = {
+    access_token:
+      "header.eyJleHAiOjQxMDAwMDAwMDAsInN1YiI6InJlY292ZXJ5LXVzZXIifQ.signature",
+    refresh_token: "refresh-token",
+    token_type: "bearer",
+    expires_in: 3600,
+    expires_at: 4_100_000_000,
+    user: {
+      id: "recovery-user",
+      email: "owner@example.test",
+      aud: "authenticated",
+      role: "authenticated",
+      created_at: "2026-10-21T00:00:00.000Z",
+      updated_at: "2026-10-21T00:00:00.000Z",
+    },
+  };
+  await page.route("https://leadloop-recovery.test/**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.pathname.endsWith("/token") && request.method() === "POST") {
+      if (url.searchParams.get("grant_type") === "pkce") codeExchanges += 1;
+      if (url.searchParams.get("grant_type") === "password")
+        passwordSignIns += 1;
+      await route.fulfill({ json: session });
+      return;
+    }
+    if (url.pathname.endsWith("/user") && request.method() === "PUT") {
+      passwordUpdates += 1;
+      await route.fulfill({ json: { user: session.user } });
+      return;
+    }
+    // The post-update auth refresh lists workspaces. An empty authorized list
+    // is enough for this auth-focused test and avoids inventing cloud data.
+    await route.fulfill({ json: [] });
+  });
+
+  await page.goto(
+    "/?auth_callback=1&flow=recovery&code=one-time-recovery-code",
+  );
+
+  // Next renders this app in Strict Mode. The callback is replayed, but the
+  // one-time code must be exchanged only once and the replay must render the
+  // recovery result instead of falling through to Home.
+  await expect(
+    page.getByRole("heading", { name: "Set new password" }),
+  ).toBeVisible();
+  await expect(page.getByLabel("New password", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("Confirm new password")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Save new password" }),
+  ).toBeVisible();
+  expect(codeExchanges).toBe(1);
+
+  // The verified recovery marker is tab-scoped, so a refresh stays in the
+  // password flow instead of restoring the normal workspace.
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "Set new password" }),
+  ).toBeVisible();
+  expect(codeExchanges).toBe(1);
+
+  await page.getByLabel("New password", { exact: true }).fill("new-password");
+  await page.getByLabel("Confirm new password").fill("new-password");
+  await page.getByRole("button", { name: "Save new password" }).click();
+  await expect(
+    page.getByText("Password updated. You are signed in and can continue."),
+  ).toBeVisible();
+  expect(passwordUpdates).toBe(1);
+
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
+  await page.getByLabel("Email").fill("owner@example.test");
+  await page.getByLabel("Password", { exact: true }).fill("new-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(
+    page.getByText(/Signed in as owner@example\.test/),
+  ).toBeVisible();
+  expect(passwordSignIns).toBe(1);
+});

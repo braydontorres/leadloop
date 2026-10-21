@@ -9,7 +9,8 @@ export default defineConfig({
     },
   },
   webServer: {
-    command: "npm run build && npm run start -- --port 3100",
+    command:
+      "NEXT_PUBLIC_SUPABASE_URL=https://leadloop-recovery.test NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=playwright-public-key npm run build && npm run start -- --port 3100",
     url: "http://127.0.0.1:3100",
     reuseExistingServer: false,
   },
