@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
+  authErrorMessage,
+  authRedirectUrl,
+  completeAuthCallback,
   currentAuth,
   sendPasswordRecovery,
   signInWithEmail,
@@ -14,7 +17,12 @@ import {
   storeFromCloudRows,
   storeToCloudRows,
 } from "../lib/cloud/repository";
-import { readSupabaseBrowserConfig } from "../lib/cloud/supabase-browser";
+import {
+  getSupabaseBrowserClient,
+  getSupabaseBrowserConfigurationError,
+  readSupabaseBrowserConfig,
+  resetSupabaseBrowserClientForTests,
+} from "../lib/cloud/supabase-browser";
 import { sampleStore } from "../lib/tasks";
 
 function authClient(overrides: Record<string, unknown> = {}) {
@@ -40,6 +48,14 @@ function authClient(overrides: Record<string, unknown> = {}) {
       updateUser: async (value: unknown) => {
         calls.push({ operation: "updatePassword", value });
         return { data: { user: null }, error: null };
+      },
+      exchangeCodeForSession: async (code: string) => {
+        calls.push({ operation: "exchangeCode", value: code });
+        return { data: { session: null }, error: null };
+      },
+      setSession: async (value: unknown) => {
+        calls.push({ operation: "setSession", value });
+        return { data: { session: null }, error: null };
       },
       signOut: async () => {
         calls.push({ operation: "signOut" });
@@ -82,6 +98,68 @@ test("email auth helpers use browser-safe auth methods and surface provider erro
     signOut: async () => ({ error: { message: "Session expired" } }),
   });
   await assert.rejects(() => signOut(denied.client), /Session expired/);
+  await assert.rejects(
+    () =>
+      signUpWithEmail(client, "not-an-email", "password1", "http://localhost"),
+    /valid email/,
+  );
+  await assert.rejects(
+    () => updatePassword(client, "short"),
+    /at least 8 characters/,
+  );
+});
+
+test("confirmation and recovery callbacks exchange codes or legacy implicit tokens", async () => {
+  const { client, calls } = authClient();
+  assert.equal(
+    authRedirectUrl("http://localhost:3000"),
+    "http://localhost:3000/",
+  );
+  const recovery = await completeAuthCallback(
+    client,
+    "http://localhost:3000/?auth_callback=1&type=recovery&code=one-time-code",
+  );
+  assert.equal(recovery.kind, "recovery");
+  assert.deepEqual(calls.at(-1), {
+    operation: "exchangeCode",
+    value: "one-time-code",
+  });
+  const confirmation = await completeAuthCallback(
+    client,
+    "http://localhost:3000/?auth_callback=1#type=signup&access_token=access&refresh_token=refresh",
+  );
+  assert.equal(confirmation.kind, "confirmation");
+  assert.deepEqual(calls.at(-1), {
+    operation: "setSession",
+    value: { access_token: "access", refresh_token: "refresh" },
+  });
+  await assert.rejects(
+    () =>
+      completeAuthCallback(
+        client,
+        "http://localhost:3000/?auth_callback=1&error_description=Link%20expired",
+      ),
+    /expired/,
+  );
+});
+
+test("auth errors give useful safe recovery guidance", () => {
+  assert.match(
+    authErrorMessage({ message: "Invalid path specified in request URI" }),
+    /project base URL/i,
+  );
+  assert.match(
+    authErrorMessage({ message: "User already registered" }),
+    /already exists/i,
+  );
+  assert.match(
+    authErrorMessage({ message: "Invalid login credentials" }),
+    /incorrect/i,
+  );
+  assert.match(
+    authErrorMessage(new TypeError("Failed to fetch")),
+    /reach Supabase/i,
+  );
 });
 
 test("browser cloud configuration accepts only public Supabase values", () => {
@@ -109,6 +187,14 @@ test("browser cloud configuration accepts only public Supabase values", () => {
       }),
     /valid URL/,
   );
+  assert.throws(
+    () =>
+      readSupabaseBrowserConfig({
+        NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co/auth/v1",
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: "public-key",
+      }),
+    /project base URL only/,
+  );
 });
 
 test("default browser configuration reads statically named public variables", () => {
@@ -134,6 +220,40 @@ test("default browser configuration reads statically named public variables", ()
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
+  }
+});
+
+test("invalid public project URLs fall back safely and expose no credentials", () => {
+  const names = [
+    "NEXT_PUBLIC_SUPABASE_URL",
+    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+  ] as const;
+  const before = Object.fromEntries(
+    names.map((name) => [name, process.env[name]]),
+  );
+  try {
+    process.env.NEXT_PUBLIC_SUPABASE_URL =
+      "https://example.supabase.co/auth/v1";
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "public-key";
+    delete process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+    resetSupabaseBrowserClientForTests();
+    assert.equal(getSupabaseBrowserClient(), null);
+    assert.match(
+      getSupabaseBrowserConfigurationError() ?? "",
+      /project base URL only/,
+    );
+    assert.doesNotMatch(
+      getSupabaseBrowserConfigurationError() ?? "",
+      /public-key/,
+    );
+  } finally {
+    for (const name of names) {
+      const value = before[name];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    resetSupabaseBrowserClientForTests();
   }
 });
 

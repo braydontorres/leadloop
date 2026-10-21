@@ -92,13 +92,19 @@ import {
   calendarFromLegacy,
   resolveCalendarExpression,
 } from "../lib/calendar-expression";
-import { getSupabaseBrowserClient } from "../lib/cloud/supabase-browser";
+import {
+  getSupabaseBrowserClient,
+  getSupabaseBrowserConfigurationError,
+} from "../lib/cloud/supabase-browser";
 import {
   createSupabaseWorkspaceRepository,
   type CloudWorkspaceSummary,
   type WorkspaceRepository,
 } from "../lib/cloud/repository";
 import {
+  authErrorMessage,
+  authRedirectUrl,
+  completeAuthCallback,
   currentAuth,
   sendPasswordRecovery,
   signInWithEmail,
@@ -164,6 +170,9 @@ export default function Page() {
     [customerMemory, setCustomerMemory] = useState(emptyCustomerMemoryState),
     [quoteMemory, setQuoteMemory] = useState(emptyQuoteMemoryState),
     [cloudClient] = useState(() => getSupabaseBrowserClient()),
+    [cloudConfigurationError] = useState(() =>
+      getSupabaseBrowserConfigurationError(),
+    ),
     [cloudRepository, setCloudRepository] =
       useState<WorkspaceRepository | null>(null),
     [cloudWorkspaceId, setCloudWorkspaceId] = useState<string | null>(null),
@@ -298,6 +307,68 @@ export default function Page() {
       setStorageError(true);
     }
   }, [store, storageError, cloudWorkspaceId]);
+  useEffect(() => {
+    if (!cloudClient || typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const isAuthCallback =
+      url.searchParams.get("auth_callback") === "1" ||
+      Boolean(url.searchParams.get("code")) ||
+      Boolean(fragment.get("access_token")) ||
+      Boolean(url.searchParams.get("type")) ||
+      Boolean(url.searchParams.get("error")) ||
+      Boolean(url.searchParams.get("error_description")) ||
+      Boolean(fragment.get("error")) ||
+      Boolean(fragment.get("error_description"));
+    if (!isAuthCallback) return;
+    let active = true;
+    const clearCallbackUrl = () => {
+      ["auth_callback", "code", "type", "error", "error_description"].forEach(
+        (name) => url.searchParams.delete(name),
+      );
+      window.history.replaceState(
+        {},
+        document.title,
+        `${url.pathname}${url.search}`,
+      );
+    };
+    setCloudBusy(true);
+    setCloudError("");
+    void completeAuthCallback(cloudClient, window.location.href)
+      .then(
+        (result) => {
+          if (!active) return;
+          clearCallbackUrl();
+          if (result.kind === "recovery") {
+            setCloudMode("new_password");
+            setNotice(
+              "Choose a new password to finish recovering your account.",
+            );
+            return;
+          }
+          if (result.kind === "confirmation") {
+            setCloudMode("sign_in");
+            setCloudUserEmail(result.session?.user.email ?? "");
+            setNotice(
+              result.session
+                ? "Email confirmed. You are signed in."
+                : "Email confirmed. Sign in to continue.",
+            );
+          }
+        },
+        (error) => {
+          if (!active) return;
+          clearCallbackUrl();
+          setCloudError(authErrorMessage(error));
+        },
+      )
+      .finally(() => {
+        if (active) setCloudBusy(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [cloudClient]);
   useEffect(() => {
     if (!cloudClient) return;
     const repository = createSupabaseWorkspaceRepository(cloudClient);
@@ -529,15 +600,20 @@ export default function Page() {
     setCloudBusy(true);
     setCloudError("");
     try {
-      const redirectTo = window.location.origin;
+      const redirectTo = authRedirectUrl(window.location.origin);
       if (cloudMode === "sign_up") {
-        await signUpWithEmail(
+        const result = await signUpWithEmail(
           cloudClient,
           cloudEmail.trim(),
           cloudPassword,
           redirectTo,
         );
-        setNotice("Check your email to confirm your account, then sign in.");
+        setCloudPassword("");
+        setNotice(
+          result.session
+            ? "Account created and signed in."
+            : "Check your email to confirm your account, then sign in.",
+        );
       } else if (cloudMode === "recover") {
         await sendPasswordRecovery(cloudClient, cloudEmail.trim(), redirectTo);
         setNotice(
@@ -547,15 +623,14 @@ export default function Page() {
         await updatePassword(cloudClient, cloudPassword);
         setCloudMode("sign_in");
         setCloudPassword("");
-        setNotice(
-          "Password updated. You can continue with your cloud workspace.",
-        );
+        setNotice("Password updated. You are signed in and can continue.");
       } else {
         await signInWithEmail(cloudClient, cloudEmail.trim(), cloudPassword);
         setCloudPassword("");
+        setNotice("Signed in successfully.");
       }
     } catch (error) {
-      setCloudError((error as Error).message);
+      setCloudError(authErrorMessage(error));
     } finally {
       setCloudBusy(false);
     }
@@ -2832,12 +2907,14 @@ export default function Page() {
                       <div className="status-line">
                         <ShieldCheck size={20} />
                         <span>
-                          <strong>Local demo workspace</strong>
+                          <strong>
+                            {cloudConfigurationError
+                              ? "Cloud configuration needs attention"
+                              : "Local demo workspace"}
+                          </strong>
                           <p>
-                            Add the Supabase URL and publishable anon key to
-                            enable optional private cloud accounts. Your browser
-                            data stays on this device until you explicitly
-                            import it.
+                            {cloudConfigurationError ||
+                              "Add the Supabase project base URL and publishable key to enable optional private cloud accounts. Your browser data stays on this device until you explicitly import it."}
                           </p>
                         </span>
                       </div>
@@ -2846,9 +2923,9 @@ export default function Page() {
                       (!cloudUserEmail || cloudMode === "new_password") && (
                         <>
                           <p>
-                            Sign in to use an authenticated workspace. LeadLoop
-                            never sends browser data to the cloud until you
-                            approve an import.
+                            {cloudMode === "new_password"
+                              ? "Choose a new password to finish account recovery."
+                              : "Sign in to use an authenticated workspace. LeadLoop never sends browser data to the cloud until you approve an import."}
                           </p>
                           {cloudMode !== "new_password" && (
                             <label className="field">
@@ -2873,7 +2950,8 @@ export default function Page() {
                                   setCloudPassword(event.target.value)
                                 }
                                 autoComplete={
-                                  cloudMode === "sign_up"
+                                  cloudMode === "sign_up" ||
+                                  cloudMode === "new_password"
                                     ? "new-password"
                                     : "current-password"
                                 }

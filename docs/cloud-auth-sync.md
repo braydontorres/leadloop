@@ -19,16 +19,19 @@ LeadLoop can run in either browser-local mode or authenticated cloud mode. It re
    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=YOUR_PUBLISHABLE_KEY
    ```
 
+`NEXT_PUBLIC_SUPABASE_URL` must be the project **base URL only**: `https://YOUR_PROJECT.supabase.co`. Do not append `/auth/v1`, `/rest/v1`, a query string, or a second protocol. LeadLoop validates this before sending an Auth request and displays a safe correction message if it is malformed.
+
 `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` is a publishable client credential and is protected by RLS. Existing projects may instead use `NEXT_PUBLIC_SUPABASE_ANON_KEY`; LeadLoop accepts either name. Do not add `SUPABASE_SERVICE_ROLE_KEY`, OpenAI keys, or any private provider credential to `.env.local` for browser code.
 
 ## Account and workspace flow
 
 1. Open **Settings → Cloud account**.
-2. Create an account, confirm the email, then sign in. Password recovery sends the Supabase reset email back to the configured browser origin.
-3. Create a workspace or select one the account belongs to. A new workspace defaults to `America/Chicago` and Monday–Friday, consistent with the existing local defaults.
-4. Browser data is **not** uploaded at sign-in or workspace creation. An owner can choose **Preview local-data import**, inspect the count and validation result, then choose **Approve and import**.
-5. The import creates a browser backup, preserves existing record IDs and links, uses the server-side SHA-256/idempotency/conflict checks, and leaves the original `leadloop.phase1.v1` browser payload untouched.
-6. Once a cloud workspace is loaded, customer, quote, task, interaction, preference, and profile changes are debounced and persisted to that workspace. The Settings status shows `saving`, `saved`, or `error`; an error means the visible change has not been confirmed in cloud storage.
+2. Create an account. With confirmation enabled, LeadLoop says to check email. The confirmation link exchanges its one-time code in the browser, removes it from the address bar, and either signs the user in or asks them to sign in.
+3. **Forgot password** sends a recovery email to the configured browser origin. Its link enters the new-password screen; a successful update keeps the authenticated session.
+4. Create a workspace or select one the account belongs to. A new workspace defaults to `America/Chicago` and Monday–Friday, consistent with the existing local defaults.
+5. Browser data is **not** uploaded at sign-in or workspace creation. An owner can choose **Preview local-data import**, inspect the count and validation result, then choose **Approve and import**.
+6. The import creates a browser backup, preserves existing record IDs and links, uses the server-side SHA-256/idempotency/conflict checks, and leaves the original `leadloop.phase1.v1` browser payload untouched.
+7. Once a cloud workspace is loaded, customer, quote, task, interaction, preference, and profile changes are debounced and persisted to that workspace. The Settings status shows `saving`, `saved`, or `error`; an error means the visible change has not been confirmed in cloud storage.
 
 Only workspace owners can run a local-data import. RLS remains the authority for every read and write, including direct client requests. Signing out restores the local browser workspace in memory. Expired sessions also return to local mode instead of continuing cloud writes.
 
