@@ -151,3 +151,7 @@ vite.config.ts.timestamp-*
 # Browser test artifacts
 /test-results/
 /playwright-report/
+
+# Expo development and export output
+/mobile/.expo/
+/mobile/dist-test/

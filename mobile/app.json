@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "LeadLoop",
+    "slug": "leadloop",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "leadloop",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.leadloop.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "LeadLoop records only when you tap Capture so you can create a reminder."
+      }
+    },
+    "plugins": ["expo-audio", "expo-secure-store"],
+    "extra": {
+      "eas": { "projectId": "" }
+    }
+  }
+}

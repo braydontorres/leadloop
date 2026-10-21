@@ -1,0 +1,30 @@
+import * as SecureStore from "expo-secure-store";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { mobileSupabaseConfig } from "./config";
+
+const config = mobileSupabaseConfig(process.env);
+
+const secureStorage = {
+  getItem: (key: string) => SecureStore.getItemAsync(key),
+  setItem: (key: string, value: string) => SecureStore.setItemAsync(key, value),
+  removeItem: (key: string) => SecureStore.deleteItemAsync(key),
+};
+
+export const supabase: SupabaseClient | null = config
+  ? createClient(config.url, config.anonKey, {
+      auth: {
+        storage: secureStorage,
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: false,
+      },
+    })
+  : null;
+
+export function configuredSupabase(): SupabaseClient {
+  if (!supabase)
+    throw new Error(
+      "Cloud sign-in is not configured. Add EXPO_PUBLIC_SUPABASE_URL and a publishable key to mobile/.env.",
+    );
+  return supabase;
+}
