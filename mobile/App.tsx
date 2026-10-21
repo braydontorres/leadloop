@@ -1,13 +1,14 @@
 import "react-native-url-polyfill/auto";
 import { StatusBar } from "expo-status-bar";
 import * as Crypto from "expo-crypto";
+import * as Speech from "expo-speech";
 import {
   RecordingPresets,
   requestRecordingPermissionsAsync,
   useAudioRecorder,
   useAudioRecorderState,
 } from "expo-audio";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -24,7 +25,15 @@ import {
 } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { fromLocalInput, type Person, type Task } from "../lib/tasks";
-import { configuredSupabase, supabase } from "./src/supabase";
+import {
+  advanceConversation,
+  conversationContext,
+  emptyConversationState,
+  finishSpeech,
+  type ConversationState,
+  type IntentResult,
+} from "../lib/conversation-machine";
+import { supabase } from "./src/supabase";
 import {
   createMobileTask,
   listMobileWorkspaces,
@@ -39,6 +48,8 @@ import {
   saveMobileWorkspace,
 } from "./src/workspace-preference";
 import { errorMessage, taskDateTimeLabel } from "./src/format";
+import { uploadMobileVoiceTurn } from "./src/voice-api";
+import { linkVoiceTask } from "./src/voice-task-link";
 
 type Tab = "today" | "capture" | "people";
 const COLORS = {
@@ -85,6 +96,26 @@ function MobileApp() {
   const [time, setTime] = useState("");
   const [selectedPerson, setSelectedPerson] = useState<Person | null>(null);
   const [recordingNotice, setRecordingNotice] = useState("");
+  const [conversation, setConversation] = useState<ConversationState>(() =>
+    emptyConversationState(),
+  );
+  const conversationRef = useRef(conversation);
+  const [voiceStatus, setVoiceStatus] = useState<
+    "ready" | "recording" | "processing" | "speaking" | "saving" | "error"
+  >("ready");
+  const [transcript, setTranscript] = useState("");
+  const [assistantReply, setAssistantReply] = useState("");
+  const [pendingSave, setPendingSave] = useState<{
+    task: Task;
+    nextState: ConversationState;
+    transcript: string;
+  } | null>(null);
+  const voiceTurnRef = useRef(0);
+  const workspaceRequestRef = useRef(0);
+
+  useEffect(() => {
+    conversationRef.current = conversation;
+  }, [conversation]);
 
   const client = supabase;
   const timezone = data?.timezone ?? "America/Chicago";
@@ -100,17 +131,42 @@ function MobileApp() {
   const chooseWorkspace = useCallback(
     async (workspace: MobileWorkspace, userId = sessionUserId) => {
       if (!client || !userId) return;
+      const requestId = ++workspaceRequestRef.current;
       setBusy(true);
       setError("");
       try {
         const next = await loadMobileWorkspace(client, workspace);
+        if (requestId !== workspaceRequestRef.current) return;
         await saveMobileWorkspace(userId, workspace.id);
+        if (requestId !== workspaceRequestRef.current) return;
         setData(next);
         setShowWorkspacePicker(false);
       } catch (reason) {
+        if (requestId !== workspaceRequestRef.current) return;
+        const message = reason instanceof Error ? reason.message : "";
+        if (/42501|permission denied|not allowed/i.test(message)) {
+          // A failed read alone is not proof that access was revoked. Confirm
+          // it with a fresh membership list before changing the active view.
+          try {
+            const fresh = await listMobileWorkspaces(client);
+            if (requestId !== workspaceRequestRef.current) return;
+            setWorkspaces(fresh);
+            if (!fresh.some((item) => item.id === workspace.id)) {
+              await clearMobileWorkspace(userId);
+              setData(null);
+              setShowWorkspacePicker(true);
+              setError(
+                "You no longer have access to that workspace. Choose another workspace or sign in again.",
+              );
+              return;
+            }
+          } catch {
+            // Network and auth-refresh errors keep the existing workspace.
+          }
+        }
         setError(errorMessage(reason));
       } finally {
-        setBusy(false);
+        if (requestId === workspaceRequestRef.current) setBusy(false);
       }
     },
     [client, sessionUserId],
@@ -194,6 +250,7 @@ function MobileApp() {
       const { error: signOutError } = await client.auth.signOut();
       if (signOutError) throw signOutError;
       if (userId) await clearMobileWorkspace(userId);
+      workspaceRequestRef.current += 1;
       setData(null);
       setWorkspaces([]);
       setSessionUserId(null);
@@ -288,15 +345,161 @@ function MobileApp() {
     }
   };
 
+  const speakReply = useCallback(
+    (reply: string, nextState: ConversationState) => {
+      setAssistantReply(reply);
+      setVoiceStatus("speaking");
+      const complete = () => {
+        if (nextState.stage === "reading_back") {
+          setConversation((current) => finishSpeech(current));
+        }
+        setVoiceStatus("ready");
+      };
+      try {
+        Speech.stop();
+        Speech.speak(reply, {
+          rate: 0.48,
+          onDone: complete,
+          onError: complete,
+          onStopped: complete,
+        });
+      } catch {
+        // Text remains visible and the conversation must not get stuck when a
+        // device has speech playback disabled.
+        complete();
+      }
+    },
+    [],
+  );
+
+  const persistConfirmedTask = useCallback(
+    async (
+      task: Task,
+      nextState: ConversationState,
+      turnTranscript: string,
+    ) => {
+      if (!client || !data) return;
+      setVoiceStatus("saving");
+      const linked = linkVoiceTask(
+        task,
+        turnTranscript,
+        data.people,
+        data.quotes,
+      );
+      try {
+        await createMobileTask(client, {
+          ...linked,
+          workspaceId: data.workspace.id,
+        });
+        setData((current) =>
+          current
+            ? {
+                ...current,
+                tasks: current.tasks.some((entry) => entry.id === linked.id)
+                  ? current.tasks
+                  : [...current.tasks, linked],
+              }
+            : current,
+        );
+        setPendingSave(null);
+        setConversation(nextState);
+        speakReply(
+          "Perfect, your reminder is saved. Anything else?",
+          nextState,
+        );
+      } catch (reason) {
+        setPendingSave({ task, nextState, transcript: turnTranscript });
+        setVoiceStatus("error");
+        setError(
+          `I couldn't save that reminder to the cloud. ${errorMessage(reason)} Your confirmed reminder is ready to retry.`,
+        );
+      }
+    },
+    [client, data, speakReply],
+  );
+
+  const applyVoiceResult = useCallback(
+    async (result: IntentResult, turnTranscript: string) => {
+      if (!data) return;
+      const transition = advanceConversation({
+        state: conversationRef.current,
+        result,
+        text: turnTranscript,
+        timeZone: data.timezone,
+        createId: () => Crypto.randomUUID(),
+        now: new Date(),
+      });
+      if (transition.savedTask) {
+        await persistConfirmedTask(
+          transition.savedTask,
+          transition.state,
+          turnTranscript,
+        );
+        return;
+      }
+      setConversation(transition.state);
+      speakReply(transition.reply, transition.state);
+    },
+    [data, persistConfirmedTask, speakReply],
+  );
+
+  const confirmationResult = (): IntentResult => ({
+    intent: {
+      kind: "confirm",
+      fields: {
+        title: null,
+        person: null,
+        date: null,
+        time: null,
+        notes: null,
+        clearDue: false,
+      },
+    },
+  });
+
+  const confirmByButton = async () => {
+    if (voiceStatus !== "ready") return;
+    await applyVoiceResult(confirmationResult(), "Yes");
+  };
+
+  const retryPendingSave = async () => {
+    if (!pendingSave) return;
+    await persistConfirmedTask(
+      pendingSave.task,
+      pendingSave.nextState,
+      pendingSave.transcript,
+    );
+  };
+
   const toggleRecording = async () => {
     setError("");
     if (recording.isRecording) {
+      const turn = voiceTurnRef.current;
+      const durationMs = recording.durationMillis;
       try {
         await recorder.stop();
-        setRecordingNotice(
-          "Recording captured on this iPhone. Transcription stays on the trusted server and is not connected in this MVP; use the quick reminder below to save it.",
-        );
+        const audioUri = recorder.uri;
+        if (!audioUri)
+          throw new Error("The recording was unavailable. Please try again.");
+        if (!client || !data)
+          throw new Error("Choose a cloud workspace before recording.");
+        setVoiceStatus("processing");
+        setRecordingNotice("Thinking…");
+        const payload = await uploadMobileVoiceTurn({
+          client,
+          workspaceId: data.workspace.id,
+          audioUri,
+          durationMs,
+          timeZone: data.timezone,
+          context: conversationContext(conversationRef.current),
+        });
+        if (turn !== voiceTurnRef.current) return;
+        setTranscript(payload.transcript);
+        setRecordingNotice("");
+        await applyVoiceResult(payload.result, payload.transcript);
       } catch (reason) {
+        if (turn !== voiceTurnRef.current) return;
+        setVoiceStatus("error");
         setError(errorMessage(reason));
       }
       return;
@@ -310,12 +513,13 @@ function MobileApp() {
         return;
       }
       await recorder.prepareToRecordAsync();
+      voiceTurnRef.current += 1;
       recorder.record();
-      setRecordingNotice(
-        "Recording only while you hold this conversation open. Tap again to stop.",
-      );
+      setVoiceStatus("recording");
+      setRecordingNotice("Listening. Tap Stop when you are done.");
     } catch (reason) {
       setError(errorMessage(reason));
+      setVoiceStatus("error");
     }
   };
 
@@ -444,7 +648,17 @@ function MobileApp() {
             isRecording={recording.isRecording}
             seconds={Math.round(recording.durationMillis / 1000)}
             notice={recordingNotice}
+            status={voiceStatus}
+            transcript={transcript}
+            reply={assistantReply}
+            awaitingConfirmation={
+              conversation.stage === "awaiting_confirmation"
+            }
+            canRecord={voiceStatus === "ready" || voiceStatus === "error"}
             onRecord={toggleRecording}
+            onConfirm={() => void confirmByButton()}
+            onRetrySave={() => void retryPendingSave()}
+            hasPendingSave={Boolean(pendingSave)}
             onNewReminder={() => {
               setDate(isoDateToday(timezone));
               setTime("09:00");
@@ -635,13 +849,29 @@ function Capture({
   isRecording,
   seconds,
   notice,
+  status,
+  transcript,
+  reply,
+  awaitingConfirmation,
+  canRecord,
   onRecord,
+  onConfirm,
+  onRetrySave,
+  hasPendingSave,
   onNewReminder,
 }: {
   isRecording: boolean;
   seconds: number;
   notice: string;
+  status: string;
+  transcript: string;
+  reply: string;
+  awaitingConfirmation: boolean;
+  canRecord: boolean;
   onRecord(): void;
+  onConfirm(): void;
+  onRetrySave(): void;
+  hasPendingSave: boolean;
   onNewReminder(): void;
 }) {
   return (
@@ -651,12 +881,21 @@ function Capture({
       <Text style={styles.copy}>
         {isRecording
           ? `Listening · ${seconds}s`
-          : "Tap once to start. Tap again when you’re done."}
+          : status === "processing" || status === "saving"
+            ? "Thinking…"
+            : status === "speaking"
+              ? "LeadLoop is speaking…"
+              : "Tap once to start. Tap again when you’re done."}
       </Text>
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
-        style={[styles.mic, isRecording && styles.micActive]}
+        disabled={!isRecording && !canRecord}
+        style={[
+          styles.mic,
+          isRecording && styles.micActive,
+          !isRecording && !canRecord && styles.disabled,
+        ]}
         onPress={() => void onRecord()}
       >
         <Text style={styles.micIcon}>{isRecording ? "■" : "●"}</Text>
@@ -672,6 +911,24 @@ function Capture({
         </Text>
       </View>
       {notice ? <Text style={styles.copy}>{notice}</Text> : null}
+      {transcript ? (
+        <View style={styles.captureNote}>
+          <Text style={styles.eyebrow}>YOU SAID</Text>
+          <Text style={styles.cardTitle}>{transcript}</Text>
+        </View>
+      ) : null}
+      {reply ? (
+        <View style={styles.captureReply}>
+          <Text style={styles.eyebrow}>LEADLOOP</Text>
+          <Text style={styles.cardTitle}>{reply}</Text>
+        </View>
+      ) : null}
+      {awaitingConfirmation ? (
+        <PrimaryButton label="Yes, save it" onPress={onConfirm} />
+      ) : null}
+      {hasPendingSave ? (
+        <PrimaryButton label="Retry cloud save" onPress={onRetrySave} />
+      ) : null}
       <PrimaryButton label="Create a typed reminder" onPress={onNewReminder} />
     </ScrollView>
   );
@@ -958,6 +1215,15 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 16,
     gap: 4,
+    width: "100%",
+  },
+  captureReply: {
+    backgroundColor: COLORS.card,
+    borderColor: COLORS.line,
+    borderWidth: 1,
+    borderRadius: 16,
+    padding: 16,
+    gap: 6,
     width: "100%",
   },
   modal: { padding: 24, gap: 13, backgroundColor: COLORS.cream, flexGrow: 1 },

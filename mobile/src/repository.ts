@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Person, Task } from "../../lib/tasks";
+import type { Quote, QuoteStatus } from "../../lib/quotes";
 
 export type MobileWorkspace = {
   id: string;
@@ -11,6 +12,7 @@ export type MobileWorkspaceData = {
   workspace: MobileWorkspace;
   timezone: string;
   people: Person[];
+  quotes: Quote[];
   tasks: Task[];
 };
 
@@ -56,6 +58,22 @@ function taskFrom(row: any): Task {
     notes: row.notes ?? "",
   };
 }
+function quoteFrom(row: any): Quote {
+  return {
+    id: row.id,
+    customerId: row.customer_id,
+    serviceDescription: row.service_description,
+    amountCents: row.amount_cents,
+    currency: "USD",
+    status: row.status as QuoteStatus,
+    notes: row.notes ?? "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    // Voice reminder linking only needs the stable quote identity. The web
+    // profile remains responsible for rendering its complete history.
+    statusHistory: [],
+  };
+}
 
 /** Mobile uses the same tables and RLS boundaries as the web repository. */
 export async function listMobileWorkspaces(client: SupabaseClient) {
@@ -84,27 +102,34 @@ export async function loadMobileWorkspace(
   client: SupabaseClient,
   workspace: MobileWorkspace,
 ): Promise<MobileWorkspaceData> {
-  const [preferenceResult, customersResult, interactionsResult, tasksResult] =
-    await Promise.all([
-      client
-        .from("workspace_preferences")
-        .select("timezone")
-        .eq("workspace_id", workspace.id)
-        .single(),
-      client.from("customers").select("*").eq("workspace_id", workspace.id),
-      client
-        .from("customer_interactions")
-        .select("*")
-        .eq("workspace_id", workspace.id),
-      client
-        .from("tasks")
-        .select("*")
-        .eq("workspace_id", workspace.id)
-        .order("due", { ascending: true, nullsFirst: false }),
-    ]);
+  const [
+    preferenceResult,
+    customersResult,
+    interactionsResult,
+    quotesResult,
+    tasksResult,
+  ] = await Promise.all([
+    client
+      .from("workspace_preferences")
+      .select("timezone")
+      .eq("workspace_id", workspace.id)
+      .single(),
+    client.from("customers").select("*").eq("workspace_id", workspace.id),
+    client
+      .from("customer_interactions")
+      .select("*")
+      .eq("workspace_id", workspace.id),
+    client.from("quotes").select("*").eq("workspace_id", workspace.id),
+    client
+      .from("tasks")
+      .select("*")
+      .eq("workspace_id", workspace.id)
+      .order("due", { ascending: true, nullsFirst: false }),
+  ]);
   fail(preferenceResult.error);
   fail(customersResult.error);
   fail(interactionsResult.error);
+  fail(quotesResult.error);
   fail(tasksResult.error);
   return {
     workspace,
@@ -112,6 +137,7 @@ export async function loadMobileWorkspace(
     people: (customersResult.data ?? []).map((person) =>
       personFrom(person, interactionsResult.data ?? []),
     ),
+    quotes: (quotesResult.data ?? []).map(quoteFrom),
     tasks: (tasksResult.data ?? []).map(taskFrom),
   };
 }
@@ -120,17 +146,23 @@ export async function createMobileTask(
   client: SupabaseClient,
   input: Task & { workspaceId: string },
 ) {
-  const { error } = await client.from("tasks").insert({
-    id: input.id,
-    workspace_id: input.workspaceId,
-    title: input.title.trim(),
-    person: input.person,
-    person_id: input.personId ?? null,
-    quote_id: input.quoteId ?? null,
-    due: input.due || null,
-    completed: false,
-    notes: input.notes,
-  });
+  // The voice confirmation path retries the same application-generated ID
+  // after a connection drop. This makes that retry idempotent without
+  // creating a second reminder.
+  const { error } = await client.from("tasks").upsert(
+    {
+      id: input.id,
+      workspace_id: input.workspaceId,
+      title: input.title.trim(),
+      person: input.person,
+      person_id: input.personId ?? null,
+      quote_id: input.quoteId ?? null,
+      due: input.due || null,
+      completed: false,
+      notes: input.notes,
+    },
+    { onConflict: "workspace_id,id" },
+  );
   fail(error);
 }
 

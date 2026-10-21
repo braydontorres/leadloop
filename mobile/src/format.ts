@@ -15,6 +15,6 @@ export function errorMessage(error: unknown) {
   if (/network|fetch|offline|reach/i.test(message))
     return "Could not reach LeadLoop cloud. Check your connection and try again.";
   if (/permission|42501|not allowed/i.test(message))
-    return "You no longer have access to this workspace.";
+    return "LeadLoop could not verify workspace access. Check your connection and retry; your current workspace remains selected.";
   return message || "Something went wrong. Please try again.";
 }

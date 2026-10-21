@@ -22,6 +22,7 @@ test("recognizes Chrome WebM and Safari MP4 MIME parameters", () => {
     supportedAudioFormat("video/mp4; codecs=mp4a.40.2")?.extension,
     "m4a",
   );
+  assert.equal(supportedAudioFormat("audio/m4a")?.extension, "m4a");
 });
 
 test("chooses the first browser-supported recorder format", () => {

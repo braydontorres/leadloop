@@ -5,7 +5,7 @@ project, workspace membership, customers, and task tables as the Next.js app.
 The publishable Supabase key is protected by the existing database RLS rules;
 this app never contains a service-role or OpenAI key.
 
-## What works in Phase 3B
+## What works in Phase 3C
 
 - Email/password sign-in and encrypted native session persistence via
   `expo-secure-store`.
@@ -16,12 +16,23 @@ this app never contains a service-role or OpenAI key.
   Reminder IDs and optional customer IDs are preserved.
 - A native `expo-audio` tap-to-talk recorder with iOS microphone permission.
   Recording begins only after an explicit tap and stops after a second tap.
+- Authenticated voice upload to `POST /api/mobile/voice`. The app attaches the
+  signed-in user's Supabase access token; the server verifies the token and
+  workspace membership with RLS before it transcribes a supported iOS MPEG-4
+  recording. The route never uses a service-role key and stores no raw audio.
+- The server reuses LeadLoop's existing OpenAI transcription, structured
+  interpretation, and deterministic calendar conversation machine. The phone
+  displays the transcript, speaks LeadLoop's response when iOS speech is
+  available, reads a complete reminder back, and writes only after an explicit
+  voice or **Yes, save it** confirmation.
 
-The recorder is real, but this milestone deliberately does **not** upload or
-transcribe audio. The web `/api/voice` route is not an authenticated mobile
-speech endpoint, and OpenAI credentials must remain server-side. After a
-recording the app clearly offers the typed reminder sheet. Server-mediated
-transcription is the next mobile voice milestone.
+Voice processing needs a trusted HTTPS Next.js server with the existing
+`OPENAI_API_KEY`, plus the public Supabase URL and publishable/anon key in its
+server environment. Do not put any of those private server values in
+`mobile/.env`. The mobile voice base URL is public configuration, not a secret.
+An iPhone cannot use `localhost` to reach the Mac. For local testing, expose
+the Mac's Next.js server through a trusted HTTPS tunnel and set
+`EXPO_PUBLIC_LEADLOOP_VOICE_API_URL` to that tunnel URL before starting Expo.
 
 The app imports deterministic task/date helpers from `../lib/tasks` through
 Metro's workspace watch folder. Calendar conversation, customer memory, quote
@@ -38,8 +49,12 @@ future-milestone work; the mobile app does not claim those features work.
    ```bash
    cd ~/leadloop
    git fetch origin
-   git switch feat/iphone-mvp-phase-3b
-   git pull --ff-only origin feat/iphone-mvp-phase-3b
+   git switch feat/iphone-ai-voice-phase-3c
+   git pull --ff-only origin feat/iphone-ai-voice-phase-3c
+   # Terminal 1: from ~/leadloop, with existing .env.local configured
+   npm run dev
+   # Terminal 2: expose port 3000 using your approved HTTPS tunnel provider
+   # and set its resulting https:// URL in mobile/.env
    cd mobile
    npm install
    npx expo start --tunnel
@@ -52,11 +67,14 @@ future-milestone work; the mobile app does not claim those features work.
 4. Sign in with the same account used on the web. The app restores a selected
    workspace or asks you to choose an authorized one.
 5. On **Capture**, tap **Tap to talk**, grant microphone permission, speak,
-   and tap **Stop**. This confirms native capture; it does not yet transcribe
-   the recording. Use **Create a typed reminder** to persist a reminder.
+   and tap **Stop**. Confirm that the transcription and spoken response match
+   what you said. Answer a missing-detail question with another recording.
+   When LeadLoop reads the full reminder back, say “Yes” or tap **Yes, save
+   it**. Verify the reminder appears in Today after cloud persistence returns.
 
-Expo Go supporting SDK 57 is compatible with this MVP. A custom development build is only needed
-when adding native transcription, Siri/App Intents, or notification modules.
+Expo Go supporting SDK 57 is compatible with this MVP. Native speech playback
+uses `expo-speech`; Siri/App Intents, background listening, push notifications,
+offline write queues, and physical-device automated tests remain later work.
 
 ## Verification
 
@@ -66,7 +84,7 @@ npm run typecheck
 npm test
 ```
 
-These tests cover public mobile Supabase configuration and account-scoped
-workspace keys. They mock neither real Supabase nor iPhone hardware. Test a
-real account, workspace, task, and microphone on a physical iPhone before
-relying on the app in daily work.
+These tests validate the deterministic helpers and configuration. They do not
+prove a hosted OpenAI request, an HTTPS tunnel, or physical iPhone microphone
+behavior. Test a real account, workspace, task, and microphone on a physical
+iPhone before relying on the app in daily work.

@@ -11,6 +11,8 @@ const SUPPORTED_FORMATS: Record<string, { extension: string; label: string }> =
   {
     "audio/webm": { extension: "webm", label: "WebM audio" },
     "audio/mp4": { extension: "m4a", label: "MPEG-4 audio" },
+    // Expo's iOS high-quality recorder reports this common MPEG-4 alias.
+    "audio/m4a": { extension: "m4a", label: "MPEG-4 audio" },
     "video/mp4": { extension: "m4a", label: "MPEG-4 audio" },
     "audio/ogg": { extension: "ogg", label: "Ogg audio" },
     "audio/mpeg": { extension: "mp3", label: "MPEG audio" },
