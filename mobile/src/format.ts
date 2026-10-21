@@ -14,7 +14,7 @@ export function errorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "";
   if (/network|fetch|offline|reach/i.test(message))
     return "Could not reach LeadLoop cloud. Check your connection and try again.";
-  if (/permission|42501|not allowed/i.test(message))
+  if (/42501|row-level security|not allowed/i.test(message))
     return "Cloud request was denied. Retry the action after the current session finishes restoring.";
   return message || "Something went wrong. Please try again.";
 }

@@ -5,6 +5,7 @@ import * as Speech from "expo-speech";
 import {
   RecordingPresets,
   requestRecordingPermissionsAsync,
+  setAudioModeAsync,
   useAudioRecorder,
   useAudioRecorderState,
 } from "expo-audio";
@@ -56,6 +57,13 @@ import {
   logCloudDiagnostic,
   type CloudDiagnostic,
 } from "./src/cloud-diagnostics";
+import {
+  microphoneErrorMessage,
+  microphoneFailure,
+  microphoneSuccess,
+  type MicrophoneDiagnostic,
+  type MicrophoneStage,
+} from "./src/microphone-diagnostics";
 
 type Tab = "today" | "capture" | "people";
 const COLORS = {
@@ -122,11 +130,23 @@ function MobileApp() {
   const [cloudDiagnostics, setCloudDiagnostics] = useState<CloudDiagnostic[]>(
     [],
   );
+  const [microphoneDiagnostics, setMicrophoneDiagnostics] = useState<
+    MicrophoneDiagnostic[]
+  >([]);
 
   const recordCloudDiagnostic = useCallback((diagnostic: CloudDiagnostic) => {
     logCloudDiagnostic(diagnostic);
     setCloudDiagnostics((current) => [diagnostic, ...current].slice(0, 12));
   }, []);
+  const recordMicrophoneDiagnostic = useCallback(
+    (diagnostic: MicrophoneDiagnostic) => {
+      console.info("[LeadLoop mobile microphone]", JSON.stringify(diagnostic));
+      setMicrophoneDiagnostics((current) =>
+        [diagnostic, ...current].slice(0, 12),
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     conversationRef.current = conversation;
@@ -511,23 +531,44 @@ function MobileApp() {
 
   const toggleRecording = async () => {
     setError("");
-    if (recording.isRecording) {
+    if (recording.isRecording || voiceStatus === "recording") {
       const turn = voiceTurnRef.current;
       const durationMs = recording.durationMillis;
       try {
         await recorder.stop();
-        const audioUri = recorder.uri;
-        if (!audioUri)
-          throw new Error("The recording was unavailable. Please try again.");
-        if (!client || !data)
-          throw new Error("Choose a cloud workspace before recording.");
+      } catch (reason) {
+        if (turn !== voiceTurnRef.current) return;
+        recordMicrophoneDiagnostic(microphoneFailure("stop"));
+        setVoiceStatus("error");
+        setError(microphoneErrorMessage("stop"));
+        return;
+      }
+      recordMicrophoneDiagnostic(microphoneSuccess("stop"));
+      const audioUri = recorder.uri;
+      const capturedDurationMs = Math.max(
+        durationMs,
+        recorder.getStatus().durationMillis,
+      );
+      if (!audioUri || capturedDurationMs < 100) {
+        recordMicrophoneDiagnostic(microphoneFailure("file"));
+        setVoiceStatus("error");
+        setError(microphoneErrorMessage("file"));
+        return;
+      }
+      recordMicrophoneDiagnostic(microphoneSuccess("file"));
+      if (!client || !data) {
+        setVoiceStatus("error");
+        setError("Choose a cloud workspace before recording.");
+        return;
+      }
+      try {
         setVoiceStatus("processing");
         setRecordingNotice("Thinking…");
         const payload = await uploadMobileVoiceTurn({
           client,
           workspaceId: data.workspace.id,
           audioUri,
-          durationMs,
+          durationMs: capturedDurationMs,
           timeZone: data.timezone,
           context: conversationContext(conversationRef.current),
         });
@@ -542,21 +583,36 @@ function MobileApp() {
       }
       return;
     }
+    let stage: MicrophoneStage = "permission";
     try {
       const permission = await requestRecordingPermissionsAsync();
       if (!permission.granted) {
-        setError(
-          "Microphone permission is needed to capture a voice note. You can still type a reminder.",
-        );
+        recordMicrophoneDiagnostic(microphoneFailure("permission"));
+        setVoiceStatus("error");
+        setError(microphoneErrorMessage("permission"));
         return;
       }
+      recordMicrophoneDiagnostic(microphoneSuccess("permission"));
+      stage = "audio_session";
+      await setAudioModeAsync({
+        allowsRecording: true,
+        playsInSilentMode: true,
+      });
+      recordMicrophoneDiagnostic(microphoneSuccess("audio_session"));
+      stage = "prepare";
       await recorder.prepareToRecordAsync();
+      recordMicrophoneDiagnostic(microphoneSuccess("prepare"));
+      stage = "start";
       voiceTurnRef.current += 1;
       recorder.record();
+      if (!recorder.getStatus().isRecording)
+        throw new Error("Recorder did not enter recording state.");
+      recordMicrophoneDiagnostic(microphoneSuccess("start"));
       setVoiceStatus("recording");
       setRecordingNotice("Listening. Tap Stop when you are done.");
     } catch (reason) {
-      setError(errorMessage(reason));
+      recordMicrophoneDiagnostic(microphoneFailure(stage));
+      setError(microphoneErrorMessage(stage));
       setVoiceStatus("error");
     }
   };
@@ -685,7 +741,7 @@ function MobileApp() {
         )}
         {tab === "capture" && (
           <Capture
-            isRecording={recording.isRecording}
+            isRecording={recording.isRecording || voiceStatus === "recording"}
             seconds={Math.round(recording.durationMillis / 1000)}
             notice={recordingNotice}
             status={voiceStatus}
@@ -701,6 +757,7 @@ function MobileApp() {
             hasPendingSave={Boolean(pendingSave)}
             onRetryCloud={() => void reloadWorkspace()}
             diagnostics={cloudDiagnostics}
+            microphoneDiagnostics={microphoneDiagnostics}
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
@@ -904,6 +961,7 @@ function Capture({
   hasPendingSave,
   onRetryCloud,
   diagnostics,
+  microphoneDiagnostics,
   workspaceLoaded,
   showDiagnostics,
   onNewReminder,
@@ -922,6 +980,7 @@ function Capture({
   hasPendingSave: boolean;
   onRetryCloud(): void;
   diagnostics: CloudDiagnostic[];
+  microphoneDiagnostics: MicrophoneDiagnostic[];
   workspaceLoaded: boolean;
   showDiagnostics: boolean;
   onNewReminder(): void;
@@ -1012,6 +1071,22 @@ function Capture({
               ) : (
                 <Text style={styles.meta}>
                   No cloud operation has completed yet.
+                </Text>
+              )}
+              <Text style={styles.diagnosticHeading}>Microphone</Text>
+              {microphoneDiagnostics.length ? (
+                microphoneDiagnostics.map((diagnostic, index) => (
+                  <Text
+                    key={`${diagnostic.stage}-${index}`}
+                    style={styles.diagnosticText}
+                  >
+                    {diagnostic.outcome} · {diagnostic.stage} ·{" "}
+                    {diagnostic.category}
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.meta}>
+                  No microphone operation has run yet.
                 </Text>
               )}
             </>
@@ -1322,6 +1397,12 @@ const styles = StyleSheet.create({
     gap: 5,
   },
   diagnosticText: { color: COLORS.ink, fontSize: 12, lineHeight: 18 },
+  diagnosticHeading: {
+    color: COLORS.ink,
+    fontSize: 13,
+    fontWeight: "800",
+    marginTop: 6,
+  },
   modal: { padding: 24, gap: 13, backgroundColor: COLORS.cream, flexGrow: 1 },
   modalHeader: {
     flexDirection: "row",
