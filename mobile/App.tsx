@@ -2,6 +2,7 @@ import "react-native-url-polyfill/auto";
 import { StatusBar } from "expo-status-bar";
 import * as Crypto from "expo-crypto";
 import * as Speech from "expo-speech";
+import Constants from "expo-constants";
 import DateTimePicker from "@react-native-community/datetimepicker";
 import {
   RecordingPresets,
@@ -18,6 +19,7 @@ import {
   Pressable,
   RefreshControl,
   SafeAreaView,
+  Share,
   ScrollView,
   SectionList,
   StyleSheet,
@@ -112,6 +114,8 @@ import {
   datePickerLabel,
   datePickerValue,
 } from "./src/date-picker";
+import { readBuildInfo, shareableBuildInfo } from "./src/build-info";
+import { HandsFreeTurnTimer } from "./src/hands-free-timer";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
 type VoiceStatus =
@@ -126,6 +130,15 @@ type VadTransition = {
   turn: number;
   event: string;
   elapsedMs: number;
+};
+type HandsFreeLoopDiagnostics = {
+  timerRunning: boolean;
+  timerStarts: number;
+  timerTicks: number;
+  lastTimerTickAtMs: number | null;
+  lastPollAtMs: number | null;
+  lastPollAgeMs: number | null;
+  latestMeterAtMs: number | null;
 };
 const HANDS_FREE_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
@@ -145,6 +158,7 @@ const COLORS = {
 };
 
 function MobileApp() {
+  const buildInfo = readBuildInfo(Constants);
   const recorder = useAudioRecorder(HANDS_FREE_RECORDING_OPTIONS);
   const recording = useSafeRecorderStatus(
     recorder,
@@ -188,6 +202,13 @@ function MobileApp() {
   const handsFreeRecordingStartedAtRef = useRef<number | null>(null);
   const handsFreeStatusStartedAtRef = useRef<number | null>(null);
   const handsFreeWallElapsedRef = useRef(0);
+  const handsFreeTimerRef = useRef<HandsFreeTurnTimer | null>(null);
+  const handsFreeTimerTurnRef = useRef<number | null>(null);
+  const handsFreeTickRef = useRef<(turn: number) => void>(() => {});
+  const lastObservedPollAtRef = useRef<number | null>(null);
+  const observedPollCountRef = useRef(0);
+  const lastMeterDbRef = useRef<number | null>(null);
+  const lastMeterChangedAtRef = useRef<number | null>(null);
   const [assistantMuted, setAssistantMuted] = useState(false);
   const assistantMutedRef = useRef(false);
   const [transcript, setTranscript] = useState("");
@@ -217,6 +238,18 @@ function MobileApp() {
     MicrophoneDiagnostic[]
   >([]);
   const [vadTransitions, setVadTransitions] = useState<VadTransition[]>([]);
+  if (handsFreeTimerRef.current === null)
+    handsFreeTimerRef.current = new HandsFreeTurnTimer();
+  const [handsFreeLoopDiagnostics, setHandsFreeLoopDiagnostics] =
+    useState<HandsFreeLoopDiagnostics>({
+      timerRunning: false,
+      timerStarts: 0,
+      timerTicks: 0,
+      lastTimerTickAtMs: null,
+      lastPollAtMs: null,
+      lastPollAgeMs: null,
+      latestMeterAtMs: null,
+    });
 
   const recordCloudDiagnostic = useCallback((diagnostic: CloudDiagnostic) => {
     logCloudDiagnostic(diagnostic);
@@ -733,6 +766,49 @@ function MobileApp() {
     );
   };
 
+  // This ticker is deliberately started from the successful recorder-start
+  // path, rather than from a React effect that waits for recorder status
+  // updates. Expo Go may keep that status frozen while audio is recording.
+  const clearHandsFreeTicker = useCallback((turn?: number) => {
+    if (
+      turn !== undefined &&
+      handsFreeTimerTurnRef.current !== null &&
+      handsFreeTimerTurnRef.current !== turn
+    )
+      return;
+    handsFreeTimerRef.current?.stop();
+    handsFreeTimerTurnRef.current = null;
+    setHandsFreeLoopDiagnostics((current) => ({
+      ...current,
+      timerRunning: false,
+    }));
+  }, []);
+
+  const startHandsFreeTicker = useCallback(
+    (turn: number) => {
+      clearHandsFreeTicker();
+      handsFreeTimerTurnRef.current = turn;
+      lastObservedPollAtRef.current = null;
+      observedPollCountRef.current = 0;
+      lastMeterDbRef.current = null;
+      lastMeterChangedAtRef.current = null;
+      setHandsFreeLoopDiagnostics((current) => ({
+        ...current,
+        timerRunning: true,
+        timerStarts: current.timerStarts + 1,
+        timerTicks: 0,
+        lastTimerTickAtMs: null,
+        lastPollAtMs: null,
+        lastPollAgeMs: null,
+        latestMeterAtMs: null,
+      }));
+      const tick = () => handsFreeTickRef.current(turn);
+      tick();
+      handsFreeTimerRef.current?.start(tick, HANDS_FREE_STATUS_INTERVAL_MS);
+    },
+    [clearHandsFreeTicker],
+  );
+
   const startListeningTurn = useCallback(
     async (sessionId?: number) => {
       if (
@@ -801,6 +877,7 @@ function MobileApp() {
         recordVadTransition(turn, "recording_started", 0);
         recordMicrophoneDiagnostic(microphoneSuccess("start"));
         setVoiceStatus("listening");
+        if (sessionId !== undefined) startHandsFreeTicker(turn);
         setRecordingNotice(
           sessionId === undefined
             ? "Listening. Tap Stop when you are done."
@@ -813,7 +890,14 @@ function MobileApp() {
         setVoiceStatus("error");
       }
     },
-    [client, data, recorder, recordMicrophoneDiagnostic, recordVadTransition],
+    [
+      client,
+      data,
+      recorder,
+      recordMicrophoneDiagnostic,
+      recordVadTransition,
+      startHandsFreeTicker,
+    ],
   );
 
   useEffect(() => {
@@ -830,6 +914,7 @@ function MobileApp() {
       } = {},
     ) => {
       if (turn !== voiceTurnRef.current) return;
+      clearHandsFreeTicker(turn);
       const durationMs = Math.max(
         recordingRef.current.durationMillis,
         handsFreeRecorderStatusRef.current.durationMillis,
@@ -898,6 +983,7 @@ function MobileApp() {
     },
     [
       applyVoiceResult,
+      clearHandsFreeTicker,
       client,
       data,
       recorder,
@@ -944,110 +1030,113 @@ function MobileApp() {
     [recordMicrophoneDiagnostic, recordVadTransition, stopAndProcessRecording],
   );
 
-  // iOS can keep durationMillis at 0/1 while a valid recorder is running in
-  // Expo Go. VAD must therefore use a per-turn JS monotonic clock. Native
-  // status still proves the recorder is alive and supplies the meter, but a
-  // stale duration can never freeze speech, silence, or watchdog timeouts.
-  useEffect(() => {
-    const turn = activeRecordingTurnRef.current;
+  // Keep this implementation in a ref so the timer created by
+  // startListeningTurn survives ordinary React renders. Its clock has no
+  // dependency on recorder duration or on the recorder-status hook.
+  handsFreeTickRef.current = (turn) => {
     const recordingStartedAtMs = handsFreeRecordingStartedAtRef.current;
     const statusStartedAtMs = handsFreeStatusStartedAtRef.current;
     if (
-      !handsFreeActive ||
-      turn === null ||
       recordingStartedAtMs === null ||
       statusStartedAtMs === null ||
-      (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
-    )
+      activeRecordingTurnRef.current !== turn ||
+      !handsFreeActiveRef.current
+    ) {
+      clearHandsFreeTicker(turn);
       return;
-    let active = true;
-    const advance = () => {
-      if (
-        !active ||
-        activeRecordingTurnRef.current !== turn ||
-        handsFreeRecordingStartedAtRef.current !== recordingStartedAtMs ||
-        !handsFreeActiveRef.current
-      )
-        return;
+    }
 
-      const elapsedMs = handsFreeElapsedMs(
-        recordingStartedAtMs,
-        monotonicNowMs(),
-      );
-      handsFreeWallElapsedRef.current = elapsedMs;
-      const nativeStatus = recordingRef.current;
-      // A status from the previous turn has no authority over this one. The
-      // wall clock still advances, so a missing fresh sample reaches a clear
-      // recovery state instead of leaving Listening frozen forever.
-      const fresh = isFreshHandsFreeStatus(
-        nativeStatus.checkedAtMs,
-        statusStartedAtMs,
-      );
-      const meterDb = fresh ? nativeStatus.metering : undefined;
-      const snapshot = recorderStatusSnapshot(
-        nativeStatus,
-        nativeStatus.checkedAtMs ?? Date.now(),
-        handsFreeRecorderStatusRef.current.action,
-        elapsedMs,
-      );
-      setHandsFreeRecorderStatus(snapshot);
-      handsFreeRecorderStatusRef.current = snapshot;
+    const nowEpochMs = Date.now();
+    const elapsedMs = handsFreeElapsedMs(
+      recordingStartedAtMs,
+      monotonicNowMs(),
+    );
+    handsFreeWallElapsedRef.current = elapsedMs;
+    const nativeStatus = recordingRef.current;
+    const fresh = isFreshHandsFreeStatus(
+      nativeStatus.checkedAtMs,
+      statusStartedAtMs,
+    );
+    if (
+      nativeStatus.checkedAtMs !== null &&
+      nativeStatus.checkedAtMs !== lastObservedPollAtRef.current
+    ) {
+      lastObservedPollAtRef.current = nativeStatus.checkedAtMs;
+      observedPollCountRef.current += 1;
+    }
+    const meterDb = fresh ? nativeStatus.metering : undefined;
+    if (
+      Number.isFinite(meterDb) &&
+      (lastMeterDbRef.current === null ||
+        Math.abs((meterDb as number) - lastMeterDbRef.current) >= 0.1)
+    ) {
+      lastMeterDbRef.current = meterDb as number;
+      lastMeterChangedAtRef.current = nowEpochMs;
+    }
+    setHandsFreeLoopDiagnostics((current) => ({
+      ...current,
+      timerRunning: true,
+      timerTicks: current.timerTicks + 1,
+      lastTimerTickAtMs: nowEpochMs,
+      lastPollAtMs: nativeStatus.checkedAtMs,
+      lastPollAgeMs:
+        nativeStatus.checkedAtMs === null
+          ? null
+          : Math.max(0, nowEpochMs - nativeStatus.checkedAtMs),
+      latestMeterAtMs: lastMeterChangedAtRef.current,
+    }));
 
-      if (fresh && nativeStatus.nativeError) {
-        pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
-        return;
-      }
-      if (fresh && recorderStoppedUnexpectedly(snapshot)) {
-        pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
-        return;
-      }
-      const result = advanceVoiceActivity(
-        voiceActivityRef.current,
-        elapsedMs,
-        meterDb,
-      );
-      voiceActivityRef.current = result.state;
-      const next = { ...snapshot, action: result.action };
-      handsFreeRecorderStatusRef.current = next;
-      setHandsFreeRecorderStatus(next);
-      if (result.action !== "continue")
-        recordVadTransition(turn, result.action, elapsedMs);
-      if (result.action === "speech_started") {
-        setVoiceStatus("user_speaking");
-        setRecordingNotice("Hearing you…");
-        return;
-      }
-      if (
-        result.action === "meter_unavailable" ||
-        result.action === "meter_stalled"
-      ) {
-        pauseHandsFreeForMeterFailure(turn, result.action);
-        return;
-      }
-      if (
-        (result.action === "submit" || result.action === "retry_silence") &&
-        canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
-      ) {
-        autoFinalizeTurnRef.current = turn;
-        void stopAndProcessRecording(turn, {
-          discard: result.action === "retry_silence",
-          retryListening: result.action === "retry_silence",
-        });
-      }
-    };
-    advance();
-    const interval = setInterval(advance, HANDS_FREE_STATUS_INTERVAL_MS);
-    return () => {
-      active = false;
-      clearInterval(interval);
-    };
-  }, [
-    handsFreeActive,
-    pauseHandsFreeForMeterFailure,
-    recordVadTransition,
-    stopAndProcessRecording,
-    voiceStatus,
-  ]);
+    const snapshot = recorderStatusSnapshot(
+      nativeStatus,
+      nativeStatus.checkedAtMs ?? nowEpochMs,
+      handsFreeRecorderStatusRef.current.action,
+      elapsedMs,
+    );
+    handsFreeRecorderStatusRef.current = snapshot;
+    setHandsFreeRecorderStatus(snapshot);
+
+    if (fresh && nativeStatus.nativeError) {
+      pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
+      return;
+    }
+    if (fresh && recorderStoppedUnexpectedly(snapshot)) {
+      pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
+      return;
+    }
+    const result = advanceVoiceActivity(
+      voiceActivityRef.current,
+      elapsedMs,
+      meterDb,
+    );
+    voiceActivityRef.current = result.state;
+    const next = { ...snapshot, action: result.action };
+    handsFreeRecorderStatusRef.current = next;
+    setHandsFreeRecorderStatus(next);
+    if (result.action !== "continue")
+      recordVadTransition(turn, result.action, elapsedMs);
+    if (result.action === "speech_started") {
+      setVoiceStatus("user_speaking");
+      setRecordingNotice("Hearing you…");
+      return;
+    }
+    if (
+      result.action === "meter_unavailable" ||
+      result.action === "meter_stalled"
+    ) {
+      pauseHandsFreeForMeterFailure(turn, result.action);
+      return;
+    }
+    if (
+      (result.action === "submit" || result.action === "retry_silence") &&
+      canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
+    ) {
+      autoFinalizeTurnRef.current = turn;
+      void stopAndProcessRecording(turn, {
+        discard: result.action === "retry_silence",
+        retryListening: result.action === "retry_silence",
+      });
+    }
+  };
 
   useEffect(() => {
     if (
@@ -1076,6 +1165,8 @@ function MobileApp() {
   useEffect(
     () => () => {
       handsFreeActiveRef.current = false;
+      handsFreeTimerRef.current?.stop();
+      handsFreeTimerTurnRef.current = null;
       handsFreeRecordingStartedAtRef.current = null;
       handsFreeStatusStartedAtRef.current = null;
       handsFreeWallElapsedRef.current = 0;
@@ -1106,6 +1197,7 @@ function MobileApp() {
 
   const endHandsFreeConversation = async () => {
     handsFreeActiveRef.current = false;
+    clearHandsFreeTicker();
     setHandsFreeActive(false);
     handsFreeSessionRef.current += 1;
     voiceTurnRef.current += 1;
@@ -1318,6 +1410,7 @@ function MobileApp() {
             diagnostics={cloudDiagnostics}
             microphoneDiagnostics={microphoneDiagnostics}
             handsFreeRecorderStatus={handsFreeRecorderStatus}
+            handsFreeLoopDiagnostics={handsFreeLoopDiagnostics}
             voiceActivity={voiceActivityRef.current}
             vadTransitions={vadTransitions}
             workspaceLoaded={Boolean(data)}
@@ -1339,6 +1432,7 @@ function MobileApp() {
           <SettingsScreen
             workspace={data.workspace}
             timezone={timezone}
+            buildInfo={buildInfo}
             onSwitch={() => setShowWorkspacePicker(true)}
             onSignOut={() => void signOut()}
           />
@@ -1656,11 +1750,13 @@ function Tasks({
 function SettingsScreen({
   workspace,
   timezone,
+  buildInfo,
   onSwitch,
   onSignOut,
 }: {
   workspace: MobileWorkspace;
   timezone: string;
+  buildInfo: ReturnType<typeof readBuildInfo>;
   onSwitch(): void;
   onSignOut(): void;
 }) {
@@ -1674,6 +1770,28 @@ function SettingsScreen({
         <Text style={styles.meta}>Cloud-synced workspace</Text>
       </View>
       <PrimaryButton label="Switch workspace" onPress={onSwitch} />
+      <View style={styles.personCard}>
+        <Text style={styles.eyebrow}>BUILD INFORMATION</Text>
+        <Text selectable style={styles.meta}>
+          JavaScript commit · {buildInfo.commit}
+        </Text>
+        <Text selectable style={styles.meta}>
+          JavaScript build · {buildInfo.identifier}
+        </Text>
+        <Text selectable style={styles.meta}>
+          JavaScript bundle date · {buildInfo.builtAt}
+        </Text>
+        <Text selectable style={styles.meta}>
+          Native runtime · {buildInfo.nativeRuntime}
+        </Text>
+        <Pressable
+          onPress={() => {
+            void Share.share({ message: shareableBuildInfo(buildInfo) });
+          }}
+        >
+          <Text style={styles.link}>Share build information</Text>
+        </Pressable>
+      </View>
       <Pressable onPress={onSignOut}>
         <Text style={styles.deleteLink}>Sign out</Text>
       </Pressable>
@@ -1703,6 +1821,7 @@ function Capture({
   diagnostics,
   microphoneDiagnostics,
   handsFreeRecorderStatus,
+  handsFreeLoopDiagnostics,
   voiceActivity,
   vadTransitions,
   workspaceLoaded,
@@ -1731,6 +1850,7 @@ function Capture({
   diagnostics: CloudDiagnostic[];
   microphoneDiagnostics: MicrophoneDiagnostic[];
   handsFreeRecorderStatus: HandsFreeRecorderStatus;
+  handsFreeLoopDiagnostics: HandsFreeLoopDiagnostics;
   voiceActivity: VoiceActivityState;
   vadTransitions: VadTransition[];
   workspaceLoaded: boolean;
@@ -1862,6 +1982,25 @@ function Capture({
                 {Math.round(handsFreeRecorderStatus.durationMillis)}ms
                 {" · turn clock "}
                 {Math.round(handsFreeRecorderStatus.wallElapsedMs)}ms
+              </Text>
+              <Text style={styles.diagnosticText}>
+                VAD timer:{" "}
+                {handsFreeLoopDiagnostics.timerRunning ? "running" : "stopped"}
+                {" · starts: "}
+                {handsFreeLoopDiagnostics.timerStarts}
+                {" · ticks: "}
+                {handsFreeLoopDiagnostics.timerTicks}
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Last poll: {handsFreeLoopDiagnostics.lastPollAtMs ?? "none"}
+                {" · age: "}
+                {handsFreeLoopDiagnostics.lastPollAgeMs === null
+                  ? "unavailable"
+                  : `${Math.round(handsFreeLoopDiagnostics.lastPollAgeMs)}ms`}
+                {" · meter changed: "}
+                {handsFreeLoopDiagnostics.latestMeterAtMs === null
+                  ? "never"
+                  : `${Math.max(0, Date.now() - handsFreeLoopDiagnostics.latestMeterAtMs)}ms ago`}
               </Text>
               <Text style={styles.diagnosticText}>
                 Meter:{" "}

@@ -72,6 +72,10 @@ future-milestone work; the mobile app does not claim those features work.
    they are on the same trusted network.
 4. Sign in with the same account used on the web. The app restores a selected
    workspace or asks you to choose an authorized one.
+   Open **Settings → Build information** and confirm the JavaScript commit
+   matches `git rev-parse --short HEAD`. This identifies the Expo JavaScript
+   bundle separately from the installed Expo Go runtime. Use **Share build
+   information** when reporting a device result.
 5. On **Capture**, test **Start conversation** first. Speak one sentence, then
    pause for about 1–1.5 seconds. Capture should progress through **User
    Speaking**, **Processing**, and **Assistant Speaking**, then return to
