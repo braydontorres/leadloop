@@ -134,6 +134,10 @@ import {
   removeNaturalSpeechFile,
   requestNaturalSpeech,
 } from "./src/natural-speech-api";
+import {
+  isCurrentNaturalSpeechRequest,
+  naturalSpeechFailureDetails,
+} from "./src/natural-speech-response";
 import { primaryConversationControl } from "./src/capture-primary-control";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
@@ -158,6 +162,19 @@ type HandsFreeLoopDiagnostics = {
   lastPollAtMs: number | null;
   lastPollAgeMs: number | null;
   latestMeterAtMs: number | null;
+};
+type NaturalSpeechDiagnostic = {
+  source: "natural" | "device";
+  stage:
+    | "request"
+    | "response"
+    | "cache"
+    | "audio_session"
+    | "playback"
+    | "complete";
+  code: string | null;
+  voice: AssistantVoiceId;
+  speed: AssistantSpeed;
 };
 const HANDS_FREE_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
@@ -239,6 +256,8 @@ function MobileApp() {
   const naturalSpeechCompletionRef = useRef<(() => void) | null>(null);
   const naturalSpeechFallbackRef = useRef<(() => void) | null>(null);
   const naturalSpeechFileRef = useRef<ExpoFile | null>(null);
+  const [naturalSpeechDiagnostic, setNaturalSpeechDiagnostic] =
+    useState<NaturalSpeechDiagnostic | null>(null);
   const [transcript, setTranscript] = useState("");
   const [assistantReply, setAssistantReply] = useState("");
   const [pendingSave, setPendingSave] = useState<{
@@ -336,6 +355,9 @@ function MobileApp() {
   const updateAssistantPreferences = useCallback(
     (change: Partial<AssistantPreferences>) => {
       const next = { ...assistantPreferencesRef.current, ...change };
+      // A Preview press can follow a preference tap in the same native event
+      // sequence. Keep the request source synchronous with the selected UI.
+      assistantPreferencesRef.current = next;
       setAssistantPreferences(next);
       if (!sessionUserId || !data?.workspace.id) return;
       void saveAssistantPreferences(
@@ -375,9 +397,23 @@ function MobileApp() {
     const fallback = naturalSpeechFallbackRef.current;
     clearNaturalSpeech();
     if (playbackError) {
+      setNaturalSpeechDiagnostic((current) =>
+        current
+          ? {
+              ...current,
+              source: "device",
+              stage: "playback",
+              code: "SPEECH_PLAYBACK_FAILED",
+            }
+          : current,
+      );
       if (fallback) fallback();
-      else complete?.();
-    } else complete?.();
+    } else {
+      setNaturalSpeechDiagnostic((current) =>
+        current ? { ...current, stage: "complete", code: null } : current,
+      );
+      complete?.();
+    }
   }, [clearNaturalSpeech, naturalSpeechStatus]);
 
   const client = supabase;
@@ -713,7 +749,10 @@ function MobileApp() {
       const sessionId = handsFreeSessionRef.current;
       const playbackId = ++speechPlaybackRef.current;
       const complete = () => {
-        if (playbackId !== speechPlaybackRef.current) return;
+        if (
+          !isCurrentNaturalSpeechRequest(playbackId, speechPlaybackRef.current)
+        )
+          return;
         if (nextState.stage === "reading_back") {
           setConversation((current) => {
             const next = finishSpeech(current);
@@ -746,7 +785,10 @@ function MobileApp() {
         return;
       }
       const deviceFallback = () => {
-        if (playbackId !== speechPlaybackRef.current) return;
+        if (
+          !isCurrentNaturalSpeechRequest(playbackId, speechPlaybackRef.current)
+        )
+          return;
         try {
           Speech.stop();
           Speech.speak(reply, {
@@ -775,29 +817,70 @@ function MobileApp() {
         voice: preferences.voice,
         speed: preferences.speed,
       })
-        .then(async (file) => {
-          if (playbackId !== speechPlaybackRef.current) {
-            removeNaturalSpeechFile(file);
+        .then(async (naturalSpeech) => {
+          if (
+            !isCurrentNaturalSpeechRequest(
+              playbackId,
+              speechPlaybackRef.current,
+            )
+          ) {
+            removeNaturalSpeechFile(naturalSpeech.file);
             return;
           }
-          naturalSpeechFileRef.current = file;
+          try {
+            await setAudioModeAsync({
+              allowsRecording: false,
+              playsInSilentMode: true,
+            });
+          } catch {
+            removeNaturalSpeechFile(naturalSpeech.file);
+            setNaturalSpeechDiagnostic({
+              source: "device",
+              stage: "audio_session",
+              code: "SPEECH_AUDIO_SESSION_FAILED",
+              voice: preferences.voice,
+              speed: preferences.speed,
+            });
+            deviceFallback();
+            return;
+          }
+          if (
+            !isCurrentNaturalSpeechRequest(
+              playbackId,
+              speechPlaybackRef.current,
+            )
+          ) {
+            removeNaturalSpeechFile(naturalSpeech.file);
+            return;
+          }
+          naturalSpeechFileRef.current = naturalSpeech.file;
           naturalSpeechCompletionRef.current = complete;
           naturalSpeechFallbackRef.current = deviceFallback;
-          await setAudioModeAsync({
-            allowsRecording: false,
-            playsInSilentMode: true,
+          setNaturalSpeechDiagnostic({
+            source: "natural",
+            stage: "playback",
+            code: null,
+            voice: naturalSpeech.voice,
+            speed: naturalSpeech.speed,
           });
-          if (playbackId !== speechPlaybackRef.current) {
-            clearNaturalSpeech();
-            return;
-          }
-          naturalSpeechPlayer.replace(file.uri);
+          naturalSpeechPlayer.replace(naturalSpeech.file.uri);
           naturalSpeechPlayer.play();
         })
-        .catch(() => {
+        .catch((error: unknown) => {
           // Natural synthesis is an opt-in enhancement. A network or provider
           // failure must never prevent the existing device voice or listening.
-          clearNaturalSpeech();
+          const failure = naturalSpeechFailureDetails(error);
+          if (
+            isCurrentNaturalSpeechRequest(playbackId, speechPlaybackRef.current)
+          )
+            clearNaturalSpeech();
+          setNaturalSpeechDiagnostic({
+            source: "device",
+            stage: failure.stage,
+            code: failure.code,
+            voice: preferences.voice,
+            speed: preferences.speed,
+          });
           deviceFallback();
         });
     },
@@ -818,7 +901,8 @@ function MobileApp() {
         return;
       }
       const playbackId = ++speechPlaybackRef.current;
-      const text = "Hi, I’m LeadLoop. I’ll help you keep your business moving.";
+      const speed = assistantPreferencesRef.current.speed;
+      const text = `Hi, I’m LeadLoop. This is the ${voice} natural AI voice at ${speed} pace. I’ll help you keep your business moving.`;
       Speech.stop();
       clearNaturalSpeech();
       setNotice("Preparing your natural voice preview…");
@@ -827,47 +911,101 @@ function MobileApp() {
         workspaceId: data.workspace.id,
         text,
         voice,
-        speed: assistantPreferencesRef.current.speed,
+        speed,
       })
-        .then(async (file) => {
-          if (playbackId !== speechPlaybackRef.current) {
-            removeNaturalSpeechFile(file);
+        .then(async (naturalSpeech) => {
+          if (
+            !isCurrentNaturalSpeechRequest(
+              playbackId,
+              speechPlaybackRef.current,
+            )
+          ) {
+            removeNaturalSpeechFile(naturalSpeech.file);
             return;
           }
-          naturalSpeechFileRef.current = file;
+          try {
+            await setAudioModeAsync({
+              allowsRecording: false,
+              playsInSilentMode: true,
+            });
+          } catch {
+            removeNaturalSpeechFile(naturalSpeech.file);
+            setNaturalSpeechDiagnostic({
+              source: "device",
+              stage: "audio_session",
+              code: "SPEECH_AUDIO_SESSION_FAILED",
+              voice,
+              speed,
+            });
+            setNotice(
+              "Device fallback · audio session · SPEECH_AUDIO_SESSION_FAILED",
+            );
+            Speech.speak(text, { rate: deviceSpeechRate(speed) });
+            return;
+          }
+          if (
+            !isCurrentNaturalSpeechRequest(
+              playbackId,
+              speechPlaybackRef.current,
+            )
+          ) {
+            removeNaturalSpeechFile(naturalSpeech.file);
+            return;
+          }
+          naturalSpeechFileRef.current = naturalSpeech.file;
           naturalSpeechCompletionRef.current = () => {
-            if (playbackId !== speechPlaybackRef.current) return;
-            setNotice("Natural voice preview finished.");
+            if (
+              !isCurrentNaturalSpeechRequest(
+                playbackId,
+                speechPlaybackRef.current,
+              )
+            )
+              return;
+            setNotice(`Natural AI preview finished · ${voice} · ${speed}`);
           };
           naturalSpeechFallbackRef.current = () => {
-            if (playbackId !== speechPlaybackRef.current) return;
-            setNotice(
-              "Natural preview could not play. Playing the device voice instead.",
-            );
-            Speech.speak(text, {
-              rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
-            });
+            if (
+              !isCurrentNaturalSpeechRequest(
+                playbackId,
+                speechPlaybackRef.current,
+              )
+            )
+              return;
+            setNotice("Device fallback · playback · SPEECH_PLAYBACK_FAILED");
+            Speech.speak(text, { rate: deviceSpeechRate(speed) });
           };
-          await setAudioModeAsync({
-            allowsRecording: false,
-            playsInSilentMode: true,
+          setNaturalSpeechDiagnostic({
+            source: "natural",
+            stage: "playback",
+            code: null,
+            voice: naturalSpeech.voice,
+            speed: naturalSpeech.speed,
           });
-          if (playbackId !== speechPlaybackRef.current) {
-            clearNaturalSpeech();
-            return;
-          }
-          naturalSpeechPlayer.replace(file.uri);
+          setNotice(
+            `Natural AI preview · ${naturalSpeech.voice} · ${naturalSpeech.speed}`,
+          );
+          naturalSpeechPlayer.replace(naturalSpeech.file.uri);
           naturalSpeechPlayer.play();
         })
-        .catch(() => {
-          if (playbackId !== speechPlaybackRef.current) return;
+        .catch((error: unknown) => {
+          if (
+            !isCurrentNaturalSpeechRequest(
+              playbackId,
+              speechPlaybackRef.current,
+            )
+          )
+            return;
+          const failure = naturalSpeechFailureDetails(error);
           clearNaturalSpeech();
-          setNotice(
-            "Natural preview was unavailable. Playing the device voice instead.",
-          );
-          Speech.speak(text, {
-            rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
+          setNaturalSpeechDiagnostic({
+            source: "device",
+            stage: failure.stage,
+            code: failure.code,
+            voice,
+            speed,
           });
+          setNotice(`Device fallback · ${failure.stage} · ${failure.code}`);
+          Speech.speak(text, { rate: deviceSpeechRate(speed) });
         });
     },
     [clearNaturalSpeech, client, data, naturalSpeechPlayer],
@@ -1651,6 +1789,7 @@ function MobileApp() {
             timezone={timezone}
             buildInfo={buildInfo}
             assistantPreferences={assistantPreferences}
+            naturalSpeechDiagnostic={naturalSpeechDiagnostic}
             onAssistantPreferences={updateAssistantPreferences}
             onPreviewVoice={previewNaturalVoice}
             onSwitch={() => setShowWorkspacePicker(true)}
@@ -1972,6 +2111,7 @@ function SettingsScreen({
   timezone,
   buildInfo,
   assistantPreferences,
+  naturalSpeechDiagnostic,
   onAssistantPreferences,
   onPreviewVoice,
   onSwitch,
@@ -1981,6 +2121,7 @@ function SettingsScreen({
   timezone: string;
   buildInfo: ReturnType<typeof readBuildInfo>;
   assistantPreferences: AssistantPreferences;
+  naturalSpeechDiagnostic: NaturalSpeechDiagnostic | null;
   onAssistantPreferences(change: Partial<AssistantPreferences>): void;
   onPreviewVoice(voice: AssistantVoiceId): void;
   onSwitch(): void;
@@ -2096,6 +2237,19 @@ function SettingsScreen({
           workspace schema has no voice-preference field, so LeadLoop does not
           silently sync them across devices yet.
         </Text>
+        {naturalSpeechDiagnostic ? (
+          <Text selectable style={styles.meta}>
+            Last voice playback ·{" "}
+            {naturalSpeechDiagnostic.source === "natural"
+              ? "Natural AI"
+              : "Device fallback"}{" "}
+            · {naturalSpeechDiagnostic.voice} · {naturalSpeechDiagnostic.speed}{" "}
+            · {naturalSpeechDiagnostic.stage}
+            {naturalSpeechDiagnostic.code
+              ? ` · ${naturalSpeechDiagnostic.code}`
+              : ""}
+          </Text>
+        ) : null}
       </View>
       <View style={styles.personCard}>
         <Text style={styles.eyebrow}>BUILD INFORMATION</Text>

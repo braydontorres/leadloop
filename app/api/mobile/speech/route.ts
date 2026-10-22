@@ -87,6 +87,12 @@ export async function POST(request: Request) {
         "Content-Type": "audio/mpeg",
         "Cache-Control": "no-store, private",
         "Content-Length": String(audio.byteLength),
+        // These non-secret response markers let a native client verify that
+        // it received the exact requested generated audio instead of quietly
+        // falling back to device speech.
+        "X-LeadLoop-Speech-Source": "openai-tts",
+        "X-LeadLoop-Speech-Voice": input.voice,
+        "X-LeadLoop-Speech-Speed": input.speed,
       },
     });
   } catch (error) {

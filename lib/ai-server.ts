@@ -28,9 +28,11 @@ export const NATURAL_SPEECH_SPEEDS = ["relaxed", "normal", "fast"] as const;
 export type NaturalSpeechSpeed = (typeof NATURAL_SPEECH_SPEEDS)[number];
 
 const naturalSpeechRates: Record<NaturalSpeechSpeed, number> = {
-  relaxed: 0.9,
+  // Make the three owner-facing choices readily audible in a short preview.
+  // All values are within the provider's supported range.
+  relaxed: 0.75,
   normal: 1,
-  fast: 1.12,
+  fast: 1.35,
 };
 
 export function isNaturalSpeechVoice(

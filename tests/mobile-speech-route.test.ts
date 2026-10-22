@@ -74,6 +74,12 @@ test("mobile natural speech authorizes the workspace and returns a no-store MP3"
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("content-type"), "audio/mpeg");
     assert.match(response.headers.get("cache-control") ?? "", /no-store/);
+    assert.equal(
+      response.headers.get("x-leadloop-speech-source"),
+      "openai-tts",
+    );
+    assert.equal(response.headers.get("x-leadloop-speech-voice"), "alloy");
+    assert.equal(response.headers.get("x-leadloop-speech-speed"), "normal");
     assert.deepEqual(
       new Uint8Array(await response.arrayBuffer()),
       new Uint8Array([73, 68, 51, 4]),
@@ -87,6 +93,62 @@ test("mobile natural speech authorizes the workspace and returns a no-store MP3"
       instructions:
         "Speak warmly and conversationally, with clear pacing for a small-business owner.",
     });
+  } finally {
+    globalThis.fetch = previous.fetch;
+    if (previous.url === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    else process.env.NEXT_PUBLIC_SUPABASE_URL = previous.url;
+    if (previous.key === undefined)
+      delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    else process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = previous.key;
+    if (previous.openAi === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous.openAi;
+  }
+});
+
+test("mobile natural speech preserves the requested voice and contrasting pace", async () => {
+  const previous = {
+    url: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    key: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    openAi: process.env.OPENAI_API_KEY,
+    fetch: globalThis.fetch,
+  };
+  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "public-key";
+  process.env.OPENAI_API_KEY = "test-key";
+  resetRateLimitsForTest();
+  let speechPayload: Record<string, unknown> | undefined;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    if (url.endsWith("/auth/v1/user"))
+      return new Response(JSON.stringify({ id: "user-1" }), { status: 200 });
+    if (url.includes("/rest/v1/workspace_members"))
+      return new Response(JSON.stringify([{ workspace_id: workspaceId }]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    if (url.includes("/audio/speech")) {
+      speechPayload = JSON.parse(String(init?.body));
+      return new Response(new Uint8Array([73, 68, 51, 4]), { status: 200 });
+    }
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const response = await POST(
+      request(
+        {
+          workspaceId,
+          text: "Preview this voice.",
+          voice: "onyx",
+          speed: "fast",
+        },
+        { Authorization: "Bearer signed-user-token" },
+      ),
+    );
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("x-leadloop-speech-voice"), "onyx");
+    assert.equal(response.headers.get("x-leadloop-speech-speed"), "fast");
+    assert.equal(speechPayload?.voice, "onyx");
+    assert.equal(speechPayload?.speed, 1.35);
   } finally {
     globalThis.fetch = previous.fetch;
     if (previous.url === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
