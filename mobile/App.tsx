@@ -92,7 +92,11 @@ import {
   recorderStoppedUnexpectedly,
   type HandsFreeRecorderStatus,
 } from "./src/hands-free-recorder-status";
-import { statusBelongsToActiveTurn } from "./src/hands-free-status-sync";
+import {
+  handsFreeElapsedMs,
+  isFreshHandsFreeStatus,
+  monotonicNowMs,
+} from "./src/hands-free-turn-clock";
 import {
   readRecorderStatus,
   readRecorderUri,
@@ -146,6 +150,10 @@ function MobileApp() {
     recorder,
     HANDS_FREE_STATUS_INTERVAL_MS,
   );
+  // The interval callbacks below intentionally read the newest native sample,
+  // rather than closing over the sample from the render that created them.
+  const recordingRef = useRef(recording);
+  recordingRef.current = recording;
   const [tab, setTab] = useState<Tab>("home");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -178,6 +186,8 @@ function MobileApp() {
     initialHandsFreeRecorderStatus,
   );
   const handsFreeRecordingStartedAtRef = useRef<number | null>(null);
+  const handsFreeStatusStartedAtRef = useRef<number | null>(null);
+  const handsFreeWallElapsedRef = useRef(0);
   const [assistantMuted, setAssistantMuted] = useState(false);
   const assistantMutedRef = useRef(false);
   const [transcript, setTranscript] = useState("");
@@ -731,7 +741,10 @@ function MobileApp() {
           sessionId !== handsFreeSessionRef.current)
       )
         return;
-      if (recording.isRecording || activeRecordingTurnRef.current !== null)
+      if (
+        recordingRef.current.isRecording ||
+        activeRecordingTurnRef.current !== null
+      )
         return;
       if (!client || !data) {
         setVoiceStatus("error");
@@ -772,19 +785,20 @@ function MobileApp() {
         const recorderStatus = readRecorderStatus(recorder);
         if (recorderStatus.nativeError || !recorderStatus.isRecording)
           throw new Error("Recorder did not enter recording state.");
-        const recordingStartedAtMs = Date.now();
+        const recordingStartedAtMs = monotonicNowMs();
+        const statusStartedAtMs = Date.now();
         handsFreeRecordingStartedAtRef.current = recordingStartedAtMs;
+        handsFreeStatusStartedAtRef.current = statusStartedAtMs;
+        handsFreeWallElapsedRef.current = 0;
         const initialStatus = recorderStatusSnapshot(
           recorderStatus,
-          recordingStartedAtMs,
+          statusStartedAtMs,
+          "waiting",
+          0,
         );
         handsFreeRecorderStatusRef.current = initialStatus;
         setHandsFreeRecorderStatus(initialStatus);
-        recordVadTransition(
-          turn,
-          "recording_started",
-          initialStatus.durationMillis,
-        );
+        recordVadTransition(turn, "recording_started", 0);
         recordMicrophoneDiagnostic(microphoneSuccess("start"));
         setVoiceStatus("listening");
         setRecordingNotice(
@@ -799,14 +813,7 @@ function MobileApp() {
         setVoiceStatus("error");
       }
     },
-    [
-      client,
-      data,
-      recorder,
-      recording.isRecording,
-      recordMicrophoneDiagnostic,
-      recordVadTransition,
-    ],
+    [client, data, recorder, recordMicrophoneDiagnostic, recordVadTransition],
   );
 
   useEffect(() => {
@@ -824,8 +831,9 @@ function MobileApp() {
     ) => {
       if (turn !== voiceTurnRef.current) return;
       const durationMs = Math.max(
-        recording.durationMillis,
+        recordingRef.current.durationMillis,
         handsFreeRecorderStatusRef.current.durationMillis,
+        handsFreeWallElapsedRef.current,
       );
       try {
         await recorder.stop();
@@ -893,7 +901,6 @@ function MobileApp() {
       client,
       data,
       recorder,
-      recording.durationMillis,
       recordCloudDiagnostic,
       recordMicrophoneDiagnostic,
     ],
@@ -912,11 +919,7 @@ function MobileApp() {
       autoFinalizeTurnRef.current = turn;
       if (action === "recorder_invalidated")
         recordMicrophoneDiagnostic(microphoneFailure("status"));
-      recordVadTransition(
-        turn,
-        action,
-        handsFreeRecorderStatusRef.current.durationMillis,
-      );
+      recordVadTransition(turn, action, handsFreeWallElapsedRef.current);
       const message =
         action === "recorder_invalidated"
           ? "The iPhone recorder was interrupted or reloaded. Reload Expo, then start the conversation again."
@@ -941,85 +944,105 @@ function MobileApp() {
     [recordMicrophoneDiagnostic, recordVadTransition, stopAndProcessRecording],
   );
 
-  // Only status samples taken after this turn started may drive VAD. This
-  // prevents a just-started conversation from consuming the previous turn's
-  // inactive status while React is applying state updates.
-  useEffect(() => {
-    if (
-      !handsFreeActive ||
-      !statusBelongsToActiveTurn(
-        recording.checkedAtMs,
-        handsFreeRecordingStartedAtRef.current,
-      )
-    )
-      return;
-    setHandsFreeRecorderStatus((current) => {
-      const next = recorderStatusSnapshot(
-        recording,
-        recording.checkedAtMs as number,
-        current.action,
-      );
-      handsFreeRecorderStatusRef.current = next;
-      return next;
-    });
-  }, [handsFreeActive, recording]);
-
+  // iOS can keep durationMillis at 0/1 while a valid recorder is running in
+  // Expo Go. VAD must therefore use a per-turn JS monotonic clock. Native
+  // status still proves the recorder is alive and supplies the meter, but a
+  // stale duration can never freeze speech, silence, or watchdog timeouts.
   useEffect(() => {
     const turn = activeRecordingTurnRef.current;
-    const recorderStatus = handsFreeRecorderStatus;
+    const recordingStartedAtMs = handsFreeRecordingStartedAtRef.current;
+    const statusStartedAtMs = handsFreeStatusStartedAtRef.current;
     if (
       !handsFreeActive ||
       turn === null ||
-      recorderStatus.checkedAtMs === null ||
+      recordingStartedAtMs === null ||
+      statusStartedAtMs === null ||
       (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
     )
       return;
-    if (recorderStatus.nativeError) {
-      pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
-      return;
-    }
-    if (recorderStoppedUnexpectedly(recorderStatus)) {
-      pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
-      return;
-    }
-    const result = advanceVoiceActivity(
-      voiceActivityRef.current,
-      recorderStatus.durationMillis,
-      recorderStatus.meterDb,
-    );
-    voiceActivityRef.current = result.state;
-    setHandsFreeRecorderStatus((current) => {
-      const next = { ...current, action: result.action };
+    let active = true;
+    const advance = () => {
+      if (
+        !active ||
+        activeRecordingTurnRef.current !== turn ||
+        handsFreeRecordingStartedAtRef.current !== recordingStartedAtMs ||
+        !handsFreeActiveRef.current
+      )
+        return;
+
+      const elapsedMs = handsFreeElapsedMs(
+        recordingStartedAtMs,
+        monotonicNowMs(),
+      );
+      handsFreeWallElapsedRef.current = elapsedMs;
+      const nativeStatus = recordingRef.current;
+      // A status from the previous turn has no authority over this one. The
+      // wall clock still advances, so a missing fresh sample reaches a clear
+      // recovery state instead of leaving Listening frozen forever.
+      const fresh = isFreshHandsFreeStatus(
+        nativeStatus.checkedAtMs,
+        statusStartedAtMs,
+      );
+      const meterDb = fresh ? nativeStatus.metering : undefined;
+      const snapshot = recorderStatusSnapshot(
+        nativeStatus,
+        nativeStatus.checkedAtMs ?? Date.now(),
+        handsFreeRecorderStatusRef.current.action,
+        elapsedMs,
+      );
+      setHandsFreeRecorderStatus(snapshot);
+      handsFreeRecorderStatusRef.current = snapshot;
+
+      if (fresh && nativeStatus.nativeError) {
+        pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
+        return;
+      }
+      if (fresh && recorderStoppedUnexpectedly(snapshot)) {
+        pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
+        return;
+      }
+      const result = advanceVoiceActivity(
+        voiceActivityRef.current,
+        elapsedMs,
+        meterDb,
+      );
+      voiceActivityRef.current = result.state;
+      const next = { ...snapshot, action: result.action };
       handsFreeRecorderStatusRef.current = next;
-      return next;
-    });
-    if (result.action !== "continue")
-      recordVadTransition(turn, result.action, recorderStatus.durationMillis);
-    if (result.action === "speech_started") {
-      setVoiceStatus("user_speaking");
-      setRecordingNotice("Hearing you…");
-      return;
-    }
-    if (
-      result.action === "meter_unavailable" ||
-      result.action === "meter_stalled"
-    ) {
-      pauseHandsFreeForMeterFailure(turn, result.action);
-      return;
-    }
-    if (
-      (result.action === "submit" || result.action === "retry_silence") &&
-      canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
-    ) {
-      autoFinalizeTurnRef.current = turn;
-      void stopAndProcessRecording(turn, {
-        discard: result.action === "retry_silence",
-        retryListening: result.action === "retry_silence",
-      });
-    }
+      setHandsFreeRecorderStatus(next);
+      if (result.action !== "continue")
+        recordVadTransition(turn, result.action, elapsedMs);
+      if (result.action === "speech_started") {
+        setVoiceStatus("user_speaking");
+        setRecordingNotice("Hearing you…");
+        return;
+      }
+      if (
+        result.action === "meter_unavailable" ||
+        result.action === "meter_stalled"
+      ) {
+        pauseHandsFreeForMeterFailure(turn, result.action);
+        return;
+      }
+      if (
+        (result.action === "submit" || result.action === "retry_silence") &&
+        canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
+      ) {
+        autoFinalizeTurnRef.current = turn;
+        void stopAndProcessRecording(turn, {
+          discard: result.action === "retry_silence",
+          retryListening: result.action === "retry_silence",
+        });
+      }
+    };
+    advance();
+    const interval = setInterval(advance, HANDS_FREE_STATUS_INTERVAL_MS);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, [
     handsFreeActive,
-    handsFreeRecorderStatus,
     pauseHandsFreeForMeterFailure,
     recordVadTransition,
     stopAndProcessRecording,
@@ -1053,6 +1076,9 @@ function MobileApp() {
   useEffect(
     () => () => {
       handsFreeActiveRef.current = false;
+      handsFreeRecordingStartedAtRef.current = null;
+      handsFreeStatusStartedAtRef.current = null;
+      handsFreeWallElapsedRef.current = 0;
       voiceTurnRef.current += 1;
       speechPlaybackRef.current += 1;
       Speech.stop();
@@ -1085,6 +1111,8 @@ function MobileApp() {
     voiceTurnRef.current += 1;
     autoFinalizeTurnRef.current = null;
     handsFreeRecordingStartedAtRef.current = null;
+    handsFreeStatusStartedAtRef.current = null;
+    handsFreeWallElapsedRef.current = 0;
     speechPlaybackRef.current += 1;
     Speech.stop();
     try {
@@ -1261,7 +1289,7 @@ function MobileApp() {
             }
             seconds={Math.round(
               (handsFreeActive
-                ? handsFreeRecorderStatus.durationMillis
+                ? handsFreeRecorderStatus.wallElapsedMs
                 : recording.durationMillis) / 1000,
             )}
             notice={recordingNotice}
@@ -1830,7 +1858,10 @@ function Capture({
                 Hands-free recorder:{" "}
                 {handsFreeRecorderStatus.active ? "active" : "inactive"}
                 {" · "}
+                native duration{" "}
                 {Math.round(handsFreeRecorderStatus.durationMillis)}ms
+                {" · turn clock "}
+                {Math.round(handsFreeRecorderStatus.wallElapsedMs)}ms
               </Text>
               <Text style={styles.diagnosticText}>
                 Meter:{" "}
@@ -1856,7 +1887,8 @@ function Capture({
               </Text>
               <Text style={styles.diagnosticText}>
                 Native recorder error:{" "}
-                {handsFreeRecorderStatus.action === "recorder_invalidated"
+                {handsFreeRecorderStatus.nativeError ||
+                handsFreeRecorderStatus.action === "recorder_invalidated"
                   ? "recorder reference invalidated"
                   : "none"}
               </Text>

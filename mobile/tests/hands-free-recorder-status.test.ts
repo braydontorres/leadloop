@@ -16,6 +16,7 @@ test("hands-free recorder lifecycle preserves active meter and duration samples"
     durationMillis: 420,
     meterDb: -37.5,
     checkedAtMs: 1_000,
+    wallElapsedMs: 0,
     nativeError: null,
     action: "waiting",
   });

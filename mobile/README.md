@@ -25,6 +25,12 @@ this app never contains a service-role or OpenAI key.
   displays the transcript, speaks LeadLoop's response when iOS speech is
   available, reads a complete reminder back, and writes only after an explicit
   voice or **Yes, save it** confirmation.
+- Hands-free turns use a monotonic JavaScript clock for speech and silence
+  timing, so a frozen iOS `durationMillis` cannot leave Capture permanently in
+  **Listening**. Native recorder status remains a health and upload-metadata
+  source. If iOS supplies no changing microphone levels, Capture stops that
+  turn with a clear recovery message instead of guessing; **Record one turn**
+  remains available.
 
 Voice processing needs a trusted HTTPS Next.js server with the existing
 `OPENAI_API_KEY`, plus the public Supabase URL and publishable/anon key in its
@@ -66,15 +72,22 @@ future-milestone work; the mobile app does not claim those features work.
    they are on the same trusted network.
 4. Sign in with the same account used on the web. The app restores a selected
    workspace or asks you to choose an authorized one.
-5. On **Capture**, tap **Tap to talk**, grant microphone permission, speak,
-   and tap **Stop**. Confirm that the transcription and spoken response match
-   what you said. Answer a missing-detail question with another recording.
-   When LeadLoop reads the full reminder back, say “Yes” or tap **Yes, save
-   it**. Verify the reminder appears in Today after cloud persistence returns.
+5. On **Capture**, test **Start conversation** first. Speak one sentence, then
+   pause for about 1–1.5 seconds. Capture should progress through **User
+   Speaking**, **Processing**, and **Assistant Speaking**, then return to
+   **Listening**. Development diagnostics should show the turn clock advancing
+   even if native duration remains 0 ms. If the meter does not change, Capture
+   will show an automatic-detection error; use **Record one turn** and retain
+   the diagnostics. When LeadLoop reads the full reminder back, say “Yes” or
+   tap **Yes, save it**. Verify the reminder appears in Today after cloud
+   persistence returns.
 
-Expo Go supporting SDK 57 is compatible with this MVP. Native speech playback
-uses `expo-speech`; Siri/App Intents, background listening, push notifications,
-offline write queues, and physical-device automated tests remain later work.
+Expo Go supporting SDK 57 is compatible with the tap-to-talk MVP. Hands-free
+still requires physical-device verification because Expo Go recorder metering
+can vary by iOS/runtime version; this repository does not yet claim an
+AVAudioEngine development-build VAD. Native speech playback uses `expo-speech`;
+Siri/App Intents, background listening, push notifications, offline write
+queues, and physical-device automated tests remain later work.
 
 ## Verification
 

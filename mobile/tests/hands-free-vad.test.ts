@@ -57,6 +57,13 @@ test("unavailable or frozen meters pause instead of leaving a turn listening", (
   assert.equal(stalled.action, "meter_stalled");
 });
 
+test("a constant numeric meter is not accepted as evidence of speech", () => {
+  let state = newVoiceActivity();
+  ({ state } = frame(state, 100, -52));
+  const result = frame(state, HANDS_FREE_VAD.meterStalledMs + 200, -52);
+  assert.equal(result.action, "meter_stalled");
+});
+
 test("a frozen meter after speech is actionable rather than blocking silence forever", () => {
   let state = newVoiceActivity();
   ({ state } = frame(state, 100, -75));
