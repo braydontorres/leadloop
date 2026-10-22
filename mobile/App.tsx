@@ -2,6 +2,7 @@ import "react-native-url-polyfill/auto";
 import { StatusBar } from "expo-status-bar";
 import * as Crypto from "expo-crypto";
 import * as Speech from "expo-speech";
+import DateTimePicker from "@react-native-community/datetimepicker";
 import {
   RecordingPresets,
   requestRecordingPermissionsAsync,
@@ -73,6 +74,11 @@ import {
   type MicrophoneDiagnostic,
   type MicrophoneStage,
 } from "./src/microphone-diagnostics";
+import {
+  timeInputFromPicker,
+  timePickerLabel,
+  timePickerValue,
+} from "./src/time-picker";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
 const COLORS = {
@@ -416,16 +422,30 @@ function MobileApp() {
       setError("Choose a date and time before saving this reminder.");
       return;
     }
-    const due = fromLocalInput(`${date}T${time}`, data.timezone);
+    let due: string;
+    try {
+      due = fromLocalInput(`${date}T${time}`, data.timezone);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Choose a valid date and time before saving this reminder.",
+      );
+      return;
+    }
     if (!due || Number.isNaN(Date.parse(due))) {
-      setError("Use a valid date and time, for example 2026-10-21 and 15:00.");
+      setError("Choose a valid date and time before saving this reminder.");
       return;
     }
     const task: Task = {
       id: editingTask?.id ?? Crypto.randomUUID(),
       title: title.trim(),
       person: selectedPerson?.name ?? editingTask?.person ?? "",
-      ...(selectedPerson ? { personId: selectedPerson.id } : {}),
+      ...(selectedPerson
+        ? { personId: selectedPerson.id }
+        : editingTask?.personId
+          ? { personId: editingTask.personId }
+          : {}),
       due,
       completed: editingTask?.completed ?? false,
       notes: editingTask?.notes ?? "",
@@ -932,14 +952,20 @@ function MobileApp() {
                 onChangeText={setDate}
                 autoCapitalize="none"
               />
-              <Text style={styles.fieldLabel}>Time (24-hour HH:MM)</Text>
-              <TextInput
-                placeholder="15:00"
-                placeholderTextColor={COLORS.muted}
-                style={styles.input}
-                value={time}
-                onChangeText={setTime}
-                autoCapitalize="none"
+              <Text style={styles.fieldLabel}>Time</Text>
+              <Text style={styles.timePickerValue}>
+                {timePickerLabel(time)}
+              </Text>
+              <DateTimePicker
+                value={timePickerValue(time)}
+                mode="time"
+                display="spinner"
+                locale="en-US"
+                is24Hour={false}
+                onChange={(_event, selectedTime) => {
+                  if (selectedTime) setTime(timeInputFromPicker(selectedTime));
+                }}
+                style={styles.timePicker}
               />
               <Text style={styles.fieldLabel}>Customer (optional)</Text>
               <ScrollView
@@ -1507,6 +1533,17 @@ const styles = StyleSheet.create({
   },
   tallInput: { minHeight: 92, textAlignVertical: "top" },
   fieldLabel: { color: COLORS.ink, fontWeight: "700", marginTop: 4 },
+  timePickerValue: {
+    color: COLORS.ink,
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  timePicker: {
+    alignSelf: "stretch",
+    height: 154,
+    marginBottom: 8,
+  },
   primary: {
     minHeight: 54,
     borderRadius: 27,

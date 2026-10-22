@@ -7,6 +7,7 @@ export function taskDateTimeLabel(iso: string, timeZone: string) {
     day: "numeric",
     hour: "numeric",
     minute: "2-digit",
+    hour12: true,
   }).format(new Date(iso));
 }
 
