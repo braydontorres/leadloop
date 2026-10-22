@@ -12,7 +12,11 @@ export type HandsFreeRecorderStatus = {
   durationMillis: number;
   meterDb: number | undefined;
   checkedAtMs: number | null;
-  action: VoiceActivityAction | "waiting" | "recorder_inactive";
+  action:
+    | VoiceActivityAction
+    | "waiting"
+    | "recorder_inactive"
+    | "recorder_invalidated";
 };
 
 export const initialHandsFreeRecorderStatus: HandsFreeRecorderStatus = {

@@ -25,4 +25,6 @@ test("microphone start and usable-file outcomes are explicit", () => {
   assert.equal(microphoneSuccess("start").outcome, "succeeded");
   assert.equal(microphoneFailure("file").category, "file");
   assert.match(microphoneErrorMessage("file"), /audio file/i);
+  assert.equal(microphoneFailure("status").category, "recorder");
+  assert.match(microphoneErrorMessage("status"), /interrupted or reloaded/i);
 });

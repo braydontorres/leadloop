@@ -8,7 +8,6 @@ import {
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
   useAudioRecorder,
-  useAudioRecorderState,
 } from "expo-audio";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -92,6 +91,11 @@ import {
   type HandsFreeRecorderStatus,
 } from "./src/hands-free-recorder-status";
 import {
+  readRecorderStatus,
+  readRecorderUri,
+  useSafeRecorderStatus,
+} from "./src/safe-recorder-status";
+import {
   timeInputFromPicker,
   timePickerLabel,
   timePickerValue,
@@ -130,7 +134,10 @@ const COLORS = {
 
 function MobileApp() {
   const recorder = useAudioRecorder(HANDS_FREE_RECORDING_OPTIONS);
-  const recording = useAudioRecorderState(recorder, 100);
+  const recording = useSafeRecorderStatus(
+    recorder,
+    HANDS_FREE_STATUS_INTERVAL_MS,
+  );
   const [tab, setTab] = useState<Tab>("home");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -743,8 +750,8 @@ function MobileApp() {
         autoFinalizeTurnRef.current = null;
         voiceActivityRef.current = newVoiceActivity();
         recorder.record();
-        const recorderStatus = recorder.getStatus();
-        if (!recorderStatus.isRecording)
+        const recorderStatus = readRecorderStatus(recorder);
+        if (recorderStatus.nativeError || !recorderStatus.isRecording)
           throw new Error("Recorder did not enter recording state.");
         const initialStatus = recorderStatusSnapshot(
           recorderStatus,
@@ -812,11 +819,8 @@ function MobileApp() {
         }
         return;
       }
-      const audioUri = recorder.uri;
-      const capturedDurationMs = Math.max(
-        durationMs,
-        recorder.getStatus().durationMillis,
-      );
+      const audioUri = readRecorderUri(recorder);
+      const capturedDurationMs = durationMs;
       if (!audioUri || capturedDurationMs < 100) {
         recordMicrophoneDiagnostic(microphoneFailure("file"));
         setVoiceStatus("error");
@@ -862,47 +866,25 @@ function MobileApp() {
     ],
   );
 
-  // `useAudioRecorderState` is useful for rendering the ordinary recorder
-  // controls, but hands-free turn-taking needs each status read to drive the
-  // VAD. Poll the recorder directly so that a missing/stalled native meter is
-  // surfaced rather than being hidden by a stale React state update.
-  useEffect(() => {
-    const turn = activeRecordingTurnRef.current;
-    if (
-      !handsFreeActive ||
-      turn === null ||
-      (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
-    )
-      return;
-    let cancelled = false;
-    const readStatus = () => {
-      const status = recorder.getStatus();
-      if (cancelled) return;
-      setHandsFreeRecorderStatus((current) => {
-        const next = recorderStatusSnapshot(status, Date.now(), current.action);
-        handsFreeRecorderStatusRef.current = next;
-        return next;
-      });
-    };
-    readStatus();
-    const interval = setInterval(readStatus, HANDS_FREE_STATUS_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [handsFreeActive, recorder, voiceStatus]);
-
   const pauseHandsFreeForMeterFailure = useCallback(
     (
       turn: number,
-      action: "meter_unavailable" | "meter_stalled" | "recorder_inactive",
+      action:
+        | "meter_unavailable"
+        | "meter_stalled"
+        | "recorder_inactive"
+        | "recorder_invalidated",
     ) => {
       if (!canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)) return;
       autoFinalizeTurnRef.current = turn;
+      if (action === "recorder_invalidated")
+        recordMicrophoneDiagnostic(microphoneFailure("status"));
       const message =
-        action === "recorder_inactive"
-          ? "The iPhone stopped recording before LeadLoop could hear you. Resume listening or use Record one turn."
-          : "Hands-free speech detection could not read the iPhone microphone level. Resume listening or use Record one turn.";
+        action === "recorder_invalidated"
+          ? "The iPhone recorder was interrupted or reloaded. Reload Expo, then start the conversation again."
+          : action === "recorder_inactive"
+            ? "The iPhone stopped recording before LeadLoop could hear you. Resume listening or use Record one turn."
+            : "Hands-free speech detection could not read the iPhone microphone level. Resume listening or use Record one turn.";
       setHandsFreeRecorderStatus((current) => {
         const next = { ...current, action };
         handsFreeRecorderStatusRef.current = next;
@@ -918,7 +900,7 @@ function MobileApp() {
         preserveError: true,
       });
     },
-    [stopAndProcessRecording],
+    [recordMicrophoneDiagnostic, stopAndProcessRecording],
   );
 
   useEffect(() => {
@@ -929,14 +911,25 @@ function MobileApp() {
       (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
     )
       return;
-    if (recorderStoppedUnexpectedly(handsFreeRecorderStatus)) {
+    const recorderStatus = recorderStatusSnapshot(
+      recording,
+      recording.checkedAtMs ?? Date.now(),
+      handsFreeRecorderStatus.action,
+    );
+    handsFreeRecorderStatusRef.current = recorderStatus;
+    setHandsFreeRecorderStatus(recorderStatus);
+    if (recording.nativeError) {
+      pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
+      return;
+    }
+    if (recorderStoppedUnexpectedly(recorderStatus)) {
       pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
       return;
     }
     const result = advanceVoiceActivity(
       voiceActivityRef.current,
-      handsFreeRecorderStatus.durationMillis,
-      handsFreeRecorderStatus.meterDb,
+      recorderStatus.durationMillis,
+      recorderStatus.meterDb,
     );
     voiceActivityRef.current = result.state;
     setHandsFreeRecorderStatus((current) => {
@@ -968,11 +961,26 @@ function MobileApp() {
     }
   }, [
     handsFreeActive,
-    handsFreeRecorderStatus,
+    handsFreeRecorderStatus.action,
     pauseHandsFreeForMeterFailure,
+    recording,
     stopAndProcessRecording,
     voiceStatus,
   ]);
+
+  useEffect(() => {
+    if (
+      !recording.nativeError ||
+      handsFreeActive ||
+      activeRecordingTurnRef.current === null
+    )
+      return;
+    activeRecordingTurnRef.current = null;
+    autoFinalizeTurnRef.current = null;
+    recordMicrophoneDiagnostic(microphoneFailure("status"));
+    setVoiceStatus("error");
+    setError(microphoneErrorMessage("status"));
+  }, [handsFreeActive, recordMicrophoneDiagnostic, recording.nativeError]);
 
   useEffect(() => {
     if (!recording.mediaServicesDidReset) return;
@@ -990,7 +998,9 @@ function MobileApp() {
       voiceTurnRef.current += 1;
       speechPlaybackRef.current += 1;
       Speech.stop();
-      if (recorder.getStatus().isRecording) void recorder.stop();
+      void recorder.stop().catch(() => {
+        // A released recorder needs no further cleanup.
+      });
     },
     [recorder],
   );
@@ -1018,12 +1028,10 @@ function MobileApp() {
     autoFinalizeTurnRef.current = null;
     speechPlaybackRef.current += 1;
     Speech.stop();
-    if (recorder.getStatus().isRecording) {
-      try {
-        await recorder.stop();
-      } catch {
-        // The session is still ended even if iOS already interrupted capture.
-      }
+    try {
+      await recorder.stop();
+    } catch {
+      // The session is still ended even if iOS already interrupted capture.
     }
     activeRecordingTurnRef.current = null;
     setVoiceStatus("ready");
@@ -1780,6 +1788,12 @@ function Capture({
                   : "detected"}
                 {" · action: "}
                 {handsFreeRecorderStatus.action}
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Native recorder error:{" "}
+                {handsFreeRecorderStatus.action === "recorder_invalidated"
+                  ? "recorder reference invalidated"
+                  : "none"}
               </Text>
               {microphoneDiagnostics.length ? (
                 microphoneDiagnostics.map((diagnostic, index) => (

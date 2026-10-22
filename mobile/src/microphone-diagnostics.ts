@@ -1,5 +1,11 @@
 export type MicrophoneStage =
-  "permission" | "audio_session" | "prepare" | "start" | "stop" | "file";
+  | "permission"
+  | "audio_session"
+  | "prepare"
+  | "start"
+  | "status"
+  | "stop"
+  | "file";
 
 export type MicrophoneDiagnostic = {
   stage: MicrophoneStage;
@@ -43,6 +49,8 @@ export function microphoneErrorMessage(stage: MicrophoneStage) {
       return "LeadLoop could not prepare the microphone. Try again in a moment.";
     case "start":
       return "LeadLoop could not start recording. Try again.";
+    case "status":
+      return "The iPhone recorder was interrupted or reloaded. Resume listening or record one turn again.";
     case "stop":
       return "LeadLoop could not finish that recording. Your reminder was not changed; try again.";
     case "file":

@@ -32,3 +32,13 @@ test("a completed status read is reported as an actionable recorder interruption
   );
   assert.equal(recorderStoppedUnexpectedly(stopped), true);
 });
+
+test("session cancellation keeps an invalidated recorder from becoming a live turn", () => {
+  const stopped = recorderStatusSnapshot(
+    { isRecording: false, durationMillis: 1_250, metering: -45 },
+    3_000,
+    "recorder_invalidated",
+  );
+  assert.equal(stopped.action, "recorder_invalidated");
+  assert.equal(recorderStoppedUnexpectedly(stopped), true);
+});
