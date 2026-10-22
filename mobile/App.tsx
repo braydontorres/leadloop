@@ -79,6 +79,11 @@ import {
   timePickerLabel,
   timePickerValue,
 } from "./src/time-picker";
+import {
+  dateInputFromPicker,
+  datePickerLabel,
+  datePickerValue,
+} from "./src/date-picker";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
 const COLORS = {
@@ -943,14 +948,19 @@ function MobileApp() {
                 onChangeText={setTitle}
                 multiline
               />
-              <Text style={styles.fieldLabel}>Date (YYYY-MM-DD)</Text>
-              <TextInput
-                placeholder="2026-10-21"
-                placeholderTextColor={COLORS.muted}
-                style={styles.input}
-                value={date}
-                onChangeText={setDate}
-                autoCapitalize="none"
+              <Text style={styles.fieldLabel}>Date</Text>
+              <Text style={styles.datePickerValue}>
+                {datePickerLabel(date)}
+              </Text>
+              <DateTimePicker
+                value={datePickerValue(date)}
+                mode="date"
+                display="inline"
+                locale="en-US"
+                onChange={(_event, selectedDate) => {
+                  if (selectedDate) setDate(dateInputFromPicker(selectedDate));
+                }}
+                style={styles.datePicker}
               />
               <Text style={styles.fieldLabel}>Time</Text>
               <Text style={styles.timePickerValue}>
@@ -1533,6 +1543,16 @@ const styles = StyleSheet.create({
   },
   tallInput: { minHeight: 92, textAlignVertical: "top" },
   fieldLabel: { color: COLORS.ink, fontWeight: "700", marginTop: 4 },
+  datePickerValue: {
+    color: COLORS.ink,
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  datePicker: {
+    alignSelf: "stretch",
+    marginBottom: 8,
+  },
   timePickerValue: {
     color: COLORS.ink,
     fontSize: 18,
