@@ -578,6 +578,7 @@ function MobileApp() {
         await applyVoiceResult(payload.result, payload.transcript);
       } catch (reason) {
         if (turn !== voiceTurnRef.current) return;
+        recordCloudDiagnostic(cloudDiagnostic("voice_upload", reason));
         setVoiceStatus("error");
         setError(errorMessage(reason));
       }

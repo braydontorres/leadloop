@@ -1,12 +1,24 @@
+export class MobileVoiceApiError extends Error {
+  constructor(
+    message: string,
+    public readonly code?: string,
+  ) {
+    super(message);
+    this.name = "MobileVoiceApiError";
+  }
+}
+
 export function voiceHttpError(input: {
   message?: string;
+  code?: string;
   retryAfterSeconds?: number;
 }) {
   const retry = input.retryAfterSeconds
     ? ` Try again in ${input.retryAfterSeconds} seconds.`
     : "";
-  return new Error(
+  return new MobileVoiceApiError(
     (input.message || "LeadLoop could not process that recording.") + retry,
+    input.code,
   );
 }
 

@@ -8,6 +8,7 @@ import {
   voiceHttpError,
   voiceTimeoutError,
 } from "./voice-response";
+import { mobileVoiceAuthorizationHeaders } from "./voice-auth";
 import { appendExpoAudioFile } from "./voice-upload";
 
 const config = mobileVoiceConfig(process.env);
@@ -46,12 +47,13 @@ export async function uploadMobileVoiceTurn(input: {
     // boundary itself. Do not set Content-Type manually.
     const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/voice`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${data.session.access_token}` },
+      headers: mobileVoiceAuthorizationHeaders(data.session.access_token),
       body,
       signal: controller.signal,
     });
     const payload = (await response.json().catch(() => ({}))) as {
       error?: string;
+      code?: string;
       retryAfterSeconds?: number;
       transcript?: string;
       result?: IntentResult;
@@ -59,6 +61,7 @@ export async function uploadMobileVoiceTurn(input: {
     if (!response.ok) {
       throw voiceHttpError({
         message: payload.error,
+        code: payload.code,
         retryAfterSeconds: payload.retryAfterSeconds,
       });
     }

@@ -3,6 +3,10 @@ import { ApiError } from "./ai-server";
 
 type AuthenticatedMobileUser = { id: string };
 
+type SupabaseAuthError = {
+  status?: unknown;
+};
+
 function supabaseConfig() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key =
@@ -18,15 +22,47 @@ function supabaseConfig() {
 }
 
 function bearerToken(request: Request) {
-  const value = request.headers.get("authorization") ?? "";
+  const value = request.headers.get("authorization");
+  if (!value)
+    throw new ApiError(
+      "LeadLoop did not receive a sign-in authorization. Reopen the app and try again.",
+      401,
+      "MOBILE_AUTH_HEADER_MISSING",
+    );
   const match = /^Bearer\s+(.+)$/i.exec(value);
   if (!match || match[1].length > 8192)
     throw new ApiError(
-      "Sign in before using voice capture.",
+      "LeadLoop received an invalid sign-in authorization. Sign in again before recording.",
       401,
-      "MOBILE_AUTH_REQUIRED",
+      "MOBILE_AUTH_HEADER_MALFORMED",
     );
   return match[1];
+}
+
+function authFailureStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const status = (error as SupabaseAuthError).status;
+  return typeof status === "number" ? status : undefined;
+}
+
+function rejectedTokenError() {
+  return new ApiError(
+    "Your sign-in session was rejected. Sign out and sign in again before recording.",
+    401,
+    "MOBILE_AUTH_TOKEN_REJECTED",
+  );
+}
+
+function authServiceError() {
+  return new ApiError(
+    "LeadLoop could not verify your sign-in right now. Check your connection and try again.",
+    503,
+    "MOBILE_AUTH_SERVICE_UNAVAILABLE",
+  );
+}
+
+function isRejectedAuthStatus(status: number | undefined) {
+  return status === 400 || status === 401 || status === 403;
 }
 
 /** Validates the caller with their JWT; this route never uses a service-role key. */
@@ -40,13 +76,20 @@ export async function authorizeMobileVoice(
     global: { headers: { Authorization: `Bearer ${token}` } },
     auth: { persistSession: false, autoRefreshToken: false },
   });
-  const { data, error } = await client.auth.getUser(token);
-  if (error || !data.user)
-    throw new ApiError(
-      "Your sign-in session has expired. Sign in again.",
-      401,
-      "MOBILE_AUTH_REQUIRED",
-    );
+  let verifiedUser: { id: string } | null = null;
+  try {
+    const { data, error } = await client.auth.getUser(token);
+    if (data.user) verifiedUser = { id: data.user.id };
+    else if (isRejectedAuthStatus(authFailureStatus(error)))
+      throw rejectedTokenError();
+    else if (error) throw authServiceError();
+    else throw rejectedTokenError();
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    if (isRejectedAuthStatus(authFailureStatus(error)))
+      throw rejectedTokenError();
+    throw authServiceError();
+  }
   // RLS evaluates this request as the authenticated caller. A member can only
   // prove membership in a workspace they are allowed to use.
   const membership = await client
@@ -60,5 +103,5 @@ export async function authorizeMobileVoice(
       403,
       "MOBILE_WORKSPACE_FORBIDDEN",
     );
-  return { id: data.user.id };
+  return verifiedUser;
 }

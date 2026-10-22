@@ -17,10 +17,73 @@ function request(headers?: HeadersInit) {
   });
 }
 
-test("mobile voice rejects an unauthenticated upload before transcription", async () => {
+test("mobile voice reports when Expo did not deliver an Authorization header", async () => {
   const response = await POST(request());
   assert.equal(response.status, 401);
-  assert.equal((await response.json()).code, "MOBILE_AUTH_REQUIRED");
+  assert.equal((await response.json()).code, "MOBILE_AUTH_HEADER_MISSING");
+});
+
+test("mobile voice reports a malformed Authorization header before transcription", async () => {
+  const response = await POST(request({ Authorization: "Basic not-a-bearer" }));
+  assert.equal(response.status, 401);
+  assert.equal((await response.json()).code, "MOBILE_AUTH_HEADER_MALFORMED");
+});
+
+async function withSupabaseAuthResponse(
+  response: Response | Error,
+  run: () => Promise<void>,
+) {
+  const previous = {
+    url: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    key: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    fetch: globalThis.fetch,
+  };
+  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "public-key";
+  globalThis.fetch = async (input) => {
+    if (!String(input).endsWith("/auth/v1/user"))
+      throw new Error(`Unexpected fetch ${String(input)}`);
+    if (response instanceof Error) throw response;
+    return response;
+  };
+  try {
+    await run();
+  } finally {
+    globalThis.fetch = previous.fetch;
+    if (previous.url === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    else process.env.NEXT_PUBLIC_SUPABASE_URL = previous.url;
+    if (previous.key === undefined)
+      delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    else process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = previous.key;
+  }
+}
+
+test("mobile voice distinguishes a Supabase-rejected JWT from a missing header", async () => {
+  await withSupabaseAuthResponse(
+    new Response(JSON.stringify({ message: "invalid JWT" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    }),
+    async () => {
+      const response = await POST(request({ Authorization: "Bearer token" }));
+      assert.equal(response.status, 401);
+      assert.equal((await response.json()).code, "MOBILE_AUTH_TOKEN_REJECTED");
+    },
+  );
+});
+
+test("mobile voice distinguishes a Supabase verification outage from rejected credentials", async () => {
+  await withSupabaseAuthResponse(
+    new TypeError("network unavailable"),
+    async () => {
+      const response = await POST(request({ Authorization: "Bearer token" }));
+      assert.equal(response.status, 503);
+      assert.equal(
+        (await response.json()).code,
+        "MOBILE_AUTH_SERVICE_UNAVAILABLE",
+      );
+    },
+  );
 });
 
 test("mobile voice accepts an authenticated member and reaches the shared AI pipeline", async () => {

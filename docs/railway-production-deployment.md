@@ -69,6 +69,21 @@ available. They do not log audio, transcript text, authorization tokens,
 customer records, or API keys. The route uses the public Supabase key together
 with the caller JWT; it never uses a Supabase service-role key.
 
+### Mobile authentication diagnostics
+
+An HTTP 401 from the mobile voice route now has a safe, specific `errorType`
+in host logs and a matching `code` in the JSON response:
+
+| Code                              | Meaning                                                                 | Next action                                                                                        |
+| --------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `MOBILE_AUTH_HEADER_MISSING`      | The API did not receive an Authorization header.                        | Check the deployed Expo build and its configured API URL; do not change Supabase credentials.      |
+| `MOBILE_AUTH_HEADER_MALFORMED`    | The header was present but was not a usable Bearer value.               | Rebuild/reload the mobile bundle and sign in again.                                                |
+| `MOBILE_AUTH_TOKEN_REJECTED`      | Supabase Auth rejected the received access token.                       | Sign out and in once; if it repeats, verify the mobile app and host use the same Supabase project. |
+| `MOBILE_AUTH_SERVICE_UNAVAILABLE` | The host could not contact Supabase Auth or received a service failure. | Check the host-to-Supabase network/service status and retry.                                       |
+
+These categories intentionally omit tokens, email addresses, request headers,
+and raw Supabase error messages.
+
 ## Pre-deploy checks
 
 Run these from the repository root before connecting the service:

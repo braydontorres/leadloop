@@ -8,6 +8,8 @@ export type CloudDiagnostic = {
   outcome: "failed" | "succeeded";
 };
 
+type SafeErrorCode = { code?: unknown };
+
 export class MobileRepositoryError extends Error {
   constructor(
     public readonly operation: string,
@@ -25,8 +27,23 @@ export function cloudDiagnostic(
 ): CloudDiagnostic {
   const message = error instanceof Error ? error.message : "";
   const known = error instanceof MobileRepositoryError ? error : null;
-  const code = known?.code ?? /\b([A-Z0-9]{5})\b/.exec(message)?.[1] ?? null;
+  const directCode =
+    error && typeof error === "object"
+      ? (error as SafeErrorCode).code
+      : undefined;
+  const code =
+    known?.code ??
+    (typeof directCode === "string" && /^[A-Z][A-Z0-9_]{2,80}$/.test(directCode)
+      ? directCode
+      : (/\b([A-Z0-9]{5})\b/.exec(message)?.[1] ?? null));
   const operationName = known?.operation ?? operation;
+  if (typeof code === "string" && code.startsWith("MOBILE_AUTH_"))
+    return {
+      operation: operationName,
+      code,
+      kind: "authentication",
+      outcome: "failed",
+    };
   if (/network|fetch|offline|timed? out|reach/i.test(message))
     return {
       operation: operationName,
