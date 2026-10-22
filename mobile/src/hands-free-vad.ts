@@ -1,30 +1,47 @@
-/** Foreground-only recorder metering policy for Expo Audio on iOS. */
+import {
+  advanceVoiceActivity as advanceRmsVoiceActivity,
+  initialVoiceActivityState,
+  type VoiceActivityConfig,
+  type VoiceActivityState as RmsVoiceActivityState,
+} from "../../lib/voice-activity";
+
+/**
+ * AVAudioRecorder exposes a windowed average power in dBFS, rather than the
+ * Web Audio analyser's instantaneous RMS samples. Convert it to linear signal
+ * energy, then use the same adaptive state machine as the web Capture flow.
+ */
 export const HANDS_FREE_VAD = {
-  startThresholdDb: -48,
-  noiseMarginDb: 12,
-  speechStartHoldMs: 180,
+  // -60 dBFS is a conservative floor for iOS *average* power. The old -48 dB
+  // absolute gate excluded normal conversational readings before silence could
+  // ever be measured. The adaptive noise floor still raises this in loud rooms.
+  minimumSignalDb: -60,
+  speechHoldMs: 180,
+  speechGapMs: 140,
   endSilenceMs: 1_200,
-  minimumSpeechMs: 280,
-  noSpeechTimeoutMs: 8_000,
-  maximumTurnMs: 30_000,
+  noSpeechTimeoutMs: 12_000,
+  noiseMultiplier: 1.6,
+  noiseOffset: 0.0005,
   meterUnavailableMs: 2_000,
-  // AVAudioRecorder can expose a numeric floor value (commonly -160 dB)
-  // even when meter updates are not actually arriving. Treat an unchanged
-  // value as unavailable instead of silently waiting for a voice that can
-  // never be detected.
   meterStalledMs: 2_500,
   meterChangeEpsilonDb: 0.5,
 } as const;
 
+const config: VoiceActivityConfig = {
+  minimumSignal: Math.pow(10, HANDS_FREE_VAD.minimumSignalDb / 20),
+  speechHoldMs: HANDS_FREE_VAD.speechHoldMs,
+  speechGapMs: HANDS_FREE_VAD.speechGapMs,
+  silenceMs: HANDS_FREE_VAD.endSilenceMs,
+  noSpeechMs: HANDS_FREE_VAD.noSpeechTimeoutMs,
+  noiseMultiplier: HANDS_FREE_VAD.noiseMultiplier,
+  noiseOffset: HANDS_FREE_VAD.noiseOffset,
+};
+
 export type VoiceActivityState = {
-  startedAtMs: number;
-  noiseFloorDb: number | null;
-  speechCandidateAtMs: number | null;
-  speechStartedAtMs: number | null;
-  lastVoiceAtMs: number | null;
-  sawMeter: boolean;
+  activity: RmsVoiceActivityState;
+  lastElapsedMs: number;
   lastMeterDb: number | null;
   lastMeterChangeAtMs: number | null;
+  sawMeter: boolean;
 };
 
 export type VoiceActivityAction =
@@ -35,33 +52,50 @@ export type VoiceActivityAction =
   | "meter_unavailable"
   | "meter_stalled";
 
-export function newVoiceActivity(startedAtMs = 0): VoiceActivityState {
+export function newVoiceActivity(): VoiceActivityState {
   return {
-    startedAtMs,
-    noiseFloorDb: null,
-    speechCandidateAtMs: null,
-    speechStartedAtMs: null,
-    lastVoiceAtMs: null,
-    sawMeter: false,
+    activity: initialVoiceActivityState(),
+    lastElapsedMs: 0,
     lastMeterDb: null,
     lastMeterChangeAtMs: null,
+    sawMeter: false,
   };
 }
 
 function clampMeter(value: number) {
-  return Math.max(-90, Math.min(-5, value));
+  return Math.max(-120, Math.min(0, value));
+}
+
+function dbToSignal(value: number) {
+  return Math.pow(10, clampMeter(value) / 20);
+}
+
+function signalToDb(value: number) {
+  if (value <= 0) return -120;
+  return 20 * Math.log10(value);
 }
 
 export function voiceActivityThreshold(state: VoiceActivityState) {
-  return Math.max(
-    HANDS_FREE_VAD.startThresholdDb,
-    (state.noiseFloorDb ?? -60) + HANDS_FREE_VAD.noiseMarginDb,
+  return signalToDb(
+    Math.max(
+      config.minimumSignal,
+      state.activity.noiseFloor * config.noiseMultiplier + config.noiseOffset,
+    ),
   );
 }
 
+export function voiceActivityNoiseFloor(state: VoiceActivityState) {
+  return signalToDb(state.activity.noiseFloor);
+}
+
+export function voiceActivitySilenceMs(state: VoiceActivityState) {
+  return state.activity.quietMs;
+}
+
 /**
- * This detects activity, not speaker identity. It qualifies sustained nearby
- * speech/noise and waits for a natural silence before submitting one turn.
+ * This detects activity, not speaker identity. A single turn starts only after
+ * sustained signal, then submits after sustained silence. It is deterministic
+ * for a recorder duration/meter sequence and does not submit twice itself.
  */
 export function advanceVoiceActivity(
   state: VoiceActivityState,
@@ -70,7 +104,7 @@ export function advanceVoiceActivity(
 ): { state: VoiceActivityState; action: VoiceActivityAction } {
   if (!Number.isFinite(meterDb)) {
     return {
-      state,
+      state: { ...state, lastElapsedMs: elapsedMs },
       action:
         elapsedMs >= HANDS_FREE_VAD.meterUnavailableMs
           ? "meter_unavailable"
@@ -86,82 +120,43 @@ export function advanceVoiceActivity(
     ? elapsedMs
     : (state.lastMeterChangeAtMs ?? elapsedMs);
   if (
-    state.speechStartedAtMs === null &&
     elapsedMs >= HANDS_FREE_VAD.meterStalledMs &&
     elapsedMs - lastMeterChangeAtMs >= HANDS_FREE_VAD.meterStalledMs
   ) {
     return {
       state: {
         ...state,
-        sawMeter: true,
+        lastElapsedMs: elapsedMs,
         lastMeterDb: meter,
         lastMeterChangeAtMs,
+        sawMeter: true,
       },
       action: "meter_stalled",
     };
   }
-  let noiseFloorDb = state.noiseFloorDb ?? Math.min(meter, -60);
-  let threshold = Math.max(
-    HANDS_FREE_VAD.startThresholdDb,
-    noiseFloorDb + HANDS_FREE_VAD.noiseMarginDb,
+
+  const deltaMs = Math.max(0, elapsedMs - state.lastElapsedMs);
+  const update = advanceRmsVoiceActivity(
+    state.activity,
+    dbToSignal(meter),
+    deltaMs,
+    config,
   );
-  // Learn only observations below the current activity threshold. A first
-  // spoken sample must not become the noise floor and mask itself.
-  if (state.speechStartedAtMs === null && meter < threshold) {
-    noiseFloorDb = noiseFloorDb * 0.85 + meter * 0.15;
-    threshold = Math.max(
-      HANDS_FREE_VAD.startThresholdDb,
-      noiseFloorDb + HANDS_FREE_VAD.noiseMarginDb,
-    );
-  }
-  const isVoice = meter >= threshold;
-  let next: VoiceActivityState = {
-    ...state,
-    noiseFloorDb,
-    sawMeter: true,
+  const next: VoiceActivityState = {
+    activity: update.state,
+    lastElapsedMs: elapsedMs,
     lastMeterDb: meter,
     lastMeterChangeAtMs,
+    sawMeter: true,
   };
-
-  if (next.speechStartedAtMs === null) {
-    if (isVoice) {
-      const candidateAtMs = next.speechCandidateAtMs ?? elapsedMs;
-      next = { ...next, speechCandidateAtMs: candidateAtMs };
-      if (elapsedMs - candidateAtMs >= HANDS_FREE_VAD.speechStartHoldMs) {
-        next = {
-          ...next,
-          speechStartedAtMs: candidateAtMs,
-          lastVoiceAtMs: elapsedMs,
-        };
-        return { state: next, action: "speech_started" };
-      }
-    } else if (next.speechCandidateAtMs !== null) {
-      next = { ...next, speechCandidateAtMs: null };
-    }
-    return {
-      state: next,
-      action:
-        elapsedMs >= HANDS_FREE_VAD.noSpeechTimeoutMs
-          ? "retry_silence"
-          : "continue",
-    };
+  switch (update.event) {
+    case "speech_started":
+      return { state: next, action: "speech_started" };
+    case "speech_ended":
+      return { state: next, action: "submit" };
+    case "no_speech":
+      return { state: next, action: "retry_silence" };
+    default:
+      return { state: next, action: "continue" };
   }
-
-  if (isVoice)
-    next = {
-      ...next,
-      lastVoiceAtMs: elapsedMs,
-    };
-  const speechStartedAtMs = next.speechStartedAtMs;
-  if (speechStartedAtMs === null) return { state: next, action: "continue" };
-  const speechDurationMs = elapsedMs - speechStartedAtMs;
-  const silenceMs = elapsedMs - (next.lastVoiceAtMs ?? elapsedMs);
-  if (
-    speechDurationMs >= HANDS_FREE_VAD.minimumSpeechMs &&
-    silenceMs >= HANDS_FREE_VAD.endSilenceMs
-  )
-    return { state: next, action: "submit" };
-  if (elapsedMs >= HANDS_FREE_VAD.maximumTurnMs)
-    return { state: next, action: "submit" };
-  return { state: next, action: "continue" };
 }

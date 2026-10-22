@@ -77,6 +77,8 @@ import {
 import {
   advanceVoiceActivity,
   newVoiceActivity,
+  voiceActivityNoiseFloor,
+  voiceActivitySilenceMs,
   voiceActivityThreshold,
   type VoiceActivityState,
 } from "./src/hands-free-vad";
@@ -90,6 +92,7 @@ import {
   recorderStoppedUnexpectedly,
   type HandsFreeRecorderStatus,
 } from "./src/hands-free-recorder-status";
+import { statusBelongsToActiveTurn } from "./src/hands-free-status-sync";
 import {
   readRecorderStatus,
   readRecorderUri,
@@ -115,6 +118,11 @@ type VoiceStatus =
   | "speaking"
   | "saving"
   | "error";
+type VadTransition = {
+  turn: number;
+  event: string;
+  elapsedMs: number;
+};
 const HANDS_FREE_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
   isMeteringEnabled: true,
@@ -169,6 +177,7 @@ function MobileApp() {
   const handsFreeRecorderStatusRef = useRef<HandsFreeRecorderStatus>(
     initialHandsFreeRecorderStatus,
   );
+  const handsFreeRecordingStartedAtRef = useRef<number | null>(null);
   const [assistantMuted, setAssistantMuted] = useState(false);
   const assistantMutedRef = useRef(false);
   const [transcript, setTranscript] = useState("");
@@ -197,6 +206,7 @@ function MobileApp() {
   const [microphoneDiagnostics, setMicrophoneDiagnostics] = useState<
     MicrophoneDiagnostic[]
   >([]);
+  const [vadTransitions, setVadTransitions] = useState<VadTransition[]>([]);
 
   const recordCloudDiagnostic = useCallback((diagnostic: CloudDiagnostic) => {
     logCloudDiagnostic(diagnostic);
@@ -207,6 +217,15 @@ function MobileApp() {
       console.info("[LeadLoop mobile microphone]", JSON.stringify(diagnostic));
       setMicrophoneDiagnostics((current) =>
         [diagnostic, ...current].slice(0, 12),
+      );
+    },
+    [],
+  );
+  const recordVadTransition = useCallback(
+    (turn: number, event: string, elapsedMs: number) => {
+      if (process.env.NODE_ENV === "production") return;
+      setVadTransitions((current) =>
+        [{ turn, event, elapsedMs }, ...current].slice(0, 12),
       );
     },
     [],
@@ -753,12 +772,19 @@ function MobileApp() {
         const recorderStatus = readRecorderStatus(recorder);
         if (recorderStatus.nativeError || !recorderStatus.isRecording)
           throw new Error("Recorder did not enter recording state.");
+        const recordingStartedAtMs = Date.now();
+        handsFreeRecordingStartedAtRef.current = recordingStartedAtMs;
         const initialStatus = recorderStatusSnapshot(
           recorderStatus,
-          Date.now(),
+          recordingStartedAtMs,
         );
         handsFreeRecorderStatusRef.current = initialStatus;
         setHandsFreeRecorderStatus(initialStatus);
+        recordVadTransition(
+          turn,
+          "recording_started",
+          initialStatus.durationMillis,
+        );
         recordMicrophoneDiagnostic(microphoneSuccess("start"));
         setVoiceStatus("listening");
         setRecordingNotice(
@@ -773,7 +799,14 @@ function MobileApp() {
         setVoiceStatus("error");
       }
     },
-    [client, data, recorder, recording.isRecording, recordMicrophoneDiagnostic],
+    [
+      client,
+      data,
+      recorder,
+      recording.isRecording,
+      recordMicrophoneDiagnostic,
+      recordVadTransition,
+    ],
   );
 
   useEffect(() => {
@@ -879,6 +912,11 @@ function MobileApp() {
       autoFinalizeTurnRef.current = turn;
       if (action === "recorder_invalidated")
         recordMicrophoneDiagnostic(microphoneFailure("status"));
+      recordVadTransition(
+        turn,
+        action,
+        handsFreeRecorderStatusRef.current.durationMillis,
+      );
       const message =
         action === "recorder_invalidated"
           ? "The iPhone recorder was interrupted or reloaded. Reload Expo, then start the conversation again."
@@ -900,25 +938,43 @@ function MobileApp() {
         preserveError: true,
       });
     },
-    [recordMicrophoneDiagnostic, stopAndProcessRecording],
+    [recordMicrophoneDiagnostic, recordVadTransition, stopAndProcessRecording],
   );
+
+  // Only status samples taken after this turn started may drive VAD. This
+  // prevents a just-started conversation from consuming the previous turn's
+  // inactive status while React is applying state updates.
+  useEffect(() => {
+    if (
+      !handsFreeActive ||
+      !statusBelongsToActiveTurn(
+        recording.checkedAtMs,
+        handsFreeRecordingStartedAtRef.current,
+      )
+    )
+      return;
+    setHandsFreeRecorderStatus((current) => {
+      const next = recorderStatusSnapshot(
+        recording,
+        recording.checkedAtMs as number,
+        current.action,
+      );
+      handsFreeRecorderStatusRef.current = next;
+      return next;
+    });
+  }, [handsFreeActive, recording]);
 
   useEffect(() => {
     const turn = activeRecordingTurnRef.current;
+    const recorderStatus = handsFreeRecorderStatus;
     if (
       !handsFreeActive ||
       turn === null ||
+      recorderStatus.checkedAtMs === null ||
       (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
     )
       return;
-    const recorderStatus = recorderStatusSnapshot(
-      recording,
-      recording.checkedAtMs ?? Date.now(),
-      handsFreeRecorderStatus.action,
-    );
-    handsFreeRecorderStatusRef.current = recorderStatus;
-    setHandsFreeRecorderStatus(recorderStatus);
-    if (recording.nativeError) {
+    if (recorderStatus.nativeError) {
       pauseHandsFreeForMeterFailure(turn, "recorder_invalidated");
       return;
     }
@@ -937,6 +993,8 @@ function MobileApp() {
       handsFreeRecorderStatusRef.current = next;
       return next;
     });
+    if (result.action !== "continue")
+      recordVadTransition(turn, result.action, recorderStatus.durationMillis);
     if (result.action === "speech_started") {
       setVoiceStatus("user_speaking");
       setRecordingNotice("Hearing you…");
@@ -961,9 +1019,9 @@ function MobileApp() {
     }
   }, [
     handsFreeActive,
-    handsFreeRecorderStatus.action,
+    handsFreeRecorderStatus,
     pauseHandsFreeForMeterFailure,
-    recording,
+    recordVadTransition,
     stopAndProcessRecording,
     voiceStatus,
   ]);
@@ -1026,6 +1084,7 @@ function MobileApp() {
     handsFreeSessionRef.current += 1;
     voiceTurnRef.current += 1;
     autoFinalizeTurnRef.current = null;
+    handsFreeRecordingStartedAtRef.current = null;
     speechPlaybackRef.current += 1;
     Speech.stop();
     try {
@@ -1232,6 +1291,7 @@ function MobileApp() {
             microphoneDiagnostics={microphoneDiagnostics}
             handsFreeRecorderStatus={handsFreeRecorderStatus}
             voiceActivity={voiceActivityRef.current}
+            vadTransitions={vadTransitions}
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
@@ -1616,6 +1676,7 @@ function Capture({
   microphoneDiagnostics,
   handsFreeRecorderStatus,
   voiceActivity,
+  vadTransitions,
   workspaceLoaded,
   showDiagnostics,
   onNewReminder,
@@ -1643,6 +1704,7 @@ function Capture({
   microphoneDiagnostics: MicrophoneDiagnostic[];
   handsFreeRecorderStatus: HandsFreeRecorderStatus;
   voiceActivity: VoiceActivityState;
+  vadTransitions: VadTransition[];
   workspaceLoaded: boolean;
   showDiagnostics: boolean;
   onNewReminder(): void;
@@ -1776,18 +1838,21 @@ function Capture({
                   ? "unavailable"
                   : `${handsFreeRecorderStatus.meterDb.toFixed(1)} dB`}
                 {" · floor: "}
-                {voiceActivity.noiseFloorDb === null
-                  ? "measuring"
-                  : `${voiceActivity.noiseFloorDb.toFixed(1)} dB`}
+                {voiceActivityNoiseFloor(voiceActivity).toFixed(1)} dB
               </Text>
               <Text style={styles.diagnosticText}>
                 Threshold: {voiceActivityThreshold(voiceActivity).toFixed(1)} dB
                 {" · speech: "}
-                {voiceActivity.speechStartedAtMs === null
-                  ? "not detected"
-                  : "detected"}
+                {voiceActivity.activity.speechStarted
+                  ? "detected"
+                  : "not detected"}
+                {" · silence: "}
+                {Math.round(voiceActivitySilenceMs(voiceActivity))}ms
                 {" · action: "}
                 {handsFreeRecorderStatus.action}
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Silence target: 1200ms · no-speech target: 12000ms
               </Text>
               <Text style={styles.diagnosticText}>
                 Native recorder error:{" "}
@@ -1795,6 +1860,20 @@ function Capture({
                   ? "recorder reference invalidated"
                   : "none"}
               </Text>
+              <Text style={styles.diagnosticHeading}>VAD transitions</Text>
+              {vadTransitions.length ? (
+                vadTransitions.map((transition, index) => (
+                  <Text
+                    key={`${transition.turn}-${transition.event}-${index}`}
+                    style={styles.diagnosticText}
+                  >
+                    turn {transition.turn} · {transition.event} ·{" "}
+                    {Math.round(transition.elapsedMs)}ms
+                  </Text>
+                ))
+              ) : (
+                <Text style={styles.meta}>No hands-free transition yet.</Text>
+              )}
               {microphoneDiagnostics.length ? (
                 microphoneDiagnostics.map((diagnostic, index) => (
                   <Text

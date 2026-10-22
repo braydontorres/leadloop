@@ -4,6 +4,8 @@ import {
   advanceVoiceActivity,
   HANDS_FREE_VAD,
   newVoiceActivity,
+  voiceActivitySilenceMs,
+  voiceActivityThreshold,
 } from "../src/hands-free-vad";
 
 function frame(
@@ -14,24 +16,34 @@ function frame(
   return advanceVoiceActivity(state, ms, db);
 }
 
-test("sustained speech ends one hands-free turn only after natural silence", () => {
+test("native average-power speech starts then submits after natural silence", () => {
   let state = newVoiceActivity();
-  ({ state } = frame(state, 100, -35));
-  let result = frame(state, 300, -32);
+  ({ state } = frame(state, 100, -72));
+  ({ state } = frame(state, 200, -56));
+  let result = frame(state, 300, -55);
   assert.equal(result.action, "speech_started");
   state = result.state;
-  ({ state } = frame(state, 800, -34));
-  result = frame(state, 1_700, -70);
-  assert.equal(result.action, "continue");
-  result = frame(result.state, 2_100, -70);
+  ({ state } = frame(state, 500, -54));
+  ({ state } = frame(state, 750, -75));
+  assert.equal(voiceActivitySilenceMs(state), 250);
+  ({ state } = frame(state, 1_000, -74.2));
+  ({ state } = frame(state, 1_250, -75));
+  ({ state } = frame(state, 1_500, -74.2));
+  ({ state } = frame(state, 1_750, -75));
+  result = frame(state, 2_000, -74.2);
   assert.equal(result.action, "submit");
 });
 
-test("silence, unavailable metering, and maximum duration never create duplicate submissions", () => {
-  let silent = newVoiceActivity();
-  const silence = frame(silent, HANDS_FREE_VAD.noSpeechTimeoutMs, -80);
-  assert.equal(silence.action, "retry_silence");
+test("native average power uses an adaptive quiet-room threshold", () => {
+  let state = newVoiceActivity();
+  ({ state } = frame(state, 100, -76));
+  assert.ok(voiceActivityThreshold(state) <= -60);
+  ({ state } = frame(state, 200, -57));
+  const result = frame(state, 400, -56);
+  assert.equal(result.action, "speech_started");
+});
 
+test("unavailable or frozen meters pause instead of leaving a turn listening", () => {
   const unavailable = frame(
     newVoiceActivity(),
     HANDS_FREE_VAD.meterUnavailableMs,
@@ -39,24 +51,30 @@ test("silence, unavailable metering, and maximum duration never create duplicate
   );
   assert.equal(unavailable.action, "meter_unavailable");
 
-  let speaking = newVoiceActivity();
-  ({ state: speaking } = frame(speaking, 100, -30));
-  ({ state: speaking } = frame(speaking, 300, -30));
-  const maximum = frame(speaking, HANDS_FREE_VAD.maximumTurnMs, -30);
-  assert.equal(maximum.action, "submit");
+  let frozen = newVoiceActivity();
+  ({ state: frozen } = frame(frozen, 100, -160));
+  const stalled = frame(frozen, HANDS_FREE_VAD.meterStalledMs + 200, -160);
+  assert.equal(stalled.action, "meter_stalled");
 });
 
-test("a numeric iOS meter that never changes is treated as unavailable", () => {
+test("a frozen meter after speech is actionable rather than blocking silence forever", () => {
   let state = newVoiceActivity();
-  ({ state } = frame(state, 100, -160));
-  const result = frame(state, HANDS_FREE_VAD.meterStalledMs + 200, -160);
+  ({ state } = frame(state, 100, -75));
+  ({ state } = frame(state, 200, -55));
+  ({ state } = frame(state, 400, -55));
+  const result = frame(state, HANDS_FREE_VAD.meterStalledMs + 500, -55);
   assert.equal(result.action, "meter_stalled");
 });
 
-test("changing meter samples continue to qualify real speech", () => {
+test("silence without speech remains a retry rather than creating a turn", () => {
   let state = newVoiceActivity();
-  ({ state } = frame(state, 100, -62));
-  ({ state } = frame(state, 350, -35));
-  const result = frame(state, 550, -34);
-  assert.equal(result.action, "speech_started");
+  let result = frame(state, 0, -75);
+  for (
+    let elapsed = 100;
+    elapsed <= HANDS_FREE_VAD.noSpeechTimeoutMs;
+    elapsed += 100
+  ) {
+    result = frame(result.state, elapsed, elapsed % 200 === 0 ? -74.2 : -75);
+  }
+  assert.equal(result.action, "retry_silence");
 });

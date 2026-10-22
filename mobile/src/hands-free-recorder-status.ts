@@ -5,6 +5,7 @@ export type NativeRecorderStatus = {
   isRecording: boolean;
   durationMillis: number;
   metering?: number;
+  nativeError?: "recorder_invalidated" | null;
 };
 
 export type HandsFreeRecorderStatus = {
@@ -12,6 +13,7 @@ export type HandsFreeRecorderStatus = {
   durationMillis: number;
   meterDb: number | undefined;
   checkedAtMs: number | null;
+  nativeError: "recorder_invalidated" | null;
   action:
     | VoiceActivityAction
     | "waiting"
@@ -24,6 +26,7 @@ export const initialHandsFreeRecorderStatus: HandsFreeRecorderStatus = {
   durationMillis: 0,
   meterDb: undefined,
   checkedAtMs: null,
+  nativeError: null,
   action: "waiting",
 };
 
@@ -37,6 +40,7 @@ export function recorderStatusSnapshot(
     durationMillis: status.durationMillis,
     meterDb: status.metering,
     checkedAtMs,
+    nativeError: status.nativeError ?? null,
     action,
   };
 }
