@@ -1858,13 +1858,14 @@ function Capture({
   onNewReminder(): void;
 }) {
   const [showPanel, setShowPanel] = useState(false);
+  const [showManualFallback, setShowManualFallback] = useState(false);
   return (
     <ScrollView contentContainerStyle={styles.capture}>
       <Text style={styles.eyebrow}>VOICE CAPTURE</Text>
       <Text style={styles.title}>What’s on your mind?</Text>
       <Text style={styles.copy}>
         {status === "user_speaking"
-          ? `User speaking · ${seconds}s`
+          ? `Listening · hearing you · ${seconds}s`
           : status === "listening"
             ? `Listening · ${seconds}s`
             : status === "processing" || status === "saving"
@@ -1875,14 +1876,19 @@ function Capture({
                   ? "Error"
                   : conversationActive
                     ? "Waiting for the next turn…"
-                    : "Start a conversation, or record one turn."}
+                    : "Tap the microphone to start a conversation."}
       </Text>
       {!conversationActive ? (
-        <PrimaryButton
-          label="Start conversation"
-          onPress={onStartConversation}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Start voice conversation"
           disabled={!canRecord || isRecording}
-        />
+          style={[styles.mic, (!canRecord || isRecording) && styles.disabled]}
+          onPress={onStartConversation}
+        >
+          <Text style={styles.micIcon}>●</Text>
+          <Text style={styles.micText}>Start conversation</Text>
+        </Pressable>
       ) : (
         <PrimaryButton label="End conversation" onPress={onEndConversation} />
       )}
@@ -1892,24 +1898,35 @@ function Capture({
           onPress={onResumeConversation}
         />
       ) : null}
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={
-          isRecording ? "Stop this recording" : "Record one turn"
-        }
-        disabled={!canRecord}
-        style={[
-          styles.mic,
-          isRecording && styles.micActive,
-          !isRecording && !canRecord && styles.disabled,
-        ]}
-        onPress={() => void onRecord()}
-      >
-        <Text style={styles.micIcon}>{isRecording ? "■" : "●"}</Text>
-        <Text style={styles.micText}>
-          {isRecording ? "Stop this turn" : "Record one turn"}
+      <Pressable onPress={() => setShowManualFallback((visible) => !visible)}>
+        <Text style={styles.link}>
+          {showManualFallback
+            ? "Hide manual recording fallback"
+            : "Voice troubleshooting"}
         </Text>
       </Pressable>
+      {showManualFallback ? (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={
+            isRecording
+              ? "Manually submit this recording"
+              : "Record one turn manually"
+          }
+          disabled={!canRecord}
+          style={[
+            styles.mic,
+            isRecording && styles.micActive,
+            !isRecording && !canRecord && styles.disabled,
+          ]}
+          onPress={() => void onRecord()}
+        >
+          <Text style={styles.micIcon}>{isRecording ? "■" : "●"}</Text>
+          <Text style={styles.micText}>
+            {isRecording ? "Submit this turn" : "Manual recording fallback"}
+          </Text>
+        </Pressable>
+      ) : null}
       <Pressable accessibilityRole="button" onPress={onToggleMute}>
         <Text style={styles.link}>
           {assistantMuted ? "Unmute assistant" : "Mute assistant"}

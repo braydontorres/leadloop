@@ -29,8 +29,8 @@ this app never contains a service-role or OpenAI key.
   timing, so a frozen iOS `durationMillis` cannot leave Capture permanently in
   **Listening**. Native recorder status remains a health and upload-metadata
   source. If iOS supplies no changing microphone levels, Capture stops that
-  turn with a clear recovery message instead of guessing; **Record one turn**
-  remains available.
+  turn with a clear recovery message instead of guessing; manual recording is
+  available under **Voice troubleshooting**.
 
 Voice processing needs a trusted HTTPS Next.js server with the existing
 `OPENAI_API_KEY`, plus the public Supabase URL and publishable/anon key in its
@@ -76,13 +76,13 @@ future-milestone work; the mobile app does not claim those features work.
    matches `git rev-parse --short HEAD`. This identifies the Expo JavaScript
    bundle separately from the installed Expo Go runtime. Use **Share build
    information** when reporting a device result.
-5. On **Capture**, test **Start conversation** first. Speak one sentence, then
+5. On **Capture**, tap the microphone to start one conversation. Speak one sentence, then
    pause for about 1–1.5 seconds. Capture should progress through **User
    Speaking**, **Processing**, and **Assistant Speaking**, then return to
    **Listening**. Development diagnostics should show the turn clock advancing
    even if native duration remains 0 ms. If the meter does not change, Capture
-   will show an automatic-detection error; use **Record one turn** and retain
-   the diagnostics. When LeadLoop reads the full reminder back, say “Yes” or
+   will show an automatic-detection error; use **Voice troubleshooting** for
+   the manual fallback and retain the diagnostics. When LeadLoop reads the full reminder back, say “Yes” or
    tap **Yes, save it**. Verify the reminder appears in Today after cloud
    persistence returns.
 
