@@ -4,6 +4,7 @@ import {
   normalizeAudioMimeType,
   selectRecorderMimeType,
   supportedAudioFormat,
+  supportedUploadedAudioFormat,
 } from "../lib/audio-format";
 import { ApiError, interpretThought, transcribeAudio } from "../lib/ai-server";
 import { POST as voicePost } from "../app/api/voice/route";
@@ -46,13 +47,42 @@ test("does not allow arbitrary audio formats", () => {
   assert.equal(supportedAudioFormat(""), null);
 });
 
-function voiceRequest(mimeType: string) {
-  const form = new FormData();
-  form.append(
-    "audio",
-    new Blob(["short audio"], { type: mimeType }),
-    "leadloop-recording.webm",
+function m4aContainer(brand = "M4A ") {
+  const header = new Uint8Array(16);
+  header.set([0, 0, 0, 16]);
+  header.set(new TextEncoder().encode("ftyp"), 4);
+  header.set(new TextEncoder().encode(brand), 8);
+  return header;
+}
+
+test("accepts a generic MIME upload only when its M4A container is verified", async () => {
+  const recording = new File([m4aContainer()], "voice.m4a", {
+    type: "application/octet-stream",
+  });
+  assert.equal(
+    (await supportedUploadedAudioFormat(recording))?.extension,
+    "m4a",
   );
+});
+
+test("rejects generic MIME uploads with a renamed or non-audio container", async () => {
+  const wrongBrand = new File([m4aContainer("isom")], "voice.m4a", {
+    type: "application/octet-stream",
+  });
+  const renamed = new File([m4aContainer()], "voice.mp4", {
+    type: "application/octet-stream",
+  });
+  assert.equal(await supportedUploadedAudioFormat(wrongBrand), null);
+  assert.equal(await supportedUploadedAudioFormat(renamed), null);
+});
+
+function voiceRequest(
+  mimeType: string,
+  content: BlobPart = "short audio",
+  filename = "leadloop-recording.webm",
+) {
+  const form = new FormData();
+  form.append("audio", new Blob([content], { type: mimeType }), filename);
   form.append("timeZone", "America/Chicago");
   form.append("context", JSON.stringify({}));
   return new Request("http://leadloop.test/api/voice", {
@@ -95,6 +125,28 @@ test("accepts a codec-qualified supported upload before checking OpenAI credenti
   delete process.env.OPENAI_API_KEY;
   try {
     const response = await voicePost(voiceRequest("audio/webm;codecs=opus"));
+    assert.equal(response.status, 503);
+    assert.equal(
+      ((await response.json()) as { code: string }).code,
+      "AI_NOT_CONFIGURED",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous;
+  }
+});
+
+test("accepts an iOS-style generic multipart M4A only after checking its container", async () => {
+  const previous = process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  try {
+    const response = await voicePost(
+      voiceRequest(
+        "application/octet-stream",
+        m4aContainer(),
+        "leadloop-voice-turn.m4a",
+      ),
+    );
     assert.equal(response.status, 503);
     assert.equal(
       ((await response.json()) as { code: string }).code,

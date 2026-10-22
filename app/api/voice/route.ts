@@ -5,7 +5,7 @@ import {
   transcribeAudio,
   validateInterpretationInput,
 } from "../../../lib/ai-server";
-import { supportedAudioFormat } from "../../../lib/audio-format";
+import { supportedUploadedAudioFormat } from "../../../lib/audio-format";
 import {
   clientId,
   limitRequest,
@@ -34,7 +34,7 @@ export async function POST(request: Request) {
         413,
         "AUDIO_TOO_LARGE",
       );
-    if (!supportedAudioFormat(audio.type))
+    if (!(await supportedUploadedAudioFormat(audio)))
       throw new ApiError(
         "This browser recorded an audio format LeadLoop cannot transcribe. Try a current version of Chrome or Safari, or type your thought instead.",
         415,

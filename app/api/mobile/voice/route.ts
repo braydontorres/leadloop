@@ -5,7 +5,7 @@ import {
   transcribeAudio,
   validateInterpretationInput,
 } from "../../../../lib/ai-server";
-import { supportedAudioFormat } from "../../../../lib/audio-format";
+import { supportedUploadedAudioFormat } from "../../../../lib/audio-format";
 import {
   authorizeMobileVoice,
   mobileVoiceAuthDiagnostic,
@@ -58,7 +58,7 @@ export async function POST(request: Request) {
         413,
         "AUDIO_TOO_LARGE",
       );
-    if (!supportedAudioFormat(audio.type))
+    if (!(await supportedUploadedAudioFormat(audio)))
       throw new ApiError(
         "This iPhone recorded an unsupported audio format. Try typing instead.",
         415,
