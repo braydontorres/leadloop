@@ -8,8 +8,11 @@ import {
   RecordingPresets,
   requestRecordingPermissionsAsync,
   setAudioModeAsync,
+  useAudioPlayer,
+  useAudioPlayerStatus,
   useAudioRecorder,
 } from "expo-audio";
+import type { File as ExpoFile } from "expo-file-system";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -116,6 +119,22 @@ import {
 } from "./src/date-picker";
 import { readBuildInfo, shareableBuildInfo } from "./src/build-info";
 import { HandsFreeTurnTimer } from "./src/hands-free-timer";
+import {
+  ASSISTANT_SPEEDS,
+  DEFAULT_ASSISTANT_PREFERENCES,
+  deviceSpeechRate,
+  loadAssistantPreferences,
+  NATURAL_VOICE_OPTIONS,
+  saveAssistantPreferences,
+  type AssistantPreferences,
+  type AssistantSpeed,
+  type AssistantVoiceId,
+} from "./src/assistant-preferences";
+import {
+  removeNaturalSpeechFile,
+  requestNaturalSpeech,
+} from "./src/natural-speech-api";
+import { primaryConversationControl } from "./src/capture-primary-control";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
 type VoiceStatus =
@@ -160,6 +179,8 @@ const COLORS = {
 function MobileApp() {
   const buildInfo = readBuildInfo(Constants);
   const recorder = useAudioRecorder(HANDS_FREE_RECORDING_OPTIONS);
+  const naturalSpeechPlayer = useAudioPlayer(null, { updateInterval: 100 });
+  const naturalSpeechStatus = useAudioPlayerStatus(naturalSpeechPlayer);
   const recording = useSafeRecorderStatus(
     recorder,
     HANDS_FREE_STATUS_INTERVAL_MS,
@@ -211,6 +232,13 @@ function MobileApp() {
   const lastMeterChangedAtRef = useRef<number | null>(null);
   const [assistantMuted, setAssistantMuted] = useState(false);
   const assistantMutedRef = useRef(false);
+  const [assistantPreferences, setAssistantPreferences] =
+    useState<AssistantPreferences>(DEFAULT_ASSISTANT_PREFERENCES);
+  const assistantPreferencesRef = useRef(assistantPreferences);
+  const assistantPreferencesRequestRef = useRef(0);
+  const naturalSpeechCompletionRef = useRef<(() => void) | null>(null);
+  const naturalSpeechFallbackRef = useRef<(() => void) | null>(null);
+  const naturalSpeechFileRef = useRef<ExpoFile | null>(null);
   const [transcript, setTranscript] = useState("");
   const [assistantReply, setAssistantReply] = useState("");
   const [pendingSave, setPendingSave] = useState<{
@@ -281,6 +309,76 @@ function MobileApp() {
   useEffect(() => {
     assistantMutedRef.current = assistantMuted;
   }, [assistantMuted]);
+
+  useEffect(() => {
+    assistantPreferencesRef.current = assistantPreferences;
+    assistantMutedRef.current = assistantPreferences.muted;
+    setAssistantMuted(assistantPreferences.muted);
+  }, [assistantPreferences]);
+
+  useEffect(() => {
+    if (!sessionUserId || !data?.workspace.id) {
+      setAssistantPreferences({ ...DEFAULT_ASSISTANT_PREFERENCES });
+      return;
+    }
+    const requestId = ++assistantPreferencesRequestRef.current;
+    void loadAssistantPreferences(sessionUserId, data.workspace.id)
+      .then((preferences) => {
+        if (requestId !== assistantPreferencesRequestRef.current) return;
+        setAssistantPreferences(preferences);
+      })
+      .catch(() => {
+        if (requestId !== assistantPreferencesRequestRef.current) return;
+        setAssistantPreferences({ ...DEFAULT_ASSISTANT_PREFERENCES });
+      });
+  }, [data?.workspace.id, sessionUserId]);
+
+  const updateAssistantPreferences = useCallback(
+    (change: Partial<AssistantPreferences>) => {
+      const next = { ...assistantPreferencesRef.current, ...change };
+      setAssistantPreferences(next);
+      if (!sessionUserId || !data?.workspace.id) return;
+      void saveAssistantPreferences(
+        sessionUserId,
+        data.workspace.id,
+        next,
+      ).catch(() => {
+        setNotice(
+          "Your voice preference is active for now, but could not be saved on this device.",
+        );
+      });
+    },
+    [data?.workspace.id, sessionUserId],
+  );
+
+  const clearNaturalSpeech = useCallback(() => {
+    naturalSpeechCompletionRef.current = null;
+    naturalSpeechFallbackRef.current = null;
+    try {
+      naturalSpeechPlayer.pause();
+      naturalSpeechPlayer.replace(null);
+    } catch {
+      // A released player is already silent.
+    }
+    removeNaturalSpeechFile(naturalSpeechFileRef.current);
+    naturalSpeechFileRef.current = null;
+  }, [naturalSpeechPlayer]);
+
+  useEffect(() => {
+    const playbackError = (
+      naturalSpeechStatus as typeof naturalSpeechStatus & {
+        error?: string | null;
+      }
+    ).error;
+    if (!naturalSpeechStatus.didJustFinish && !playbackError) return;
+    const complete = naturalSpeechCompletionRef.current;
+    const fallback = naturalSpeechFallbackRef.current;
+    clearNaturalSpeech();
+    if (playbackError) {
+      if (fallback) fallback();
+      else complete?.();
+    } else complete?.();
+  }, [clearNaturalSpeech, naturalSpeechStatus]);
 
   const client = supabase;
   const timezone = data?.timezone ?? "America/Chicago";
@@ -647,21 +745,132 @@ function MobileApp() {
         complete();
         return;
       }
-      try {
-        Speech.stop();
-        Speech.speak(reply, {
-          rate: 0.48,
-          onDone: complete,
-          onError: complete,
-          onStopped: complete,
-        });
-      } catch {
-        // Text remains visible and the conversation must not get stuck when a
-        // device has speech playback disabled.
-        complete();
+      const deviceFallback = () => {
+        if (playbackId !== speechPlaybackRef.current) return;
+        try {
+          Speech.stop();
+          Speech.speak(reply, {
+            rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
+            onDone: complete,
+            onError: complete,
+            onStopped: complete,
+          });
+        } catch {
+          // Text remains visible and the conversation must not get stuck when
+          // the device speech engine is unavailable.
+          complete();
+        }
+      };
+      const preferences = assistantPreferencesRef.current;
+      if (preferences.mode !== "natural" || !client || !data) {
+        deviceFallback();
+        return;
       }
+      Speech.stop();
+      clearNaturalSpeech();
+      void requestNaturalSpeech({
+        client,
+        workspaceId: data.workspace.id,
+        text: reply,
+        voice: preferences.voice,
+        speed: preferences.speed,
+      })
+        .then(async (file) => {
+          if (playbackId !== speechPlaybackRef.current) {
+            removeNaturalSpeechFile(file);
+            return;
+          }
+          naturalSpeechFileRef.current = file;
+          naturalSpeechCompletionRef.current = complete;
+          naturalSpeechFallbackRef.current = deviceFallback;
+          await setAudioModeAsync({
+            allowsRecording: false,
+            playsInSilentMode: true,
+          });
+          if (playbackId !== speechPlaybackRef.current) {
+            clearNaturalSpeech();
+            return;
+          }
+          naturalSpeechPlayer.replace(file.uri);
+          naturalSpeechPlayer.play();
+        })
+        .catch(() => {
+          // Natural synthesis is an opt-in enhancement. A network or provider
+          // failure must never prevent the existing device voice or listening.
+          clearNaturalSpeech();
+          deviceFallback();
+        });
     },
-    [],
+    [clearNaturalSpeech, client, data, naturalSpeechPlayer],
+  );
+
+  const previewNaturalVoice = useCallback(
+    (voice: AssistantVoiceId) => {
+      if (handsFreeActiveRef.current) {
+        setNotice("End the active conversation before previewing a voice.");
+        return;
+      }
+      if (!client || !data) return;
+      if (assistantPreferencesRef.current.mode !== "natural") {
+        setNotice(
+          "Enable Natural AI voice before requesting a paid voice preview.",
+        );
+        return;
+      }
+      const playbackId = ++speechPlaybackRef.current;
+      const text = "Hi, I’m LeadLoop. I’ll help you keep your business moving.";
+      Speech.stop();
+      clearNaturalSpeech();
+      setNotice("Preparing your natural voice preview…");
+      void requestNaturalSpeech({
+        client,
+        workspaceId: data.workspace.id,
+        text,
+        voice,
+        speed: assistantPreferencesRef.current.speed,
+      })
+        .then(async (file) => {
+          if (playbackId !== speechPlaybackRef.current) {
+            removeNaturalSpeechFile(file);
+            return;
+          }
+          naturalSpeechFileRef.current = file;
+          naturalSpeechCompletionRef.current = () => {
+            if (playbackId !== speechPlaybackRef.current) return;
+            setNotice("Natural voice preview finished.");
+          };
+          naturalSpeechFallbackRef.current = () => {
+            if (playbackId !== speechPlaybackRef.current) return;
+            setNotice(
+              "Natural preview could not play. Playing the device voice instead.",
+            );
+            Speech.speak(text, {
+              rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
+            });
+          };
+          await setAudioModeAsync({
+            allowsRecording: false,
+            playsInSilentMode: true,
+          });
+          if (playbackId !== speechPlaybackRef.current) {
+            clearNaturalSpeech();
+            return;
+          }
+          naturalSpeechPlayer.replace(file.uri);
+          naturalSpeechPlayer.play();
+        })
+        .catch(() => {
+          if (playbackId !== speechPlaybackRef.current) return;
+          clearNaturalSpeech();
+          setNotice(
+            "Natural preview was unavailable. Playing the device voice instead.",
+          );
+          Speech.speak(text, {
+            rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
+          });
+        });
+    },
+    [clearNaturalSpeech, client, data, naturalSpeechPlayer],
   );
 
   const persistConfirmedTask = useCallback(
@@ -1173,17 +1382,19 @@ function MobileApp() {
       voiceTurnRef.current += 1;
       speechPlaybackRef.current += 1;
       Speech.stop();
+      clearNaturalSpeech();
       void recorder.stop().catch(() => {
         // A released recorder needs no further cleanup.
       });
     },
-    [recorder],
+    [clearNaturalSpeech, recorder],
   );
 
   const startHandsFreeConversation = async () => {
     if (handsFreeActiveRef.current) return;
     speechPlaybackRef.current += 1;
     Speech.stop();
+    clearNaturalSpeech();
     const sessionId = ++handsFreeSessionRef.current;
     handsFreeActiveRef.current = true;
     setHandsFreeActive(true);
@@ -1207,6 +1418,7 @@ function MobileApp() {
     handsFreeWallElapsedRef.current = 0;
     speechPlaybackRef.current += 1;
     Speech.stop();
+    clearNaturalSpeech();
     try {
       await recorder.stop();
     } catch {
@@ -1233,6 +1445,7 @@ function MobileApp() {
     }
     speechPlaybackRef.current += 1;
     Speech.stop();
+    clearNaturalSpeech();
     await startListeningTurn();
   };
 
@@ -1402,7 +1615,11 @@ function MobileApp() {
             onStartConversation={() => void startHandsFreeConversation()}
             onEndConversation={() => void endHandsFreeConversation()}
             onResumeConversation={() => void resumeHandsFreeConversation()}
-            onToggleMute={() => setAssistantMuted((muted) => !muted)}
+            onToggleMute={() =>
+              updateAssistantPreferences({
+                muted: !assistantPreferencesRef.current.muted,
+              })
+            }
             onConfirm={() => void confirmByButton()}
             onRetrySave={() => void retryPendingSave()}
             hasPendingSave={Boolean(pendingSave)}
@@ -1433,6 +1650,9 @@ function MobileApp() {
             workspace={data.workspace}
             timezone={timezone}
             buildInfo={buildInfo}
+            assistantPreferences={assistantPreferences}
+            onAssistantPreferences={updateAssistantPreferences}
+            onPreviewVoice={previewNaturalVoice}
             onSwitch={() => setShowWorkspacePicker(true)}
             onSignOut={() => void signOut()}
           />
@@ -1751,12 +1971,18 @@ function SettingsScreen({
   workspace,
   timezone,
   buildInfo,
+  assistantPreferences,
+  onAssistantPreferences,
+  onPreviewVoice,
   onSwitch,
   onSignOut,
 }: {
   workspace: MobileWorkspace;
   timezone: string;
   buildInfo: ReturnType<typeof readBuildInfo>;
+  assistantPreferences: AssistantPreferences;
+  onAssistantPreferences(change: Partial<AssistantPreferences>): void;
+  onPreviewVoice(voice: AssistantVoiceId): void;
   onSwitch(): void;
   onSignOut(): void;
 }) {
@@ -1770,6 +1996,107 @@ function SettingsScreen({
         <Text style={styles.meta}>Cloud-synced workspace</Text>
       </View>
       <PrimaryButton label="Switch workspace" onPress={onSwitch} />
+      <View style={styles.personCard}>
+        <Text style={styles.eyebrow}>ASSISTANT VOICE</Text>
+        <Text style={styles.cardTitle}>Natural conversation, your choice.</Text>
+        <Text style={styles.meta}>
+          Device voice is included. Natural AI voice uses the secure LeadLoop
+          service and may incur OpenAI usage charges.
+        </Text>
+        <View style={styles.choiceRow}>
+          <Pressable
+            accessibilityRole="button"
+            style={[
+              styles.choice,
+              assistantPreferences.mode === "device" && styles.choiceSelected,
+            ]}
+            onPress={() => onAssistantPreferences({ mode: "device" })}
+          >
+            <Text style={styles.choiceTitle}>Device voice</Text>
+            <Text style={styles.choiceMeta}>Included fallback</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            style={[
+              styles.choice,
+              assistantPreferences.mode === "natural" && styles.choiceSelected,
+            ]}
+            onPress={() => {
+              if (assistantPreferences.mode === "natural") return;
+              Alert.alert(
+                "Enable Natural AI Voice?",
+                "LeadLoop will send each assistant reply to the secure server for OpenAI speech generation. This can create usage charges. You can switch back to device voice anytime.",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  {
+                    text: "Enable",
+                    onPress: () => onAssistantPreferences({ mode: "natural" }),
+                  },
+                ],
+              );
+            }}
+          >
+            <Text style={styles.choiceTitle}>Natural AI voice</Text>
+            <Text style={styles.choiceMeta}>Opt in before use</Text>
+          </Pressable>
+        </View>
+        <Text style={styles.fieldLabel}>Voice style</Text>
+        {NATURAL_VOICE_OPTIONS.map((voice) => (
+          <View key={voice.id} style={styles.voiceRow}>
+            <Pressable
+              accessibilityRole="button"
+              style={[
+                styles.voiceChoice,
+                assistantPreferences.voice === voice.id &&
+                  styles.choiceSelected,
+              ]}
+              onPress={() => onAssistantPreferences({ voice: voice.id })}
+            >
+              <Text style={styles.choiceTitle}>{voice.label}</Text>
+              <Text style={styles.choiceMeta}>{voice.description}</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => onPreviewVoice(voice.id)}
+            >
+              <Text style={styles.link}>Preview</Text>
+            </Pressable>
+          </View>
+        ))}
+        <Text style={styles.fieldLabel}>Speaking pace</Text>
+        <View style={styles.choiceRow}>
+          {ASSISTANT_SPEEDS.map((speed) => (
+            <Pressable
+              key={speed}
+              accessibilityRole="button"
+              style={[
+                styles.choice,
+                assistantPreferences.speed === speed && styles.choiceSelected,
+              ]}
+              onPress={() => onAssistantPreferences({ speed })}
+            >
+              <Text style={styles.choiceTitle}>
+                {speed.charAt(0).toUpperCase() + speed.slice(1)}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          onPress={() =>
+            onAssistantPreferences({ muted: !assistantPreferences.muted })
+          }
+        >
+          <Text style={styles.link}>
+            {assistantPreferences.muted ? "Unmute assistant" : "Mute assistant"}
+          </Text>
+        </Pressable>
+        <Text style={styles.meta}>
+          Voice preferences are stored on this device. The current cloud
+          workspace schema has no voice-preference field, so LeadLoop does not
+          silently sync them across devices yet.
+        </Text>
+      </View>
       <View style={styles.personCard}>
         <Text style={styles.eyebrow}>BUILD INFORMATION</Text>
         <Text selectable style={styles.meta}>
@@ -1831,7 +2158,7 @@ function Capture({
   isRecording: boolean;
   seconds: number;
   notice: string;
-  status: string;
+  status: VoiceStatus;
   conversationActive: boolean;
   assistantMuted: boolean;
   transcript: string;
@@ -1859,6 +2186,7 @@ function Capture({
 }) {
   const [showPanel, setShowPanel] = useState(false);
   const [showManualFallback, setShowManualFallback] = useState(false);
+  const primaryControl = primaryConversationControl(conversationActive, status);
   return (
     <ScrollView contentContainerStyle={styles.capture}>
       <Text style={styles.eyebrow}>VOICE CAPTURE</Text>
@@ -1878,20 +2206,20 @@ function Capture({
                     ? "Waiting for the next turn…"
                     : "Tap the microphone to start a conversation."}
       </Text>
-      {!conversationActive ? (
-        <Pressable
-          accessibilityRole="button"
-          accessibilityLabel="Start voice conversation"
-          disabled={!canRecord || isRecording}
-          style={[styles.mic, (!canRecord || isRecording) && styles.disabled]}
-          onPress={onStartConversation}
-        >
-          <Text style={styles.micIcon}>●</Text>
-          <Text style={styles.micText}>Start conversation</Text>
-        </Pressable>
-      ) : (
-        <PrimaryButton label="End conversation" onPress={onEndConversation} />
-      )}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={primaryControl.accessibilityLabel}
+        disabled={!conversationActive && (!canRecord || isRecording)}
+        style={[
+          styles.mic,
+          primaryControl.tone === "danger" && styles.micEnd,
+          !conversationActive && (!canRecord || isRecording) && styles.disabled,
+        ]}
+        onPress={conversationActive ? onEndConversation : onStartConversation}
+      >
+        <Text style={styles.micIcon}>{primaryControl.icon}</Text>
+        <Text style={styles.micText}>{primaryControl.label}</Text>
+      </Pressable>
       {conversationActive && status === "error" ? (
         <PrimaryButton
           label="Resume listening"
@@ -2289,6 +2617,32 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.55 },
   primaryText: { color: "#FFFFFF", fontSize: 16, fontWeight: "800" },
   link: { color: COLORS.green, fontSize: 16, fontWeight: "700", padding: 8 },
+  choiceRow: { flexDirection: "row", gap: 8, width: "100%" },
+  choice: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: COLORS.line,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: COLORS.cream,
+  },
+  choiceSelected: { borderColor: COLORS.green, backgroundColor: COLORS.sage },
+  choiceTitle: { color: COLORS.ink, fontSize: 14, fontWeight: "800" },
+  choiceMeta: { color: COLORS.muted, fontSize: 12, lineHeight: 17 },
+  voiceRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    width: "100%",
+  },
+  voiceChoice: {
+    flex: 1,
+    borderWidth: 1,
+    borderColor: COLORS.line,
+    borderRadius: 12,
+    padding: 10,
+    backgroundColor: COLORS.cream,
+  },
   deleteLink: {
     color: COLORS.danger,
     fontSize: 16,
@@ -2394,6 +2748,7 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.22,
     elevation: 6,
   },
+  micEnd: { backgroundColor: COLORS.danger, shadowColor: COLORS.danger },
   micActive: { backgroundColor: COLORS.danger },
   micIcon: { color: "#FFFFFF", fontSize: 42, lineHeight: 45 },
   micText: { color: "#FFFFFF", fontSize: 18, fontWeight: "800" },

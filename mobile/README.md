@@ -14,8 +14,10 @@ this app never contains a service-role or OpenAI key.
 - Cloud-backed customer and open-reminder lists.
 - Creation and completion of reminders directly in the existing `tasks` table.
   Reminder IDs and optional customer IDs are preserved.
-- A native `expo-audio` tap-to-talk recorder with iOS microphone permission.
-  Recording begins only after an explicit tap and stops after a second tap.
+- A native `expo-audio` hands-free recorder with iOS microphone permission.
+  One explicit Start Conversation tap begins the session; LeadLoop detects
+  speech and end-of-turn silence automatically. End Conversation is always
+  available, and manual recording remains a troubleshooting fallback.
 - Authenticated voice upload to `POST /api/mobile/voice`. The app attaches the
   signed-in user's Supabase access token; the server verifies the token and
   workspace membership with RLS before it transcribes a supported iOS MPEG-4
@@ -25,6 +27,11 @@ this app never contains a service-role or OpenAI key.
   displays the transcript, speaks LeadLoop's response when iOS speech is
   available, reads a complete reminder back, and writes only after an explicit
   voice or **Yes, save it** confirmation.
+- Optional Natural AI voice playback through authenticated
+  `POST /api/mobile/speech`. It is off by default, uses the existing server-only
+  `OPENAI_API_KEY`, and falls back to device speech. See
+  [`docs/natural-ai-voices.md`](../docs/natural-ai-voices.md) for cost and
+  privacy details.
 - Hands-free turns use a monotonic JavaScript clock for speech and silence
   timing, so a frozen iOS `durationMillis` cannot leave Capture permanently in
   **Listening**. Native recorder status remains a health and upload-metadata
@@ -55,8 +62,8 @@ future-milestone work; the mobile app does not claim those features work.
    ```bash
    cd ~/leadloop
    git fetch origin
-   git switch feat/iphone-ai-voice-phase-3c
-   git pull --ff-only origin feat/iphone-ai-voice-phase-3c
+   git switch chore/railway-production-backend
+   git pull --ff-only origin chore/railway-production-backend
    # Terminal 1: from ~/leadloop, with existing .env.local configured
    npm run dev
    # Terminal 2: expose port 3000 using your approved HTTPS tunnel provider

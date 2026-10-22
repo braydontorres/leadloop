@@ -9,6 +9,47 @@ import { recoverInitialReminderIntent } from "./reminder-fallback";
 
 const OPENAI_API_URL = "https://api.openai.com/v1";
 const MAX_TEXT_LENGTH = 3000;
+const MAX_SPEECH_TEXT_LENGTH = 800;
+
+/**
+ * These identifiers are documented OpenAI voices. The product labels describe
+ * their perceived delivery only; they do not claim a person's gender.
+ */
+export const NATURAL_SPEECH_VOICES = [
+  "alloy",
+  "echo",
+  "fable",
+  "onyx",
+  "nova",
+  "shimmer",
+] as const;
+export type NaturalSpeechVoice = (typeof NATURAL_SPEECH_VOICES)[number];
+export const NATURAL_SPEECH_SPEEDS = ["relaxed", "normal", "fast"] as const;
+export type NaturalSpeechSpeed = (typeof NATURAL_SPEECH_SPEEDS)[number];
+
+const naturalSpeechRates: Record<NaturalSpeechSpeed, number> = {
+  relaxed: 0.9,
+  normal: 1,
+  fast: 1.12,
+};
+
+export function isNaturalSpeechVoice(
+  value: unknown,
+): value is NaturalSpeechVoice {
+  return (
+    typeof value === "string" &&
+    (NATURAL_SPEECH_VOICES as readonly string[]).includes(value)
+  );
+}
+
+export function isNaturalSpeechSpeed(
+  value: unknown,
+): value is NaturalSpeechSpeed {
+  return (
+    typeof value === "string" &&
+    (NATURAL_SPEECH_SPEEDS as readonly string[]).includes(value)
+  );
+}
 
 const responseSchema = {
   type: "object",
@@ -262,7 +303,7 @@ async function providerFailure(response: Response): Promise<ProviderFailure> {
 }
 
 function logAiFailure(
-  operation: "transcription" | "interpretation",
+  operation: "transcription" | "interpretation" | "speech",
   failure: ProviderFailure & { errorType: string },
 ) {
   console.error(
@@ -282,7 +323,7 @@ function logAiFailure(
 
 function errorForProviderFailure(
   failure: ProviderFailure,
-  operation: "transcription" | "interpretation",
+  operation: "transcription" | "interpretation" | "speech",
 ) {
   if (failure.status === 401)
     return new ApiError(
@@ -324,11 +365,15 @@ function errorForProviderFailure(
     return new ApiError(
       operation === "transcription"
         ? "OpenAI could not accept this recording. Record a short note in a supported browser and try again."
-        : "OpenAI rejected LeadLoop's task interpretation request. Update LeadLoop and try again.",
+        : operation === "speech"
+          ? "OpenAI could not create that voice response. Try device speech instead."
+          : "OpenAI rejected LeadLoop's task interpretation request. Update LeadLoop and try again.",
       operation === "transcription" ? 422 : 502,
       operation === "transcription"
         ? "AI_TRANSCRIPTION_REJECTED"
-        : "AI_INTERPRETATION_REJECTED",
+        : operation === "speech"
+          ? "AI_SPEECH_REJECTED"
+          : "AI_INTERPRETATION_REJECTED",
       failure.requestId,
     );
   if (failure.status && failure.status >= 500)
@@ -349,7 +394,7 @@ function errorForProviderFailure(
 async function openAiFetch(
   path: string,
   init: RequestInit,
-  operation: "transcription" | "interpretation",
+  operation: "transcription" | "interpretation" | "speech",
 ) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25_000);
@@ -392,6 +437,42 @@ async function openAiFetch(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+/**
+ * Creates a short, transient MP3 response for an authenticated client. The
+ * caller owns authorization and must never persist the returned response.
+ */
+export async function synthesizeNaturalSpeech(input: {
+  text: string;
+  voice: NaturalSpeechVoice;
+  speed: NaturalSpeechSpeed;
+}) {
+  const text = input.text.trim();
+  if (!text || text.length > MAX_SPEECH_TEXT_LENGTH)
+    throw new ApiError(
+      "LeadLoop can speak replies up to 800 characters.",
+      400,
+      "SPEECH_TEXT_INVALID",
+    );
+  const response = await openAiFetch(
+    "/audio/speech",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: process.env.OPENAI_TTS_MODEL?.trim() || "gpt-4o-mini-tts",
+        voice: input.voice,
+        input: text,
+        response_format: "mp3",
+        speed: naturalSpeechRates[input.speed],
+        instructions:
+          "Speak warmly and conversationally, with clear pacing for a small-business owner.",
+      }),
+    },
+    "speech",
+  );
+  return response;
 }
 
 export async function interpretThought(
