@@ -36,16 +36,22 @@ migration requirement; Supabase remains the system of record.
 | Name                                   | Purpose                                                                     | Required                                                                    |
 | -------------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | `OPENAI_API_KEY`                       | Server-only OpenAI transcription and interpretation key for voice requests. | Yes for `/api/mobile/voice`; no for health checks and typed local-only use. |
-| `NEXT_PUBLIC_SUPABASE_URL`             | Supabase project base URL, for example `https://project-ref.supabase.co`.   | Yes for authenticated cloud and mobile voice.                               |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Current Supabase browser-safe publishable key.                              | Yes, unless using the legacy key below.                                     |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY`        | Legacy alternative to the publishable key.                                  | Use only when the project does not have a publishable key.                  |
+| `SUPABASE_URL`                         | Runtime-only Supabase project base URL for server API routes.               | Yes for `/api/mobile/voice`.                                                |
+| `SUPABASE_PUBLISHABLE_KEY`             | Runtime-only Supabase publishable key for server API routes.                | Yes, unless using the legacy server key below.                              |
+| `SUPABASE_ANON_KEY`                    | Legacy runtime-only alternative to the publishable key.                     | Use only when the project does not have a publishable key.                  |
+| `NEXT_PUBLIC_SUPABASE_URL`             | Browser-safe Supabase project base URL.                                     | Yes for the hosted web client.                                              |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Browser-safe Supabase publishable key.                                      | Yes for the hosted web client, unless using the legacy public key below.    |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY`        | Legacy browser-safe alternative to the publishable key.                     | Use only when the project does not have a publishable key.                  |
 
-Use exactly one of `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` and
-`NEXT_PUBLIC_SUPABASE_ANON_KEY`; the publishable key takes precedence. Values
-with `NEXT_PUBLIC_` are intentionally browser-visible Supabase configuration,
-not server secrets. Do **not** configure `SUPABASE_SERVICE_ROLE_KEY` or any
-`EXPO_PUBLIC_*` value on this service. `PORT` and `NODE_ENV` are supplied by
-Railway; do not set them to a fixed value.
+For production mobile voice, set `SUPABASE_URL` and exactly one server key:
+`SUPABASE_PUBLISHABLE_KEY` or `SUPABASE_ANON_KEY`. The endpoint rejects missing
+or conflicting server keys rather than silently choosing a `NEXT_PUBLIC_*`
+value that Next.js may have embedded at build time. The `NEXT_PUBLIC_*` values
+remain necessary for the hosted web client and are browser-visible project
+configuration, not server secrets. Do **not** configure
+`SUPABASE_SERVICE_ROLE_KEY` or any `EXPO_PUBLIC_*` value on this service.
+`PORT` and `NODE_ENV` are supplied by Railway; do not set them to a fixed
+value.
 
 ## Security review of mobile voice
 
@@ -74,13 +80,15 @@ with the caller JWT; it never uses a Supabase service-role key.
 An HTTP 401 from the mobile voice route now has a safe, specific `errorType`
 in host logs and a matching `code` in the JSON response:
 
-| Code                               | Meaning                                                                 | Next action                                                                                        |
-| ---------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `MOBILE_AUTH_HEADER_MISSING`       | The API did not receive an Authorization header.                        | Check the deployed Expo build and its configured API URL; do not change Supabase credentials.      |
-| `MOBILE_AUTH_HEADER_MALFORMED`     | The header was present but was not a usable Bearer value.               | Rebuild/reload the mobile bundle and sign in again.                                                |
-| `MOBILE_AUTH_TOKEN_REJECTED`       | Supabase Auth rejected the received access token.                       | Sign out and in once; if it repeats, verify the mobile app and host use the same Supabase project. |
-| `MOBILE_AUTH_PROJECT_KEY_REJECTED` | Supabase Auth rejected the host's public project key.                   | Review the hosted key configuration without rotating it unnecessarily.                             |
-| `MOBILE_AUTH_SERVICE_UNAVAILABLE`  | The host could not contact Supabase Auth or received a service failure. | Check the host-to-Supabase network/service status and retry.                                       |
+| Code                                  | Meaning                                                                 | Next action                                                                                        |
+| ------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `MOBILE_AUTH_HEADER_MISSING`          | The API did not receive an Authorization header.                        | Check the deployed Expo build and its configured API URL; do not change Supabase credentials.      |
+| `MOBILE_AUTH_HEADER_MALFORMED`        | The header was present but was not a usable Bearer value.               | Rebuild/reload the mobile bundle and sign in again.                                                |
+| `MOBILE_AUTH_TOKEN_REJECTED`          | Supabase Auth rejected the received access token.                       | Sign out and in once; if it repeats, verify the mobile app and host use the same Supabase project. |
+| `MOBILE_AUTH_PROJECT_KEY_REJECTED`    | Supabase Auth rejected the host's public project key.                   | Review the hosted key configuration without rotating it unnecessarily.                             |
+| `MOBILE_AUTH_RUNTIME_CONFIG_REQUIRED` | The deployed server lacks runtime-only `SUPABASE_*` settings.           | Add the documented runtime variables, then redeploy.                                               |
+| `MOBILE_AUTH_CONFIG_AMBIGUOUS`        | Both server key types are configured with different values.             | Keep exactly one runtime key type.                                                                 |
+| `MOBILE_AUTH_SERVICE_UNAVAILABLE`     | The host could not contact Supabase Auth or received a service failure. | Check the host-to-Supabase network/service status and retry.                                       |
 
 These categories intentionally omit tokens, email addresses, request headers,
 and raw Supabase error messages.
@@ -115,7 +123,7 @@ needs no credentials.
 1. Open `https://YOUR_RAILWAY_DOMAIN/api/health`. Expect HTTP 200 and exactly
    the two non-sensitive fields listed above.
 2. Send a multipart request with a syntactically valid `workspaceId` but no
-   Bearer token. Expect HTTP 401 and `MOBILE_AUTH_REQUIRED`; it must not call
+   Bearer token. Expect HTTP 401 and `MOBILE_AUTH_HEADER_MISSING`; it must not call
    OpenAI.
 3. With a test account that is a member of a test workspace, use the existing
    iPhone Capture screen to record a short M4A below 10 MiB. Confirm it shows a

@@ -21,24 +21,122 @@ export type MobileVoiceAuthDiagnostic = {
     | "service_unavailable";
   providerStatus: number | null;
   providerCode: string | null;
+  configSource: MobileVoiceSupabaseConfig["source"] | null;
+};
+
+type ServerEnvironment = Record<string, string | undefined>;
+type MobileVoiceKeySource =
+  | "server_publishable"
+  | "server_anon"
+  | "development_public_publishable"
+  | "development_public_anon";
+
+export type MobileVoiceSupabaseConfig = {
+  url: string;
+  key: string;
+  source: MobileVoiceKeySource;
 };
 
 type MobileVoiceAuthError = ApiError & {
   mobileVoiceAuthDiagnostic?: MobileVoiceAuthDiagnostic;
 };
 
-function supabaseConfig() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key =
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ??
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  if (!url || !key)
-    throw new ApiError(
-      "LeadLoop cloud authentication is not configured on this server.",
-      503,
-      "MOBILE_AUTH_NOT_CONFIGURED",
+function environmentValue(environment: ServerEnvironment, name: string) {
+  return environment[name]?.trim() || undefined;
+}
+
+function configurationError(message: string, code: string) {
+  return new ApiError(message, 503, code);
+}
+
+function projectBaseUrl(value: string) {
+  try {
+    const url = new URL(value);
+    if (
+      !["https:", "http:"].includes(url.protocol) ||
+      !url.hostname ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      (url.pathname !== "" && url.pathname !== "/")
+    )
+      throw new Error("Invalid project URL");
+    return url.origin;
+  } catch {
+    throw configurationError(
+      "LeadLoop cloud authentication has an invalid server project URL.",
+      "MOBILE_AUTH_CONFIG_INVALID",
     );
-  return { url: url.replace(/\/$/, ""), key };
+  }
+}
+
+/**
+ * Reads server-only runtime configuration. `NEXT_PUBLIC_*` names are allowed
+ * only for local development; Next.js substitutes those names while building a
+ * production bundle and they are not safe for a server-side auth boundary.
+ */
+export function mobileVoiceSupabaseConfig(
+  environment: ServerEnvironment = process.env,
+): MobileVoiceSupabaseConfig {
+  const isProduction =
+    environmentValue(environment, "NODE_ENV") === "production";
+  const runtimeUrl = environmentValue(environment, "SUPABASE_URL");
+  const runtimePublishable = environmentValue(
+    environment,
+    "SUPABASE_PUBLISHABLE_KEY",
+  );
+  const runtimeAnon = environmentValue(environment, "SUPABASE_ANON_KEY");
+  const publicUrl = environmentValue(environment, "NEXT_PUBLIC_SUPABASE_URL");
+  const publicPublishable = environmentValue(
+    environment,
+    "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
+  );
+  const publicAnon = environmentValue(
+    environment,
+    "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+  );
+
+  if (runtimePublishable && runtimeAnon && runtimePublishable !== runtimeAnon)
+    throw configurationError(
+      "LeadLoop cloud authentication has conflicting server key settings.",
+      "MOBILE_AUTH_CONFIG_AMBIGUOUS",
+    );
+  if (
+    !isProduction &&
+    publicPublishable &&
+    publicAnon &&
+    publicPublishable !== publicAnon
+  )
+    throw configurationError(
+      "LeadLoop cloud authentication has conflicting public key settings.",
+      "MOBILE_AUTH_CONFIG_AMBIGUOUS",
+    );
+
+  const url = runtimeUrl ?? (!isProduction ? publicUrl : undefined);
+  const key = runtimePublishable ?? runtimeAnon;
+  const source: MobileVoiceKeySource | undefined = runtimePublishable
+    ? "server_publishable"
+    : runtimeAnon
+      ? "server_anon"
+      : !isProduction && publicPublishable
+        ? "development_public_publishable"
+        : !isProduction && publicAnon
+          ? "development_public_anon"
+          : undefined;
+  const configuredKey =
+    key ?? (!isProduction ? (publicPublishable ?? publicAnon) : undefined);
+  if (!url || !configuredKey || !source)
+    throw new ApiError(
+      isProduction
+        ? "LeadLoop cloud authentication needs server runtime configuration."
+        : "LeadLoop cloud authentication is not configured on this server.",
+      503,
+      isProduction
+        ? "MOBILE_AUTH_RUNTIME_CONFIG_REQUIRED"
+        : "MOBILE_AUTH_NOT_CONFIGURED",
+    );
+  return { url: projectBaseUrl(url), key: configuredKey, source };
 }
 
 function bearerToken(request: Request) {
@@ -53,6 +151,7 @@ function bearerToken(request: Request) {
         outcome: "missing_header",
         providerStatus: null,
         providerCode: null,
+        configSource: null,
       },
     );
   const match = /^Bearer\s+(.+)$/i.exec(value);
@@ -66,6 +165,7 @@ function bearerToken(request: Request) {
         outcome: "malformed_header",
         providerStatus: null,
         providerCode: null,
+        configSource: null,
       },
     );
   return match[1];
@@ -106,6 +206,7 @@ function rejectionOutcome(
 function authDiagnostic(
   stage: MobileVoiceAuthDiagnostic["stage"],
   outcome: MobileVoiceAuthDiagnostic["outcome"],
+  configSource: MobileVoiceSupabaseConfig["source"],
   error?: unknown,
 ): MobileVoiceAuthDiagnostic {
   return {
@@ -113,6 +214,7 @@ function authDiagnostic(
     outcome,
     providerStatus: authFailureStatus(error) ?? null,
     providerCode: safeProviderCode(error),
+    configSource,
   };
 }
 
@@ -135,7 +237,10 @@ export function mobileVoiceAuthDiagnostic(
     : null;
 }
 
-function rejectedTokenError(error?: unknown) {
+function rejectedTokenError(
+  configSource: MobileVoiceSupabaseConfig["source"],
+  error?: unknown,
+) {
   const outcome = rejectionOutcome(error);
   const projectKeyRejected = outcome === "project_key_rejected";
   return authError(
@@ -146,16 +251,24 @@ function rejectedTokenError(error?: unknown) {
     projectKeyRejected
       ? "MOBILE_AUTH_PROJECT_KEY_REJECTED"
       : "MOBILE_AUTH_TOKEN_REJECTED",
-    authDiagnostic("supabase_get_user", outcome, error),
+    authDiagnostic("supabase_get_user", outcome, configSource, error),
   );
 }
 
-function authServiceError(error?: unknown) {
+function authServiceError(
+  configSource: MobileVoiceSupabaseConfig["source"],
+  error?: unknown,
+) {
   return authError(
     "LeadLoop could not verify your sign-in right now. Check your connection and try again.",
     503,
     "MOBILE_AUTH_SERVICE_UNAVAILABLE",
-    authDiagnostic("supabase_get_user", "service_unavailable", error),
+    authDiagnostic(
+      "supabase_get_user",
+      "service_unavailable",
+      configSource,
+      error,
+    ),
   );
 }
 
@@ -169,7 +282,7 @@ export async function authorizeMobileVoice(
   workspaceId: string,
 ): Promise<AuthenticatedMobileUser> {
   const token = bearerToken(request);
-  const { url, key } = supabaseConfig();
+  const { url, key, source } = mobileVoiceSupabaseConfig();
   const client = createClient(url, key, {
     global: { headers: { Authorization: `Bearer ${token}` } },
     auth: { persistSession: false, autoRefreshToken: false },
@@ -179,14 +292,14 @@ export async function authorizeMobileVoice(
     const { data, error } = await client.auth.getUser(token);
     if (data.user) verifiedUser = { id: data.user.id };
     else if (isRejectedAuthStatus(authFailureStatus(error)))
-      throw rejectedTokenError(error);
-    else if (error) throw authServiceError(error);
-    else throw rejectedTokenError();
+      throw rejectedTokenError(source, error);
+    else if (error) throw authServiceError(source, error);
+    else throw rejectedTokenError(source);
   } catch (error) {
     if (error instanceof ApiError) throw error;
     if (isRejectedAuthStatus(authFailureStatus(error)))
-      throw rejectedTokenError(error);
-    throw authServiceError(error);
+      throw rejectedTokenError(source, error);
+    throw authServiceError(source, error);
   }
   // RLS evaluates this request as the authenticated caller. A member can only
   // prove membership in a workspace they are allowed to use.

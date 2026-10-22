@@ -192,3 +192,65 @@ test("mobile voice accepts an authenticated member and reaches the shared AI pip
     else process.env.OPENAI_API_KEY = previous.openAi;
   }
 });
+
+test("mobile voice sends the configured runtime API key and caller JWT as separate headers", async () => {
+  const environment = process.env as Record<string, string | undefined>;
+  const previous = {
+    nodeEnv: process.env.NODE_ENV,
+    url: process.env.SUPABASE_URL,
+    key: process.env.SUPABASE_PUBLISHABLE_KEY,
+    legacyKey: process.env.SUPABASE_ANON_KEY,
+    publicUrl: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    publicKey: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    fetch: globalThis.fetch,
+  };
+  environment.NODE_ENV = "production";
+  process.env.SUPABASE_URL = "https://runtime.supabase.co";
+  process.env.SUPABASE_PUBLISHABLE_KEY = "runtime-key";
+  delete process.env.SUPABASE_ANON_KEY;
+  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://build-time.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "build-time-key";
+  let apiKey: string | null = null;
+  let authorization: string | null = null;
+  globalThis.fetch = async (input, init) => {
+    const url = String(input);
+    const headers = new Headers(init?.headers);
+    if (url.endsWith("/auth/v1/user")) {
+      apiKey = headers.get("apikey");
+      authorization = headers.get("authorization");
+      return new Response(JSON.stringify({ id: "user-1" }), { status: 200 });
+    }
+    if (url.includes("/rest/v1/workspace_members"))
+      return new Response(
+        JSON.stringify([
+          { workspace_id: "11111111-1111-4111-8111-111111111111" },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const response = await POST(
+      request({ Authorization: "Bearer caller-access-token" }),
+    );
+    assert.equal(response.status, 503);
+    assert.equal(apiKey, "runtime-key");
+    assert.equal(authorization, "Bearer caller-access-token");
+  } finally {
+    globalThis.fetch = previous.fetch;
+    if (previous.nodeEnv === undefined) delete environment.NODE_ENV;
+    else environment.NODE_ENV = previous.nodeEnv;
+    if (previous.url === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previous.url;
+    if (previous.key === undefined) delete process.env.SUPABASE_PUBLISHABLE_KEY;
+    else process.env.SUPABASE_PUBLISHABLE_KEY = previous.key;
+    if (previous.legacyKey === undefined) delete process.env.SUPABASE_ANON_KEY;
+    else process.env.SUPABASE_ANON_KEY = previous.legacyKey;
+    if (previous.publicUrl === undefined)
+      delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    else process.env.NEXT_PUBLIC_SUPABASE_URL = previous.publicUrl;
+    if (previous.publicKey === undefined)
+      delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    else process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = previous.publicKey;
+  }
+});
