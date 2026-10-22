@@ -33,6 +33,7 @@ import {
   conversationContext,
   emptyConversationState,
   finishSpeech,
+  startConversation,
   type ConversationState,
   type IntentResult,
 } from "../lib/conversation-machine";
@@ -75,6 +76,15 @@ import {
   type MicrophoneStage,
 } from "./src/microphone-diagnostics";
 import {
+  advanceVoiceActivity,
+  newVoiceActivity,
+  type VoiceActivityState,
+} from "./src/hands-free-vad";
+import {
+  canFinalizeHandsFreeTurn,
+  canResumeHandsFreeListening,
+} from "./src/hands-free-session";
+import {
   timeInputFromPicker,
   timePickerLabel,
   timePickerValue,
@@ -86,6 +96,18 @@ import {
 } from "./src/date-picker";
 
 type Tab = "home" | "capture" | "tasks" | "people" | "settings";
+type VoiceStatus =
+  | "ready"
+  | "listening"
+  | "user_speaking"
+  | "processing"
+  | "speaking"
+  | "saving"
+  | "error";
+const HANDS_FREE_RECORDING_OPTIONS = {
+  ...RecordingPresets.HIGH_QUALITY,
+  isMeteringEnabled: true,
+};
 const COLORS = {
   ink: "#1B2A23",
   muted: "#64726B",
@@ -99,8 +121,8 @@ const COLORS = {
 };
 
 function MobileApp() {
-  const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
-  const recording = useAudioRecorderState(recorder);
+  const recorder = useAudioRecorder(HANDS_FREE_RECORDING_OPTIONS);
+  const recording = useAudioRecorderState(recorder, 100);
   const [tab, setTab] = useState<Tab>("home");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -125,9 +147,10 @@ function MobileApp() {
     emptyConversationState(),
   );
   const conversationRef = useRef(conversation);
-  const [voiceStatus, setVoiceStatus] = useState<
-    "ready" | "recording" | "processing" | "speaking" | "saving" | "error"
-  >("ready");
+  const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("ready");
+  const [handsFreeActive, setHandsFreeActive] = useState(false);
+  const [assistantMuted, setAssistantMuted] = useState(false);
+  const assistantMutedRef = useRef(false);
   const [transcript, setTranscript] = useState("");
   const [assistantReply, setAssistantReply] = useState("");
   const [pendingSave, setPendingSave] = useState<{
@@ -136,6 +159,15 @@ function MobileApp() {
     transcript: string;
   } | null>(null);
   const voiceTurnRef = useRef(0);
+  const speechPlaybackRef = useRef(0);
+  const handsFreeSessionRef = useRef(0);
+  const handsFreeActiveRef = useRef(false);
+  const activeRecordingTurnRef = useRef<number | null>(null);
+  const autoFinalizeTurnRef = useRef<number | null>(null);
+  const voiceActivityRef = useRef<VoiceActivityState>(newVoiceActivity());
+  const startListeningRef = useRef<(sessionId: number) => Promise<void>>(
+    async () => {},
+  );
   const workspaceRequestRef = useRef(0);
   const workspaceDataRevisionRef = useRef(0);
   const restoreRequestRef = useRef(0);
@@ -163,6 +195,10 @@ function MobileApp() {
   useEffect(() => {
     conversationRef.current = conversation;
   }, [conversation]);
+
+  useEffect(() => {
+    assistantMutedRef.current = assistantMuted;
+  }, [assistantMuted]);
 
   const client = supabase;
   const timezone = data?.timezone ?? "America/Chicago";
@@ -494,12 +530,41 @@ function MobileApp() {
     (reply: string, nextState: ConversationState) => {
       setAssistantReply(reply);
       setVoiceStatus("speaking");
+      const sessionId = handsFreeSessionRef.current;
+      const playbackId = ++speechPlaybackRef.current;
       const complete = () => {
+        if (playbackId !== speechPlaybackRef.current) return;
         if (nextState.stage === "reading_back") {
-          setConversation((current) => finishSpeech(current));
+          setConversation((current) => {
+            const next = finishSpeech(current);
+            conversationRef.current = next;
+            return next;
+          });
+        }
+        if (nextState.stage === "ended") {
+          handsFreeActiveRef.current = false;
+          setHandsFreeActive(false);
+          setVoiceStatus("ready");
+          setRecordingNotice("Conversation ended.");
+          return;
+        }
+        if (
+          canResumeHandsFreeListening({
+            active: handsFreeActiveRef.current,
+            callbackSessionId: sessionId,
+            currentSessionId: handsFreeSessionRef.current,
+            nextStage: nextState.stage,
+          })
+        ) {
+          void startListeningRef.current(sessionId);
+          return;
         }
         setVoiceStatus("ready");
       };
+      if (assistantMutedRef.current) {
+        complete();
+        return;
+      }
       try {
         Speech.stop();
         Speech.speak(reply, {
@@ -548,6 +613,7 @@ function MobileApp() {
             : current,
         );
         setPendingSave(null);
+        conversationRef.current = nextState;
         setConversation(nextState);
         speakReply(
           "Perfect, your reminder is saved. Anything else?",
@@ -583,6 +649,7 @@ function MobileApp() {
         );
         return;
       }
+      conversationRef.current = transition.state;
       setConversation(transition.state);
       speakReply(transition.reply, transition.state);
     },
@@ -617,21 +684,107 @@ function MobileApp() {
     );
   };
 
-  const toggleRecording = async () => {
-    setError("");
-    if (recording.isRecording || voiceStatus === "recording") {
-      const turn = voiceTurnRef.current;
+  const startListeningTurn = useCallback(
+    async (sessionId?: number) => {
+      if (
+        sessionId !== undefined &&
+        (!handsFreeActiveRef.current ||
+          sessionId !== handsFreeSessionRef.current)
+      )
+        return;
+      if (recording.isRecording || activeRecordingTurnRef.current !== null)
+        return;
+      if (!client || !data) {
+        setVoiceStatus("error");
+        setError("Choose a cloud workspace before recording.");
+        return;
+      }
+      let stage: MicrophoneStage = "permission";
+      try {
+        const permission = await requestRecordingPermissionsAsync();
+        if (!permission.granted) {
+          recordMicrophoneDiagnostic(microphoneFailure("permission"));
+          setVoiceStatus("error");
+          setError(microphoneErrorMessage("permission"));
+          return;
+        }
+        if (
+          sessionId !== undefined &&
+          (!handsFreeActiveRef.current ||
+            sessionId !== handsFreeSessionRef.current)
+        )
+          return;
+        recordMicrophoneDiagnostic(microphoneSuccess("permission"));
+        stage = "audio_session";
+        await setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
+        });
+        recordMicrophoneDiagnostic(microphoneSuccess("audio_session"));
+        stage = "prepare";
+        await recorder.prepareToRecordAsync();
+        recordMicrophoneDiagnostic(microphoneSuccess("prepare"));
+        stage = "start";
+        const turn = ++voiceTurnRef.current;
+        activeRecordingTurnRef.current = turn;
+        autoFinalizeTurnRef.current = null;
+        voiceActivityRef.current = newVoiceActivity();
+        recorder.record();
+        if (!recorder.getStatus().isRecording)
+          throw new Error("Recorder did not enter recording state.");
+        recordMicrophoneDiagnostic(microphoneSuccess("start"));
+        setVoiceStatus("listening");
+        setRecordingNotice(
+          sessionId === undefined
+            ? "Listening. Tap Stop when you are done."
+            : "Listening for you…",
+        );
+      } catch {
+        activeRecordingTurnRef.current = null;
+        recordMicrophoneDiagnostic(microphoneFailure(stage));
+        setError(microphoneErrorMessage(stage));
+        setVoiceStatus("error");
+      }
+    },
+    [client, data, recorder, recording.isRecording, recordMicrophoneDiagnostic],
+  );
+
+  useEffect(() => {
+    startListeningRef.current = startListeningTurn;
+  }, [startListeningTurn]);
+
+  const stopAndProcessRecording = useCallback(
+    async (
+      turn: number,
+      options: { discard?: boolean; retryListening?: boolean } = {},
+    ) => {
+      if (turn !== voiceTurnRef.current) return;
       const durationMs = recording.durationMillis;
       try {
         await recorder.stop();
-      } catch (reason) {
+      } catch {
         if (turn !== voiceTurnRef.current) return;
+        activeRecordingTurnRef.current = null;
         recordMicrophoneDiagnostic(microphoneFailure("stop"));
         setVoiceStatus("error");
         setError(microphoneErrorMessage("stop"));
         return;
       }
+      if (turn !== voiceTurnRef.current) return;
+      activeRecordingTurnRef.current = null;
       recordMicrophoneDiagnostic(microphoneSuccess("stop"));
+      const sessionId = handsFreeSessionRef.current;
+      if (options.discard) {
+        if (options.retryListening && handsFreeActiveRef.current) {
+          setRecordingNotice(
+            "I didn’t hear a usable response. Still listening…",
+          );
+          await startListeningRef.current(sessionId);
+        } else {
+          setVoiceStatus("ready");
+        }
+        return;
+      }
       const audioUri = recorder.uri;
       const capturedDurationMs = Math.max(
         durationMs,
@@ -651,7 +804,7 @@ function MobileApp() {
       }
       try {
         setVoiceStatus("processing");
-        setRecordingNotice("Thinking…");
+        setRecordingNotice("Processing your request…");
         const payload = await uploadMobileVoiceTurn({
           client,
           workspaceId: data.workspace.id,
@@ -670,40 +823,138 @@ function MobileApp() {
         setVoiceStatus("error");
         setError(errorMessage(reason));
       }
+    },
+    [
+      applyVoiceResult,
+      client,
+      data,
+      recorder,
+      recording.durationMillis,
+      recordCloudDiagnostic,
+      recordMicrophoneDiagnostic,
+    ],
+  );
+
+  useEffect(() => {
+    const turn = activeRecordingTurnRef.current;
+    if (
+      !handsFreeActive ||
+      turn === null ||
+      !recording.isRecording ||
+      (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
+    )
+      return;
+    const result = advanceVoiceActivity(
+      voiceActivityRef.current,
+      recording.durationMillis,
+      recording.metering,
+    );
+    voiceActivityRef.current = result.state;
+    if (result.action === "speech_started") {
+      setVoiceStatus("user_speaking");
+      setRecordingNotice("Hearing you…");
       return;
     }
-    let stage: MicrophoneStage = "permission";
-    try {
-      const permission = await requestRecordingPermissionsAsync();
-      if (!permission.granted) {
-        recordMicrophoneDiagnostic(microphoneFailure("permission"));
-        setVoiceStatus("error");
-        setError(microphoneErrorMessage("permission"));
-        return;
-      }
-      recordMicrophoneDiagnostic(microphoneSuccess("permission"));
-      stage = "audio_session";
-      await setAudioModeAsync({
-        allowsRecording: true,
-        playsInSilentMode: true,
-      });
-      recordMicrophoneDiagnostic(microphoneSuccess("audio_session"));
-      stage = "prepare";
-      await recorder.prepareToRecordAsync();
-      recordMicrophoneDiagnostic(microphoneSuccess("prepare"));
-      stage = "start";
-      voiceTurnRef.current += 1;
-      recorder.record();
-      if (!recorder.getStatus().isRecording)
-        throw new Error("Recorder did not enter recording state.");
-      recordMicrophoneDiagnostic(microphoneSuccess("start"));
-      setVoiceStatus("recording");
-      setRecordingNotice("Listening. Tap Stop when you are done.");
-    } catch (reason) {
-      recordMicrophoneDiagnostic(microphoneFailure(stage));
-      setError(microphoneErrorMessage(stage));
-      setVoiceStatus("error");
+    if (result.action === "meter_unavailable") {
+      autoFinalizeTurnRef.current = turn;
+      void stopAndProcessRecording(turn, { discard: true });
+      setError(
+        "Hands-free speech detection is unavailable here. Use Record one turn instead.",
+      );
+      return;
     }
+    if (
+      (result.action === "submit" || result.action === "retry_silence") &&
+      canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
+    ) {
+      autoFinalizeTurnRef.current = turn;
+      void stopAndProcessRecording(turn, {
+        discard: result.action === "retry_silence",
+        retryListening: result.action === "retry_silence",
+      });
+    }
+  }, [
+    handsFreeActive,
+    recording.durationMillis,
+    recording.isRecording,
+    recording.metering,
+    stopAndProcessRecording,
+    voiceStatus,
+  ]);
+
+  useEffect(() => {
+    if (!recording.mediaServicesDidReset) return;
+    activeRecordingTurnRef.current = null;
+    autoFinalizeTurnRef.current = null;
+    setVoiceStatus("error");
+    setError(
+      "The iPhone audio session was interrupted. Your reminder was not changed; resume or record one turn to continue.",
+    );
+  }, [recording.mediaServicesDidReset]);
+
+  useEffect(
+    () => () => {
+      handsFreeActiveRef.current = false;
+      voiceTurnRef.current += 1;
+      speechPlaybackRef.current += 1;
+      Speech.stop();
+      if (recorder.getStatus().isRecording) void recorder.stop();
+    },
+    [recorder],
+  );
+
+  const startHandsFreeConversation = async () => {
+    if (handsFreeActiveRef.current) return;
+    speechPlaybackRef.current += 1;
+    Speech.stop();
+    const sessionId = ++handsFreeSessionRef.current;
+    handsFreeActiveRef.current = true;
+    setHandsFreeActive(true);
+    setError("");
+    setPendingSave(null);
+    const next = startConversation(conversationRef.current);
+    conversationRef.current = next;
+    setConversation(next);
+    await startListeningTurn(sessionId);
+  };
+
+  const endHandsFreeConversation = async () => {
+    handsFreeActiveRef.current = false;
+    setHandsFreeActive(false);
+    handsFreeSessionRef.current += 1;
+    voiceTurnRef.current += 1;
+    autoFinalizeTurnRef.current = null;
+    speechPlaybackRef.current += 1;
+    Speech.stop();
+    if (recorder.getStatus().isRecording) {
+      try {
+        await recorder.stop();
+      } catch {
+        // The session is still ended even if iOS already interrupted capture.
+      }
+    }
+    activeRecordingTurnRef.current = null;
+    setVoiceStatus("ready");
+    setRecordingNotice("Conversation ended.");
+  };
+
+  const resumeHandsFreeConversation = async () => {
+    if (!handsFreeActiveRef.current) return;
+    setError("");
+    await startListeningTurn(handsFreeSessionRef.current);
+  };
+
+  const toggleRecording = async () => {
+    setError("");
+    if (recording.isRecording || activeRecordingTurnRef.current !== null) {
+      const turn = activeRecordingTurnRef.current ?? voiceTurnRef.current;
+      autoFinalizeTurnRef.current = turn;
+      await stopAndProcessRecording(turn);
+      return;
+    }
+    speechPlaybackRef.current += 1;
+    Speech.stop();
+    await startListeningTurn();
   };
 
   if (!client)
@@ -844,17 +1095,27 @@ function MobileApp() {
         )}
         {tab === "capture" && (
           <Capture
-            isRecording={recording.isRecording || voiceStatus === "recording"}
+            isRecording={recording.isRecording}
             seconds={Math.round(recording.durationMillis / 1000)}
             notice={recordingNotice}
             status={voiceStatus}
+            conversationActive={handsFreeActive}
+            assistantMuted={assistantMuted}
             transcript={transcript}
             reply={assistantReply}
             awaitingConfirmation={
               conversation.stage === "awaiting_confirmation"
             }
-            canRecord={voiceStatus === "ready" || voiceStatus === "error"}
+            canRecord={
+              voiceStatus === "ready" ||
+              voiceStatus === "error" ||
+              recording.isRecording
+            }
             onRecord={toggleRecording}
+            onStartConversation={() => void startHandsFreeConversation()}
+            onEndConversation={() => void endHandsFreeConversation()}
+            onResumeConversation={() => void resumeHandsFreeConversation()}
+            onToggleMute={() => setAssistantMuted((muted) => !muted)}
             onConfirm={() => void confirmByButton()}
             onRetrySave={() => void retryPendingSave()}
             hasPendingSave={Boolean(pendingSave)}
@@ -1226,11 +1487,17 @@ function Capture({
   seconds,
   notice,
   status,
+  conversationActive,
+  assistantMuted,
   transcript,
   reply,
   awaitingConfirmation,
   canRecord,
   onRecord,
+  onStartConversation,
+  onEndConversation,
+  onResumeConversation,
+  onToggleMute,
   onConfirm,
   onRetrySave,
   hasPendingSave,
@@ -1245,11 +1512,17 @@ function Capture({
   seconds: number;
   notice: string;
   status: string;
+  conversationActive: boolean;
+  assistantMuted: boolean;
   transcript: string;
   reply: string;
   awaitingConfirmation: boolean;
   canRecord: boolean;
   onRecord(): void;
+  onStartConversation(): void;
+  onEndConversation(): void;
+  onResumeConversation(): void;
+  onToggleMute(): void;
   onConfirm(): void;
   onRetrySave(): void;
   hasPendingSave: boolean;
@@ -1266,18 +1539,41 @@ function Capture({
       <Text style={styles.eyebrow}>VOICE CAPTURE</Text>
       <Text style={styles.title}>What’s on your mind?</Text>
       <Text style={styles.copy}>
-        {isRecording
-          ? `Listening · ${seconds}s`
-          : status === "processing" || status === "saving"
-            ? "Thinking…"
-            : status === "speaking"
-              ? "LeadLoop is speaking…"
-              : "Tap once to start. Tap again when you’re done."}
+        {status === "user_speaking"
+          ? `User speaking · ${seconds}s`
+          : status === "listening"
+            ? `Listening · ${seconds}s`
+            : status === "processing" || status === "saving"
+              ? "Processing…"
+              : status === "speaking"
+                ? "Assistant speaking…"
+                : status === "error"
+                  ? "Error"
+                  : conversationActive
+                    ? "Waiting for the next turn…"
+                    : "Start a conversation, or record one turn."}
       </Text>
+      {!conversationActive ? (
+        <PrimaryButton
+          label="Start conversation"
+          onPress={onStartConversation}
+          disabled={!canRecord || isRecording}
+        />
+      ) : (
+        <PrimaryButton label="End conversation" onPress={onEndConversation} />
+      )}
+      {conversationActive && status === "error" ? (
+        <PrimaryButton
+          label="Resume listening"
+          onPress={onResumeConversation}
+        />
+      ) : null}
       <Pressable
         accessibilityRole="button"
-        accessibilityLabel={isRecording ? "Stop recording" : "Start recording"}
-        disabled={!isRecording && !canRecord}
+        accessibilityLabel={
+          isRecording ? "Stop this recording" : "Record one turn"
+        }
+        disabled={!canRecord}
         style={[
           styles.mic,
           isRecording && styles.micActive,
@@ -1287,14 +1583,19 @@ function Capture({
       >
         <Text style={styles.micIcon}>{isRecording ? "■" : "●"}</Text>
         <Text style={styles.micText}>
-          {isRecording ? "Stop" : "Tap to talk"}
+          {isRecording ? "Stop this turn" : "Record one turn"}
+        </Text>
+      </Pressable>
+      <Pressable accessibilityRole="button" onPress={onToggleMute}>
+        <Text style={styles.link}>
+          {assistantMuted ? "Unmute assistant" : "Mute assistant"}
         </Text>
       </Pressable>
       <View style={styles.captureNote}>
         <Text style={styles.cardTitle}>Your control comes first</Text>
         <Text style={styles.meta}>
-          LeadLoop records only after this tap. It never listens in the
-          background.
+          Hands-free listening starts only after Start conversation and ends
+          when you choose End conversation. It never listens in the background.
         </Text>
       </View>
       {notice ? <Text style={styles.copy}>{notice}</Text> : null}
