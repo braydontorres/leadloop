@@ -9,6 +9,7 @@ import {
   voiceTimeoutError,
 } from "./voice-response";
 import { mobileVoiceAuthorizationHeaders } from "./voice-auth";
+import { currentMobileVoiceAccessToken } from "./voice-session";
 import { appendExpoAudioFile } from "./voice-upload";
 
 const config = mobileVoiceConfig(process.env);
@@ -28,11 +29,7 @@ export async function uploadMobileVoiceTurn(input: {
     throw new Error(
       "Voice processing is not configured. Add EXPO_PUBLIC_LEADLOOP_VOICE_API_URL, or use the typed reminder form.",
     );
-  const { data, error } = await input.client.auth.getSession();
-  if (error || !data.session?.access_token)
-    throw new Error(
-      "Your sign-in session has expired. Sign in again before recording.",
-    );
+  const accessToken = await currentMobileVoiceAccessToken(input.client);
   const body = new FormData();
   body.append("workspaceId", input.workspaceId);
   body.append("timeZone", input.timeZone);
@@ -47,7 +44,7 @@ export async function uploadMobileVoiceTurn(input: {
     // boundary itself. Do not set Content-Type manually.
     const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/voice`, {
       method: "POST",
-      headers: mobileVoiceAuthorizationHeaders(data.session.access_token),
+      headers: mobileVoiceAuthorizationHeaders(accessToken),
       body,
       signal: controller.signal,
     });

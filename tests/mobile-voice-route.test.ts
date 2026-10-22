@@ -72,6 +72,32 @@ test("mobile voice distinguishes a Supabase-rejected JWT from a missing header",
   );
 });
 
+test("mobile voice classifies a rejected Supabase project key without logging provider text", async () => {
+  const previousError = console.error;
+  const logs: string[] = [];
+  console.error = (...values: unknown[]) => logs.push(values.join(" "));
+  try {
+    await withSupabaseAuthResponse(
+      new Response(JSON.stringify({ message: "Invalid API key" }), {
+        status: 401,
+        headers: { "content-type": "application/json" },
+      }),
+      async () => {
+        const response = await POST(request({ Authorization: "Bearer token" }));
+        assert.equal(response.status, 401);
+        assert.equal(
+          (await response.json()).code,
+          "MOBILE_AUTH_PROJECT_KEY_REJECTED",
+        );
+      },
+    );
+  } finally {
+    console.error = previousError;
+  }
+  assert.match(logs.join("\n"), /project_key_rejected/);
+  assert.doesNotMatch(logs.join("\n"), /Invalid API key/);
+});
+
 test("mobile voice distinguishes a Supabase verification outage from rejected credentials", async () => {
   await withSupabaseAuthResponse(
     new TypeError("network unavailable"),

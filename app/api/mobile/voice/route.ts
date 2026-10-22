@@ -6,7 +6,10 @@ import {
   validateInterpretationInput,
 } from "../../../../lib/ai-server";
 import { supportedAudioFormat } from "../../../../lib/audio-format";
-import { authorizeMobileVoice } from "../../../../lib/mobile-voice-auth";
+import {
+  authorizeMobileVoice,
+  mobileVoiceAuthDiagnostic,
+} from "../../../../lib/mobile-voice-auth";
 import {
   limitRequest,
   releaseRequest,
@@ -110,6 +113,7 @@ export async function POST(request: Request) {
         requestId: known.requestId,
         rateLimitSource: known.status === 429 ? known.source : undefined,
         retryAfterSeconds: known.retryAfterSeconds,
+        authVerification: mobileVoiceAuthDiagnostic(known),
         totalMs: Math.round(performance.now() - startedAt),
       }),
     );
