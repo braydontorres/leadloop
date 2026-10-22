@@ -5,6 +5,8 @@ export type MobileTaskSection = {
   data: Task[];
 };
 
+export type MobileTaskFilter = "Upcoming" | "Overdue" | "Completed" | "All";
+
 export function localIsoDate(value: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -15,6 +17,18 @@ export function localIsoDate(value: Date, timeZone: string) {
   const part = (type: string) =>
     parts.find((entry) => entry.type === type)?.value;
   return `${part("year")}-${part("month")}-${part("day")}`;
+}
+
+export function localTimeInput(value: Date, timeZone: string) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(value);
+  const part = (type: string) =>
+    parts.find((entry) => entry.type === type)?.value;
+  return `${part("hour")}:${part("minute")}`;
 }
 
 function taskDate(task: Task, timeZone: string) {
@@ -28,6 +42,41 @@ function byDue(left: Task, right: Task) {
     ? Date.parse(right.due)
     : Number.POSITIVE_INFINITY;
   return leftTime - rightTime || left.title.localeCompare(right.title);
+}
+
+/**
+ * The Tasks screen and its tests share one timezone-aware definition of a
+ * reminder's status. An unscheduled open task stays visible in Upcoming so it
+ * cannot disappear just because it needs a date.
+ */
+export function filterMobileTasks(
+  tasks: Task[],
+  timeZone: string,
+  filter: MobileTaskFilter,
+  search: string,
+  now = new Date(),
+) {
+  const today = localIsoDate(now, timeZone);
+  const query = search.trim().toLowerCase();
+  return tasks
+    .filter((task) => {
+      const date = taskDate(task, timeZone);
+      const matchesFilter =
+        filter === "All" ||
+        (filter === "Completed" && task.completed === true) ||
+        (filter === "Upcoming" &&
+          task.completed !== true &&
+          (!date || date >= today)) ||
+        (filter === "Overdue" &&
+          task.completed !== true &&
+          date !== null &&
+          date < today);
+      return (
+        matchesFilter &&
+        (!query || `${task.title} ${task.person}`.toLowerCase().includes(query))
+      );
+    })
+    .sort(byDue);
 }
 
 /**

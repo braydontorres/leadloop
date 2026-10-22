@@ -38,6 +38,7 @@ import {
 import { supabase } from "./src/supabase";
 import {
   createMobileTask,
+  deleteMobileTask,
   listMobileWorkspaces,
   loadMobileWorkspace,
   setMobileTaskCompleted,
@@ -50,7 +51,13 @@ import {
   saveMobileWorkspace,
 } from "./src/workspace-preference";
 import { errorMessage, taskDateTimeLabel } from "./src/format";
-import { localIsoDate, mobileTaskSections } from "./src/task-list";
+import {
+  filterMobileTasks,
+  localIsoDate,
+  localTimeInput,
+  type MobileTaskFilter,
+  mobileTaskSections,
+} from "./src/task-list";
 import { uploadMobileVoiceTurn } from "./src/voice-api";
 import { linkVoiceTask } from "./src/voice-task-link";
 import {
@@ -67,7 +74,7 @@ import {
   type MicrophoneStage,
 } from "./src/microphone-diagnostics";
 
-type Tab = "today" | "capture" | "people";
+type Tab = "home" | "capture" | "tasks" | "people" | "settings";
 const COLORS = {
   ink: "#1B2A23",
   muted: "#64726B",
@@ -83,7 +90,7 @@ const COLORS = {
 function MobileApp() {
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
   const recording = useAudioRecorderState(recorder);
-  const [tab, setTab] = useState<Tab>("today");
+  const [tab, setTab] = useState<Tab>("home");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -95,6 +102,9 @@ function MobileApp() {
   const [data, setData] = useState<MobileWorkspaceData | null>(null);
   const [showWorkspacePicker, setShowWorkspacePicker] = useState(false);
   const [showNewReminder, setShowNewReminder] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [taskFilter, setTaskFilter] = useState<MobileTaskFilter>("Upcoming");
+  const [taskSearch, setTaskSearch] = useState("");
   const [title, setTitle] = useState("");
   const [date, setDate] = useState("");
   const [time, setTime] = useState("");
@@ -352,6 +362,50 @@ function MobileApp() {
     }
   };
 
+  const openTaskEditor = (task?: Task) => {
+    setEditingTask(task ?? null);
+    setTitle(task?.title ?? "");
+    setSelectedPerson(
+      task?.personId
+        ? (data?.people.find((person) => person.id === task.personId) ?? null)
+        : null,
+    );
+    if (task?.due) {
+      const due = new Date(task.due);
+      setDate(localIsoDate(due, timezone));
+      setTime(localTimeInput(due, timezone));
+    } else {
+      setDate(localIsoDate(new Date(), timezone));
+      setTime("09:00");
+    }
+    setShowNewReminder(true);
+  };
+
+  const deleteTask = async () => {
+    if (!client || !data || !editingTask) return;
+    setBusy(true);
+    setError("");
+    try {
+      await deleteMobileTask(client, data.workspace.id, editingTask.id);
+      workspaceDataRevisionRef.current += 1;
+      setData((current) =>
+        current
+          ? {
+              ...current,
+              tasks: current.tasks.filter((task) => task.id !== editingTask.id),
+            }
+          : current,
+      );
+      setShowNewReminder(false);
+      setEditingTask(null);
+      setNotice("Reminder removed from your cloud workspace.");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const saveReminder = async () => {
     if (!client || !data) return;
     if (!title.trim()) {
@@ -368,13 +422,13 @@ function MobileApp() {
       return;
     }
     const task: Task = {
-      id: Crypto.randomUUID(),
+      id: editingTask?.id ?? Crypto.randomUUID(),
       title: title.trim(),
-      person: selectedPerson?.name ?? "",
+      person: selectedPerson?.name ?? editingTask?.person ?? "",
       ...(selectedPerson ? { personId: selectedPerson.id } : {}),
       due,
-      completed: false,
-      notes: "",
+      completed: editingTask?.completed ?? false,
+      notes: editingTask?.notes ?? "",
     };
     setBusy(true);
     setError("");
@@ -385,15 +439,25 @@ function MobileApp() {
       });
       workspaceDataRevisionRef.current += 1;
       setData((current) =>
-        current ? { ...current, tasks: [...current.tasks, task] } : current,
+        current
+          ? {
+              ...current,
+              tasks: current.tasks.some((entry) => entry.id === task.id)
+                ? current.tasks.map((entry) =>
+                    entry.id === task.id ? task : entry,
+                  )
+                : [...current.tasks, task],
+            }
+          : current,
       );
       setShowNewReminder(false);
+      setEditingTask(null);
       setTitle("");
       setDate("");
       setTime("");
       setSelectedPerson(null);
       setNotice("Reminder saved to your cloud workspace.");
-      setTab("today");
+      setTab("tasks");
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -729,13 +793,28 @@ function MobileApp() {
             <Text style={styles.link}>Switch</Text>
           </Pressable>
         </View>
-        {tab === "today" && (
+        {tab === "home" && (
           <Today
             sections={taskSections}
             timezone={timezone}
             busy={busy}
             onToggle={toggleCompleted}
             onRefresh={reloadWorkspace}
+          />
+        )}
+        {tab === "tasks" && (
+          <Tasks
+            tasks={data.tasks}
+            timezone={timezone}
+            busy={busy}
+            filter={taskFilter}
+            search={taskSearch}
+            onFilter={setTaskFilter}
+            onSearch={setTaskSearch}
+            onToggle={toggleCompleted}
+            onEdit={openTaskEditor}
+            onRefresh={reloadWorkspace}
+            onNew={() => openTaskEditor()}
           />
         )}
         {tab === "capture" && (
@@ -760,9 +839,7 @@ function MobileApp() {
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
-              setDate(localIsoDate(new Date(), timezone));
-              setTime("09:00");
-              setShowNewReminder(true);
+              openTaskEditor();
             }}
           />
         )}
@@ -774,13 +851,21 @@ function MobileApp() {
             onRefresh={reloadWorkspace}
           />
         )}
+        {tab === "settings" && (
+          <SettingsScreen
+            workspace={data.workspace}
+            timezone={timezone}
+            onSwitch={() => setShowWorkspacePicker(true)}
+            onSignOut={() => void signOut()}
+          />
+        )}
         <Message error={error} notice={notice} />
         <View style={styles.tabbar}>
           <TabButton
-            label="Today"
+            label="Home"
             icon="✓"
-            active={tab === "today"}
-            onPress={() => setTab("today")}
+            active={tab === "home"}
+            onPress={() => setTab("home")}
           />
           <TabButton
             label="Capture"
@@ -789,10 +874,22 @@ function MobileApp() {
             onPress={() => setTab("capture")}
           />
           <TabButton
+            label="Tasks"
+            icon="☑"
+            active={tab === "tasks"}
+            onPress={() => setTab("tasks")}
+          />
+          <TabButton
             label="People"
             icon="◎"
             active={tab === "people"}
             onPress={() => setTab("people")}
+          />
+          <TabButton
+            label="Settings"
+            icon="⚙"
+            active={tab === "settings"}
+            onPress={() => setTab("settings")}
           />
         </View>
         <Modal
@@ -807,7 +904,9 @@ function MobileApp() {
               keyboardShouldPersistTaps="handled"
             >
               <View style={styles.modalHeader}>
-                <Text style={styles.title}>New reminder</Text>
+                <Text style={styles.title}>
+                  {editingTask ? "Edit reminder" : "New reminder"}
+                </Text>
                 <Pressable onPress={() => setShowNewReminder(false)}>
                   <Text style={styles.link}>Close</Text>
                 </Pressable>
@@ -872,6 +971,11 @@ function MobileApp() {
                 onPress={saveReminder}
                 disabled={busy}
               />
+              {editingTask ? (
+                <Pressable onPress={() => void deleteTask()} disabled={busy}>
+                  <Text style={styles.deleteLink}>Delete reminder</Text>
+                </Pressable>
+              ) : null}
               <Message error={error} notice="" />
             </ScrollView>
           </SafeAreaView>
@@ -946,6 +1050,139 @@ function Today({
         </View>
       )}
     />
+  );
+}
+
+function Tasks({
+  tasks,
+  timezone,
+  busy,
+  filter,
+  search,
+  onFilter,
+  onSearch,
+  onToggle,
+  onEdit,
+  onRefresh,
+  onNew,
+}: {
+  tasks: Task[];
+  timezone: string;
+  busy: boolean;
+  filter: MobileTaskFilter;
+  search: string;
+  onFilter(value: MobileTaskFilter): void;
+  onSearch(value: string): void;
+  onToggle(task: Task): void;
+  onEdit(task: Task): void;
+  onRefresh(): void;
+  onNew(): void;
+}) {
+  const shown = filterMobileTasks(tasks, timezone, filter, search);
+  return (
+    <FlatList
+      data={shown}
+      keyExtractor={(task) => task.id}
+      refreshControl={
+        <RefreshControl
+          refreshing={busy}
+          onRefresh={onRefresh}
+          tintColor={COLORS.green}
+        />
+      }
+      contentContainerStyle={styles.list}
+      ListHeaderComponent={
+        <>
+          <Text style={styles.eyebrow}>A LITTLE MORE ORGANIZED</Text>
+          <Text style={styles.title}>Your tasks.</Text>
+          <TextInput
+            value={search}
+            onChangeText={onSearch}
+            placeholder="Search tasks"
+            placeholderTextColor={COLORS.muted}
+            style={styles.input}
+          />
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            style={styles.chips}
+          >
+            {(["Upcoming", "Overdue", "Completed", "All"] as const).map(
+              (item) => (
+                <Pressable
+                  key={item}
+                  onPress={() => onFilter(item)}
+                  style={[styles.chip, filter === item && styles.chipActive]}
+                >
+                  <Text style={styles.chipText}>{item}</Text>
+                </Pressable>
+              ),
+            )}
+          </ScrollView>
+          <PrimaryButton label="Add reminder" onPress={onNew} />
+        </>
+      }
+      ListEmptyComponent={
+        <View style={styles.empty}>
+          <Text style={styles.cardTitle}>All clear here.</Text>
+          <Text style={styles.meta}>No tasks match this view.</Text>
+        </View>
+      }
+      renderItem={({ item }) => (
+        <Pressable style={styles.taskCard} onPress={() => onEdit(item)}>
+          <Pressable
+            accessibilityRole="checkbox"
+            accessibilityState={{ checked: item.completed }}
+            style={styles.check}
+            onPress={() => void onToggle(item)}
+          >
+            <Text>{item.completed ? "✓" : ""}</Text>
+          </Pressable>
+          <View style={styles.taskBody}>
+            <Text
+              style={[
+                styles.cardTitle,
+                item.completed && styles.completedTitle,
+              ]}
+            >
+              {item.title}
+            </Text>
+            <Text style={styles.meta}>
+              {taskDateTimeLabel(item.due, timezone)}
+              {item.person ? ` · ${item.person}` : ""}
+            </Text>
+          </View>
+        </Pressable>
+      )}
+    />
+  );
+}
+
+function SettingsScreen({
+  workspace,
+  timezone,
+  onSwitch,
+  onSignOut,
+}: {
+  workspace: MobileWorkspace;
+  timezone: string;
+  onSwitch(): void;
+  onSignOut(): void;
+}) {
+  return (
+    <ScrollView contentContainerStyle={styles.list}>
+      <Text style={styles.eyebrow}>YOUR WORKSPACE</Text>
+      <Text style={styles.title}>Settings.</Text>
+      <View style={styles.personCard}>
+        <Text style={styles.cardTitle}>{workspace.businessName}</Text>
+        <Text style={styles.meta}>Time zone · {timezone}</Text>
+        <Text style={styles.meta}>Cloud-synced workspace</Text>
+      </View>
+      <PrimaryButton label="Switch workspace" onPress={onSwitch} />
+      <Pressable onPress={onSignOut}>
+        <Text style={styles.deleteLink}>Sign out</Text>
+      </Pressable>
+    </ScrollView>
   );
 }
 function Capture({
@@ -1282,6 +1519,13 @@ const styles = StyleSheet.create({
   disabled: { opacity: 0.55 },
   primaryText: { color: "#FFFFFF", fontSize: 16, fontWeight: "800" },
   link: { color: COLORS.green, fontSize: 16, fontWeight: "700", padding: 8 },
+  deleteLink: {
+    color: COLORS.danger,
+    fontSize: 16,
+    fontWeight: "700",
+    padding: 12,
+    textAlign: "center",
+  },
   error: {
     color: COLORS.danger,
     backgroundColor: "#F8E5E2",
@@ -1335,6 +1579,7 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   taskBody: { flex: 1, gap: 4 },
+  completedTitle: { color: COLORS.muted, textDecorationLine: "line-through" },
   cardTitle: {
     color: COLORS.ink,
     fontSize: 16,

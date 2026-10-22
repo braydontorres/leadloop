@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mobileTaskSections } from "../src/task-list";
+import {
+  filterMobileTasks,
+  localTimeInput,
+  mobileTaskSections,
+} from "../src/task-list";
 import { loadMobileWorkspace, type MobileWorkspace } from "../src/repository";
 
 const workspace: MobileWorkspace = {
@@ -98,5 +102,73 @@ test("a string false from an older payload cannot hide an open cloud reminder", 
   assert.deepEqual(
     sections[0]?.data.map((task) => task.id),
     ["legacy-open-task"],
+  );
+});
+
+test("task filters remain timezone-aware, searchable, and put unscheduled work in Upcoming", () => {
+  const tasks = [
+    {
+      id: "tomorrow-mike",
+      title: "Call Mike",
+      person: "Mike",
+      due: "2026-10-23T20:00:00.000Z",
+      completed: false,
+      notes: "",
+    },
+    {
+      id: "overdue-supply",
+      title: "Order supplies",
+      person: "",
+      due: "2026-10-21T20:00:00.000Z",
+      completed: false,
+      notes: "",
+    },
+    {
+      id: "unscheduled",
+      title: "Plan next week",
+      person: "",
+      due: "",
+      completed: false,
+      notes: "",
+    },
+    {
+      id: "done",
+      title: "Call Mike again",
+      person: "Mike",
+      due: "2026-10-20T20:00:00.000Z",
+      completed: true,
+      notes: "",
+    },
+  ];
+  const now = new Date("2026-10-22T17:00:00.000Z");
+  const upcoming = filterMobileTasks(
+    tasks,
+    "America/Chicago",
+    "Upcoming",
+    "",
+    now,
+  );
+  assert.deepEqual(
+    upcoming.map((task) => task.id),
+    ["tomorrow-mike", "unscheduled"],
+  );
+  assert.deepEqual(
+    filterMobileTasks(tasks, "America/Chicago", "Overdue", "supplies", now).map(
+      (task) => task.id,
+    ),
+    ["overdue-supply"],
+  );
+  assert.deepEqual(
+    filterMobileTasks(tasks, "America/Chicago", "Completed", "mike", now).map(
+      (task) => task.id,
+    ),
+    ["done"],
+  );
+});
+
+test("editing a cloud instant keeps its America/Chicago wall-clock time", () => {
+  assert.equal(
+    localTimeInput(new Date("2026-10-23T20:00:00.000Z"), "America/Chicago"),
+    "15:00",
   );
 });

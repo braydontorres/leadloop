@@ -185,7 +185,7 @@ export async function createMobileTask(
       person_id: input.personId ?? null,
       quote_id: input.quoteId ?? null,
       due: input.due || null,
-      completed: false,
+      completed: input.completed,
       notes: input.notes,
     },
     { onConflict: "workspace_id,id" },
@@ -205,4 +205,17 @@ export async function setMobileTaskCompleted(
     .eq("workspace_id", workspaceId)
     .eq("id", taskId);
   fail("task_complete", error);
+}
+
+export async function deleteMobileTask(
+  client: SupabaseClient,
+  workspaceId: string,
+  taskId: string,
+) {
+  const { error } = await client
+    .from("tasks")
+    .delete()
+    .eq("workspace_id", workspaceId)
+    .eq("id", taskId);
+  fail("task_delete", error);
 }
