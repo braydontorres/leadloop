@@ -1,12 +1,25 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mobileVoiceAuthorizationHeaders } from "../src/voice-auth";
+import {
+  mobileVoiceAuthorizationHeaders,
+  mobileVoiceJsonHeaders,
+} from "../src/voice-auth";
 import { cloudDiagnostic } from "../src/cloud-diagnostics";
 import { voiceHttpError } from "../src/voice-response";
 
 test("voice uploads build a Fetch-standard Authorization header", () => {
   const headers = mobileVoiceAuthorizationHeaders("session-token");
   assert.equal(headers.get("authorization"), "Bearer session-token");
+});
+
+test("natural voice JSON posts retain Authorization and Content-Type in Fetch", () => {
+  const request = new Request("https://leadloop.example/api/mobile/speech", {
+    method: "POST",
+    headers: mobileVoiceJsonHeaders("session-token"),
+    body: JSON.stringify({ voice: "onyx" }),
+  });
+  assert.equal(request.headers.get("authorization"), "Bearer session-token");
+  assert.equal(request.headers.get("content-type"), "application/json");
 });
 
 test("voice authentication diagnostics retain only the safe server category", () => {

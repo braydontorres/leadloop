@@ -5,7 +5,14 @@ export type NaturalSpeechSelection = {
   speed: AssistantSpeed;
 };
 
-export type NaturalSpeechRequestStage = "request" | "response" | "cache";
+export type NaturalSpeechRequestStage =
+  | "configuration"
+  | "session"
+  | "request"
+  | "transport"
+  | "response"
+  | "download"
+  | "cache";
 
 /** Converts a client-safe API failure into UI-safe diagnostic metadata. */
 export function naturalSpeechFailureDetails(error: unknown): {
@@ -16,9 +23,19 @@ export function naturalSpeechFailureDetails(error: unknown): {
     error &&
     typeof error === "object" &&
     (error as { name?: unknown }).name === "NaturalSpeechApiError" &&
-    ((error as { stage?: unknown }).stage === "request" ||
-      (error as { stage?: unknown }).stage === "response" ||
-      (error as { stage?: unknown }).stage === "cache")
+    (
+      [
+        "configuration",
+        "session",
+        "request",
+        "transport",
+        "response",
+        "download",
+        "cache",
+      ] as const
+    ).includes(
+      (error as { stage?: unknown }).stage as NaturalSpeechRequestStage,
+    )
   ) {
     const failure = error as {
       stage: NaturalSpeechRequestStage;

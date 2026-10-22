@@ -6,3 +6,14 @@
 export function mobileVoiceAuthorizationHeaders(accessToken: string) {
   return new Headers({ Authorization: `Bearer ${accessToken}` });
 }
+
+/**
+ * `Headers` is deliberately kept as a Headers instance. Object-spreading one
+ * on React Native can omit its internal Authorization entries before Expo
+ * fetch serializes the request.
+ */
+export function mobileVoiceJsonHeaders(accessToken: string) {
+  const headers = mobileVoiceAuthorizationHeaders(accessToken);
+  headers.set("Content-Type", "application/json");
+  return headers;
+}

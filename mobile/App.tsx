@@ -166,8 +166,12 @@ type HandsFreeLoopDiagnostics = {
 type NaturalSpeechDiagnostic = {
   source: "natural" | "device";
   stage:
+    | "configuration"
+    | "session"
     | "request"
+    | "transport"
     | "response"
+    | "download"
     | "cache"
     | "audio_session"
     | "playback"

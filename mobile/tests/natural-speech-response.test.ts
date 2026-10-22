@@ -78,3 +78,21 @@ test("failed Natural AI requests identify a safe failure stage before device fal
     code: "SPEECH_PLAYBACK_FAILED",
   });
 });
+
+test("natural voice diagnostics distinguish session, transport, download, and response failures", () => {
+  for (const stage of [
+    "session",
+    "transport",
+    "download",
+    "response",
+  ] as const) {
+    assert.deepEqual(
+      naturalSpeechFailureDetails({
+        name: "NaturalSpeechApiError",
+        stage,
+        code: `SPEECH_${stage.toUpperCase()}_FAILED`,
+      }),
+      { stage, code: `SPEECH_${stage.toUpperCase()}_FAILED` },
+    );
+  }
+});

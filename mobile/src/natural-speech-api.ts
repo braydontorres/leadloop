@@ -6,12 +6,14 @@ import {
   naturalSpeechResponseMatchesSelection,
   type NaturalSpeechRequestStage,
 } from "./natural-speech-response";
-import { mobileVoiceAuthorizationHeaders } from "./voice-auth";
+import { mobileVoiceJsonHeaders } from "./voice-auth";
 import { mobileVoiceConfig } from "./config";
-import { currentMobileVoiceAccessToken } from "./voice-session";
+import {
+  currentMobileVoiceAccessToken,
+  MobileVoiceSessionError,
+} from "./voice-session";
 import { MobileVoiceApiError } from "./voice-response";
 
-const config = mobileVoiceConfig(process.env);
 const REQUEST_TIMEOUT_MS = 25_000;
 const MAX_AUDIO_BYTES = 2 * 1024 * 1024;
 
@@ -34,6 +36,18 @@ export type NaturalSpeechResponse = {
   voice: AssistantVoiceId;
   speed: AssistantSpeed;
 };
+
+function naturalSpeechConfig() {
+  try {
+    return mobileVoiceConfig(process.env);
+  } catch {
+    throw speechError(
+      "Natural voices need a valid secure LeadLoop API address. Device speech is still available.",
+      "SPEECH_API_URL_INVALID",
+      "configuration",
+    );
+  }
+}
 
 /**
  * The server marks successful generated audio with its selected, non-secret
@@ -60,28 +74,38 @@ export async function requestNaturalSpeech(input: {
   voice: AssistantVoiceId;
   speed: AssistantSpeed;
 }): Promise<NaturalSpeechResponse> {
+  const config = naturalSpeechConfig();
   if (!config)
     throw speechError(
       "Natural voices need the secure LeadLoop API address. Device speech is still available.",
       "SPEECH_NOT_CONFIGURED",
-      "request",
+      "configuration",
     );
-  const accessToken = await currentMobileVoiceAccessToken(input.client);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/speech`, {
-      method: "POST",
-      headers: {
-        ...mobileVoiceAuthorizationHeaders(accessToken),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
+    const accessToken = await currentMobileVoiceAccessToken(input.client);
+    let headers: Headers;
+    let body: string;
+    try {
+      headers = mobileVoiceJsonHeaders(accessToken);
+      body = JSON.stringify({
         workspaceId: input.workspaceId,
         text: input.text,
         voice: input.voice,
         speed: input.speed,
-      }),
+      });
+    } catch {
+      throw speechError(
+        "LeadLoop could not prepare the natural voice request. Device speech is still available.",
+        "SPEECH_REQUEST_CREATE_FAILED",
+        "request",
+      );
+    }
+    const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/speech`, {
+      method: "POST",
+      headers,
+      body,
       signal: controller.signal,
     });
     if (!response.ok) {
@@ -108,7 +132,16 @@ export async function requestNaturalSpeech(input: {
         "SPEECH_RESPONSE_MISMATCH",
         "response",
       );
-    const bytes = new Uint8Array(await response.arrayBuffer());
+    let bytes: Uint8Array;
+    try {
+      bytes = new Uint8Array(await response.arrayBuffer());
+    } catch {
+      throw speechError(
+        "LeadLoop could not download the natural voice audio. Device speech is still available.",
+        "SPEECH_DOWNLOAD_FAILED",
+        "download",
+      );
+    }
     if (!bytes.byteLength || bytes.byteLength > MAX_AUDIO_BYTES)
       throw speechError(
         "LeadLoop received an unusable natural voice response. Device speech is still available.",
@@ -137,15 +170,23 @@ export async function requestNaturalSpeech(input: {
     }
   } catch (error) {
     if (error instanceof MobileVoiceApiError) throw error;
+    if (error instanceof MobileVoiceSessionError)
+      throw speechError(error.message, error.code, "session");
     if ((error as { name?: unknown })?.name === "AbortError")
       throw speechError(
         "Natural voice playback timed out. Device speech is still available.",
         "SPEECH_TIMEOUT",
-        "request",
+        "transport",
+      );
+    if (error instanceof TypeError)
+      throw speechError(
+        "LeadLoop could not reach the natural voice service. Device speech is still available.",
+        "SPEECH_NETWORK_ERROR",
+        "transport",
       );
     throw speechError(
-      "LeadLoop could not reach natural voice playback. Device speech is still available.",
-      "SPEECH_NETWORK_ERROR",
+      "LeadLoop could not create the natural voice request. Device speech is still available.",
+      "SPEECH_REQUEST_FAILED",
       "request",
     );
   } finally {
