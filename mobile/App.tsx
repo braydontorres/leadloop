@@ -19,6 +19,7 @@ import {
   RefreshControl,
   SafeAreaView,
   ScrollView,
+  SectionList,
   StyleSheet,
   Text,
   TextInput,
@@ -49,6 +50,7 @@ import {
   saveMobileWorkspace,
 } from "./src/workspace-preference";
 import { errorMessage, taskDateTimeLabel } from "./src/format";
+import { localIsoDate, mobileTaskSections } from "./src/task-list";
 import { uploadMobileVoiceTurn } from "./src/voice-api";
 import { linkVoiceTask } from "./src/voice-task-link";
 import {
@@ -77,18 +79,6 @@ const COLORS = {
   line: "#E5E4DA",
   danger: "#A63C32",
 };
-
-function isoDateToday(timeZone: string) {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
-  const part = (type: string) =>
-    parts.find((entry) => entry.type === type)?.value;
-  return `${part("year")}-${part("month")}-${part("day")}`;
-}
 
 function MobileApp() {
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
@@ -126,6 +116,7 @@ function MobileApp() {
   } | null>(null);
   const voiceTurnRef = useRef(0);
   const workspaceRequestRef = useRef(0);
+  const workspaceDataRevisionRef = useRef(0);
   const restoreRequestRef = useRef(0);
   const [cloudDiagnostics, setCloudDiagnostics] = useState<CloudDiagnostic[]>(
     [],
@@ -154,26 +145,31 @@ function MobileApp() {
 
   const client = supabase;
   const timezone = data?.timezone ?? "America/Chicago";
-  const openTasks = useMemo(
-    () => (data?.tasks ?? []).filter((task) => !task.completed),
-    [data?.tasks],
+  const taskSections = useMemo(
+    () => mobileTaskSections(data?.tasks ?? [], timezone),
+    [data?.tasks, timezone],
   );
-  const todayTasks = useMemo(() => {
-    const today = isoDateToday(timezone);
-    return openTasks.filter((task) => task.due.startsWith(today));
-  }, [openTasks, timezone]);
 
   const chooseWorkspace = useCallback(
     async (workspace: MobileWorkspace, userId: string) => {
       if (!client || !userId) return;
       const requestId = ++workspaceRequestRef.current;
+      const dataRevision = workspaceDataRevisionRef.current;
       setBusy(true);
       setError("");
       try {
         const next = await loadMobileWorkspace(client, workspace);
-        if (requestId !== workspaceRequestRef.current) return;
+        if (
+          requestId !== workspaceRequestRef.current ||
+          dataRevision !== workspaceDataRevisionRef.current
+        )
+          return;
         await saveMobileWorkspace(userId, workspace.id);
-        if (requestId !== workspaceRequestRef.current) return;
+        if (
+          requestId !== workspaceRequestRef.current ||
+          dataRevision !== workspaceDataRevisionRef.current
+        )
+          return;
         setData(next);
         setShowWorkspacePicker(false);
         setError("");
@@ -336,6 +332,7 @@ function MobileApp() {
         task.id,
         !task.completed,
       );
+      workspaceDataRevisionRef.current += 1;
       setData((current) =>
         current
           ? {
@@ -386,6 +383,7 @@ function MobileApp() {
         ...task,
         workspaceId: data.workspace.id,
       });
+      workspaceDataRevisionRef.current += 1;
       setData((current) =>
         current ? { ...current, tasks: [...current.tasks, task] } : current,
       );
@@ -449,6 +447,7 @@ function MobileApp() {
           ...linked,
           workspaceId: data.workspace.id,
         });
+        workspaceDataRevisionRef.current += 1;
         setData((current) =>
           current
             ? {
@@ -717,7 +716,6 @@ function MobileApp() {
       </SafeAreaView>
     );
 
-  const activeTasks = openTasks;
   return (
     <SafeAreaProvider>
       <SafeAreaView style={styles.safe}>
@@ -733,7 +731,7 @@ function MobileApp() {
         </View>
         {tab === "today" && (
           <Today
-            tasks={todayTasks.length ? todayTasks : activeTasks}
+            sections={taskSections}
             timezone={timezone}
             busy={busy}
             onToggle={toggleCompleted}
@@ -762,7 +760,7 @@ function MobileApp() {
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
-              setDate(isoDateToday(timezone));
+              setDate(localIsoDate(new Date(), timezone));
               setTime("09:00");
               setShowNewReminder(true);
             }}
@@ -884,21 +882,21 @@ function MobileApp() {
 }
 
 function Today({
-  tasks,
+  sections,
   timezone,
   busy,
   onToggle,
   onRefresh,
 }: {
-  tasks: Task[];
+  sections: ReturnType<typeof mobileTaskSections>;
   timezone: string;
   busy: boolean;
   onToggle(task: Task): void;
   onRefresh(): void;
 }) {
   return (
-    <FlatList
-      data={tasks}
+    <SectionList
+      sections={sections}
       keyExtractor={(task) => task.id}
       refreshControl={
         <RefreshControl
@@ -912,7 +910,7 @@ function Today({
         <>
           <Text style={styles.eyebrow}>YOUR DAY</Text>
           <Text style={styles.title}>
-            {tasks.length ? "Here’s what’s next." : "Your day is clear."}
+            {sections.length ? "Here’s what’s next." : "Your day is clear."}
           </Text>
           <Text style={styles.copy}>
             Cloud-synced reminders, in your selected workspace.
@@ -925,6 +923,9 @@ function Today({
           <Text style={styles.meta}>Capture one when something comes up.</Text>
         </View>
       }
+      renderSectionHeader={({ section }) => (
+        <Text style={styles.sectionHeading}>{section.title}</Text>
+      )}
       renderItem={({ item }) => (
         <View style={styles.taskCard}>
           <Pressable
@@ -1042,7 +1043,7 @@ function Capture({
       {hasPendingSave ? (
         <PrimaryButton label="Retry cloud save" onPress={onRetrySave} />
       ) : null}
-      <PrimaryButton label="Retry cloud connection" onPress={onRetryCloud} />
+      <PrimaryButton label="Refresh cloud reminders" onPress={onRetryCloud} />
       <PrimaryButton label="Create a typed reminder" onPress={onNewReminder} />
       {showDiagnostics ? (
         <View style={styles.diagnostics}>
@@ -1309,6 +1310,13 @@ const styles = StyleSheet.create({
   },
   chevron: { fontSize: 30, color: COLORS.green },
   list: { padding: 24, gap: 12, paddingBottom: 100 },
+  sectionHeading: {
+    color: COLORS.green,
+    fontSize: 12,
+    fontWeight: "800",
+    letterSpacing: 1.2,
+    marginTop: 10,
+  },
   taskCard: {
     padding: 16,
     borderRadius: 17,

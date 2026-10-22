@@ -60,7 +60,10 @@ function taskFrom(row: any): Task {
     ...(row.person_id ? { personId: row.person_id } : {}),
     ...(row.quote_id ? { quoteId: row.quote_id } : {}),
     due: row.due ?? "",
-    completed: Boolean(row.completed),
+    // PostgreSQL returns a boolean here. Do not use Boolean("false"), which
+    // would incorrectly hide an open reminder if a legacy transport encoded
+    // it as a string.
+    completed: row.completed === true,
     notes: row.notes ?? "",
   };
 }
