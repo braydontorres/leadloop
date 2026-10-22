@@ -78,12 +78,19 @@ import {
 import {
   advanceVoiceActivity,
   newVoiceActivity,
+  voiceActivityThreshold,
   type VoiceActivityState,
 } from "./src/hands-free-vad";
 import {
   canFinalizeHandsFreeTurn,
   canResumeHandsFreeListening,
 } from "./src/hands-free-session";
+import {
+  initialHandsFreeRecorderStatus,
+  recorderStatusSnapshot,
+  recorderStoppedUnexpectedly,
+  type HandsFreeRecorderStatus,
+} from "./src/hands-free-recorder-status";
 import {
   timeInputFromPicker,
   timePickerLabel,
@@ -108,6 +115,7 @@ const HANDS_FREE_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
   isMeteringEnabled: true,
 };
+const HANDS_FREE_STATUS_INTERVAL_MS = 100;
 const COLORS = {
   ink: "#1B2A23",
   muted: "#64726B",
@@ -149,6 +157,11 @@ function MobileApp() {
   const conversationRef = useRef(conversation);
   const [voiceStatus, setVoiceStatus] = useState<VoiceStatus>("ready");
   const [handsFreeActive, setHandsFreeActive] = useState(false);
+  const [handsFreeRecorderStatus, setHandsFreeRecorderStatus] =
+    useState<HandsFreeRecorderStatus>(initialHandsFreeRecorderStatus);
+  const handsFreeRecorderStatusRef = useRef<HandsFreeRecorderStatus>(
+    initialHandsFreeRecorderStatus,
+  );
   const [assistantMuted, setAssistantMuted] = useState(false);
   const assistantMutedRef = useRef(false);
   const [transcript, setTranscript] = useState("");
@@ -730,8 +743,15 @@ function MobileApp() {
         autoFinalizeTurnRef.current = null;
         voiceActivityRef.current = newVoiceActivity();
         recorder.record();
-        if (!recorder.getStatus().isRecording)
+        const recorderStatus = recorder.getStatus();
+        if (!recorderStatus.isRecording)
           throw new Error("Recorder did not enter recording state.");
+        const initialStatus = recorderStatusSnapshot(
+          recorderStatus,
+          Date.now(),
+        );
+        handsFreeRecorderStatusRef.current = initialStatus;
+        setHandsFreeRecorderStatus(initialStatus);
         recordMicrophoneDiagnostic(microphoneSuccess("start"));
         setVoiceStatus("listening");
         setRecordingNotice(
@@ -756,10 +776,17 @@ function MobileApp() {
   const stopAndProcessRecording = useCallback(
     async (
       turn: number,
-      options: { discard?: boolean; retryListening?: boolean } = {},
+      options: {
+        discard?: boolean;
+        retryListening?: boolean;
+        preserveError?: boolean;
+      } = {},
     ) => {
       if (turn !== voiceTurnRef.current) return;
-      const durationMs = recording.durationMillis;
+      const durationMs = Math.max(
+        recording.durationMillis,
+        handsFreeRecorderStatusRef.current.durationMillis,
+      );
       try {
         await recorder.stop();
       } catch {
@@ -780,7 +807,7 @@ function MobileApp() {
             "I didn’t hear a usable response. Still listening…",
           );
           await startListeningRef.current(sessionId);
-        } else {
+        } else if (!options.preserveError) {
           setVoiceStatus("ready");
         }
         return;
@@ -835,32 +862,98 @@ function MobileApp() {
     ],
   );
 
+  // `useAudioRecorderState` is useful for rendering the ordinary recorder
+  // controls, but hands-free turn-taking needs each status read to drive the
+  // VAD. Poll the recorder directly so that a missing/stalled native meter is
+  // surfaced rather than being hidden by a stale React state update.
   useEffect(() => {
     const turn = activeRecordingTurnRef.current;
     if (
       !handsFreeActive ||
       turn === null ||
-      !recording.isRecording ||
       (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
     )
       return;
+    let cancelled = false;
+    const readStatus = () => {
+      const status = recorder.getStatus();
+      if (cancelled) return;
+      setHandsFreeRecorderStatus((current) => {
+        const next = recorderStatusSnapshot(status, Date.now(), current.action);
+        handsFreeRecorderStatusRef.current = next;
+        return next;
+      });
+    };
+    readStatus();
+    const interval = setInterval(readStatus, HANDS_FREE_STATUS_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [handsFreeActive, recorder, voiceStatus]);
+
+  const pauseHandsFreeForMeterFailure = useCallback(
+    (
+      turn: number,
+      action: "meter_unavailable" | "meter_stalled" | "recorder_inactive",
+    ) => {
+      if (!canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)) return;
+      autoFinalizeTurnRef.current = turn;
+      const message =
+        action === "recorder_inactive"
+          ? "The iPhone stopped recording before LeadLoop could hear you. Resume listening or use Record one turn."
+          : "Hands-free speech detection could not read the iPhone microphone level. Resume listening or use Record one turn.";
+      setHandsFreeRecorderStatus((current) => {
+        const next = { ...current, action };
+        handsFreeRecorderStatusRef.current = next;
+        return next;
+      });
+      setRecordingNotice(
+        "Hands-free listening paused. Your reminder was not changed.",
+      );
+      setError(message);
+      setVoiceStatus("error");
+      void stopAndProcessRecording(turn, {
+        discard: true,
+        preserveError: true,
+      });
+    },
+    [stopAndProcessRecording],
+  );
+
+  useEffect(() => {
+    const turn = activeRecordingTurnRef.current;
+    if (
+      !handsFreeActive ||
+      turn === null ||
+      (voiceStatus !== "listening" && voiceStatus !== "user_speaking")
+    )
+      return;
+    if (recorderStoppedUnexpectedly(handsFreeRecorderStatus)) {
+      pauseHandsFreeForMeterFailure(turn, "recorder_inactive");
+      return;
+    }
     const result = advanceVoiceActivity(
       voiceActivityRef.current,
-      recording.durationMillis,
-      recording.metering,
+      handsFreeRecorderStatus.durationMillis,
+      handsFreeRecorderStatus.meterDb,
     );
     voiceActivityRef.current = result.state;
+    setHandsFreeRecorderStatus((current) => {
+      const next = { ...current, action: result.action };
+      handsFreeRecorderStatusRef.current = next;
+      return next;
+    });
     if (result.action === "speech_started") {
       setVoiceStatus("user_speaking");
       setRecordingNotice("Hearing you…");
       return;
     }
-    if (result.action === "meter_unavailable") {
-      autoFinalizeTurnRef.current = turn;
-      void stopAndProcessRecording(turn, { discard: true });
-      setError(
-        "Hands-free speech detection is unavailable here. Use Record one turn instead.",
-      );
+    if (
+      result.action === "meter_unavailable" ||
+      result.action === "meter_stalled"
+    ) {
+      pauseHandsFreeForMeterFailure(turn, result.action);
       return;
     }
     if (
@@ -875,9 +968,8 @@ function MobileApp() {
     }
   }, [
     handsFreeActive,
-    recording.durationMillis,
-    recording.isRecording,
-    recording.metering,
+    handsFreeRecorderStatus,
+    pauseHandsFreeForMeterFailure,
     stopAndProcessRecording,
     voiceStatus,
   ]);
@@ -1095,8 +1187,16 @@ function MobileApp() {
         )}
         {tab === "capture" && (
           <Capture
-            isRecording={recording.isRecording}
-            seconds={Math.round(recording.durationMillis / 1000)}
+            isRecording={
+              handsFreeActive
+                ? handsFreeRecorderStatus.active
+                : recording.isRecording
+            }
+            seconds={Math.round(
+              (handsFreeActive
+                ? handsFreeRecorderStatus.durationMillis
+                : recording.durationMillis) / 1000,
+            )}
             notice={recordingNotice}
             status={voiceStatus}
             conversationActive={handsFreeActive}
@@ -1122,6 +1222,8 @@ function MobileApp() {
             onRetryCloud={() => void reloadWorkspace()}
             diagnostics={cloudDiagnostics}
             microphoneDiagnostics={microphoneDiagnostics}
+            handsFreeRecorderStatus={handsFreeRecorderStatus}
+            voiceActivity={voiceActivityRef.current}
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
@@ -1504,6 +1606,8 @@ function Capture({
   onRetryCloud,
   diagnostics,
   microphoneDiagnostics,
+  handsFreeRecorderStatus,
+  voiceActivity,
   workspaceLoaded,
   showDiagnostics,
   onNewReminder,
@@ -1529,6 +1633,8 @@ function Capture({
   onRetryCloud(): void;
   diagnostics: CloudDiagnostic[];
   microphoneDiagnostics: MicrophoneDiagnostic[];
+  handsFreeRecorderStatus: HandsFreeRecorderStatus;
+  voiceActivity: VoiceActivityState;
   workspaceLoaded: boolean;
   showDiagnostics: boolean;
   onNewReminder(): void;
@@ -1650,6 +1756,31 @@ function Capture({
                 </Text>
               )}
               <Text style={styles.diagnosticHeading}>Microphone</Text>
+              <Text style={styles.diagnosticText}>
+                Hands-free recorder:{" "}
+                {handsFreeRecorderStatus.active ? "active" : "inactive"}
+                {" · "}
+                {Math.round(handsFreeRecorderStatus.durationMillis)}ms
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Meter:{" "}
+                {handsFreeRecorderStatus.meterDb === undefined
+                  ? "unavailable"
+                  : `${handsFreeRecorderStatus.meterDb.toFixed(1)} dB`}
+                {" · floor: "}
+                {voiceActivity.noiseFloorDb === null
+                  ? "measuring"
+                  : `${voiceActivity.noiseFloorDb.toFixed(1)} dB`}
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Threshold: {voiceActivityThreshold(voiceActivity).toFixed(1)} dB
+                {" · speech: "}
+                {voiceActivity.speechStartedAtMs === null
+                  ? "not detected"
+                  : "detected"}
+                {" · action: "}
+                {handsFreeRecorderStatus.action}
+              </Text>
               {microphoneDiagnostics.length ? (
                 microphoneDiagnostics.map((diagnostic, index) => (
                   <Text

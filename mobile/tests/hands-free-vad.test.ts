@@ -45,3 +45,18 @@ test("silence, unavailable metering, and maximum duration never create duplicate
   const maximum = frame(speaking, HANDS_FREE_VAD.maximumTurnMs, -30);
   assert.equal(maximum.action, "submit");
 });
+
+test("a numeric iOS meter that never changes is treated as unavailable", () => {
+  let state = newVoiceActivity();
+  ({ state } = frame(state, 100, -160));
+  const result = frame(state, HANDS_FREE_VAD.meterStalledMs + 200, -160);
+  assert.equal(result.action, "meter_stalled");
+});
+
+test("changing meter samples continue to qualify real speech", () => {
+  let state = newVoiceActivity();
+  ({ state } = frame(state, 100, -62));
+  ({ state } = frame(state, 350, -35));
+  const result = frame(state, 550, -34);
+  assert.equal(result.action, "speech_started");
+});
