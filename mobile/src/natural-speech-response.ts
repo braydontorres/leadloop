@@ -18,6 +18,7 @@ export type NaturalSpeechRequestStage =
 export function naturalSpeechFailureDetails(error: unknown): {
   stage: NaturalSpeechRequestStage | "playback";
   code: string;
+  retryAfterSeconds?: number;
 } {
   if (
     error &&
@@ -40,16 +41,57 @@ export function naturalSpeechFailureDetails(error: unknown): {
     const failure = error as {
       stage: NaturalSpeechRequestStage;
       code?: unknown;
+      retryAfterSeconds?: unknown;
     };
+    const retryAfterSeconds =
+      typeof failure.retryAfterSeconds === "number" &&
+      Number.isSafeInteger(failure.retryAfterSeconds) &&
+      failure.retryAfterSeconds > 0
+        ? failure.retryAfterSeconds
+        : undefined;
     return {
       stage: failure.stage,
       code:
         typeof failure.code === "string" && failure.code
           ? failure.code
           : "SPEECH_REQUEST_FAILED",
+      ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
     };
   }
   return { stage: "playback", code: "SPEECH_PLAYBACK_FAILED" };
+}
+
+/** A concise, user-visible explanation while the included device voice speaks. */
+export function naturalSpeechFallbackNotice(input: {
+  code: string;
+  retryAfterSeconds?: number;
+}) {
+  const reason =
+    input.code === "LOCAL_RATE_LIMIT"
+      ? "Natural voice is briefly cooling down"
+      : input.code === "AI_RATE_LIMITED" || input.code === "AI_QUOTA_EXCEEDED"
+        ? "OpenAI is temporarily limiting natural voice"
+        : input.code === "SPEECH_NETWORK_ERROR" ||
+            input.code === "SPEECH_TIMEOUT"
+          ? "Natural voice could not reach the network"
+          : "Natural voice is unavailable for this reply";
+  const retry = input.retryAfterSeconds
+    ? ` Try again in ${input.retryAfterSeconds}s.`
+    : "";
+  return `${reason}. Using device voice.${retry}`;
+}
+
+/** Settings diagnostics name the failure source without exposing request data. */
+export function naturalSpeechDiagnosticSource(input: {
+  stage: NaturalSpeechRequestStage | "audio_session" | "playback" | "complete";
+  code?: string | null;
+}) {
+  if (input.stage === "playback") return "Native playback";
+  if (input.code === "LOCAL_RATE_LIMIT") return "LeadLoop rate limit";
+  if (input.code === "AI_RATE_LIMITED" || input.code === "AI_QUOTA_EXCEEDED")
+    return "OpenAI rate limit";
+  if (input.stage === "transport") return "Network transport";
+  return "Natural voice request";
 }
 
 /** Only audio explicitly marked by our authenticated server is Natural AI audio. */

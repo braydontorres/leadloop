@@ -252,6 +252,7 @@ type ProviderFailure = {
   providerCode?: string;
   providerParam?: string;
   providerMessage?: string;
+  retryAfterSeconds?: number;
 };
 
 function safeDiagnosticValue(value: unknown) {
@@ -265,6 +266,15 @@ function requestIdFrom(response: Response) {
     safeDiagnosticValue(response.headers.get("x-request-id")) ??
     safeDiagnosticValue(response.headers.get("request-id"))
   );
+}
+
+/** Keep provider cooldowns short and clock-independent for native clients. */
+function retryAfterSeconds(value: string | null) {
+  if (!value || !/^\d+$/.test(value.trim())) return undefined;
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 3_600
+    ? seconds
+    : undefined;
 }
 
 function safeSchemaMessage(value: unknown, parameter?: string) {
@@ -301,6 +311,7 @@ async function providerFailure(response: Response): Promise<ProviderFailure> {
     providerCode: safeDiagnosticValue(error?.code),
     providerParam,
     providerMessage: safeSchemaMessage(error?.message, providerParam),
+    retryAfterSeconds: retryAfterSeconds(response.headers.get("retry-after")),
   };
 }
 
@@ -319,6 +330,7 @@ function logAiFailure(
       providerCode: failure.providerCode,
       providerParam: failure.providerParam,
       providerMessage: failure.providerMessage,
+      retryAfterSeconds: failure.retryAfterSeconds,
     }),
   );
 }
@@ -357,6 +369,7 @@ function errorForProviderFailure(
       429,
       quota ? "AI_QUOTA_EXCEEDED" : "AI_RATE_LIMITED",
       failure.requestId,
+      failure.retryAfterSeconds,
     );
   }
   if (

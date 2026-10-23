@@ -8,7 +8,10 @@ import {
 import { authorizeMobileVoice } from "../../../../lib/mobile-voice-auth";
 import {
   limitRequest,
+  mobileSpeechLimitKey,
+  mobileSpeechRateLimitConfig,
   releaseRequest,
+  type MobileSpeechRequestKind,
   type RequestPermit,
 } from "../../../../lib/request-limit";
 
@@ -16,6 +19,8 @@ export const runtime = "nodejs";
 
 const WORKSPACE_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_ASSISTANT_REPLY_CHARACTERS = 600;
+const MAX_PREVIEW_CHARACTERS = 240;
 
 function requestInput(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -23,15 +28,27 @@ function requestInput(value: unknown) {
   const input = value as Record<string, unknown>;
   const workspaceId = input.workspaceId;
   const text = input.text;
+  // Older mobile bundles did not identify previews. Keep them working as an
+  // assistant reply while new bundles receive a separate preview budget.
+  const kind: MobileSpeechRequestKind =
+    input.kind === "preview" ? "preview" : "assistant_reply";
   if (typeof workspaceId !== "string" || !WORKSPACE_ID.test(workspaceId))
     throw new ApiError(
       "Choose a valid cloud workspace before playing a natural voice.",
       400,
       "WORKSPACE_INVALID",
     );
-  if (typeof text !== "string" || !text.trim() || text.length > 800)
+  const maximumCharacters =
+    kind === "preview"
+      ? MAX_PREVIEW_CHARACTERS
+      : MAX_ASSISTANT_REPLY_CHARACTERS;
+  if (
+    typeof text !== "string" ||
+    !text.trim() ||
+    text.length > maximumCharacters
+  )
     throw new ApiError(
-      "LeadLoop can speak replies up to 800 characters.",
+      `LeadLoop can speak ${kind === "preview" ? "voice previews" : "replies"} up to ${maximumCharacters} characters.`,
       400,
       "SPEECH_TEXT_INVALID",
     );
@@ -52,6 +69,7 @@ function requestInput(value: unknown) {
     text: text.trim(),
     voice: input.voice,
     speed: input.speed,
+    kind,
   };
 }
 
@@ -65,7 +83,11 @@ export async function POST(request: Request) {
   try {
     const input = requestInput(await request.json());
     const user = await authorizeMobileVoice(request, input.workspaceId);
-    permit = limitRequest(`mobile-speech:${user.id}`);
+    permit = limitRequest(
+      mobileSpeechLimitKey(user.id, input.kind),
+      undefined,
+      mobileSpeechRateLimitConfig(input.kind),
+    );
     const response = await synthesizeNaturalSpeech(input);
     const audio = await response.arrayBuffer();
     if (!audio.byteLength)
@@ -78,6 +100,7 @@ export async function POST(request: Request) {
       "[LeadLoop mobile speech]",
       JSON.stringify({
         operation: "complete",
+        kind: input.kind,
         characterCount: input.text.length,
         totalMs: Math.round(performance.now() - startedAt),
       }),

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   isCurrentNaturalSpeechRequest,
+  naturalSpeechDiagnosticSource,
   naturalSpeechFailureDetails,
+  naturalSpeechFallbackNotice,
   naturalSpeechResponseMatchesSelection,
 } from "../src/natural-speech-response";
 
@@ -95,4 +97,41 @@ test("natural voice diagnostics distinguish session, transport, download, and re
       { stage, code: `SPEECH_${stage.toUpperCase()}_FAILED` },
     );
   }
+});
+
+test("rate-limit fallbacks distinguish LeadLoop and OpenAI with a retry time", () => {
+  const local = naturalSpeechFailureDetails({
+    name: "NaturalSpeechApiError",
+    stage: "response",
+    code: "LOCAL_RATE_LIMIT",
+    retryAfterSeconds: 42,
+  });
+  assert.deepEqual(local, {
+    stage: "response",
+    code: "LOCAL_RATE_LIMIT",
+    retryAfterSeconds: 42,
+  });
+  assert.equal(naturalSpeechDiagnosticSource(local), "LeadLoop rate limit");
+  assert.match(naturalSpeechFallbackNotice(local), /42s/);
+  assert.equal(
+    naturalSpeechDiagnosticSource({
+      stage: "response",
+      code: "AI_RATE_LIMITED",
+    }),
+    "OpenAI rate limit",
+  );
+  assert.equal(
+    naturalSpeechDiagnosticSource({
+      stage: "transport",
+      code: "SPEECH_NETWORK_ERROR",
+    }),
+    "Network transport",
+  );
+  assert.equal(
+    naturalSpeechDiagnosticSource({
+      stage: "playback",
+      code: "SPEECH_PLAYBACK_FAILED",
+    }),
+    "Native playback",
+  );
 });

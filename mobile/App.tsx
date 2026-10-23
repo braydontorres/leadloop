@@ -142,7 +142,9 @@ import {
 } from "./src/natural-speech-api";
 import {
   isCurrentNaturalSpeechRequest,
+  naturalSpeechDiagnosticSource,
   naturalSpeechFailureDetails,
+  naturalSpeechFallbackNotice,
 } from "./src/natural-speech-response";
 import { primaryConversationControl } from "./src/capture-primary-control";
 
@@ -183,6 +185,7 @@ type NaturalSpeechDiagnostic = {
     | "playback"
     | "complete";
   code: string | null;
+  retryAfterSeconds?: number;
   voice: AssistantVoiceId;
   speed: AssistantSpeed;
 };
@@ -835,6 +838,7 @@ function MobileApp() {
         text: reply,
         voice: preferences.voice,
         speed: preferences.speed,
+        kind: "assistant_reply",
       })
         .then(async (naturalSpeech) => {
           if (
@@ -897,9 +901,11 @@ function MobileApp() {
             source: "device",
             stage: failure.stage,
             code: failure.code,
+            retryAfterSeconds: failure.retryAfterSeconds,
             voice: preferences.voice,
             speed: preferences.speed,
           });
+          setRecordingNotice(naturalSpeechFallbackNotice(failure));
           deviceFallback();
         });
     },
@@ -931,6 +937,7 @@ function MobileApp() {
         text,
         voice,
         speed,
+        kind: "preview",
       })
         .then(async (naturalSpeech) => {
           if (
@@ -1020,10 +1027,11 @@ function MobileApp() {
             source: "device",
             stage: failure.stage,
             code: failure.code,
+            retryAfterSeconds: failure.retryAfterSeconds,
             voice,
             speed,
           });
-          setNotice(`Device fallback · ${failure.stage} · ${failure.code}`);
+          setNotice(naturalSpeechFallbackNotice(failure));
           Speech.speak(text, { rate: deviceSpeechRate(speed) });
         });
     },
@@ -2349,10 +2357,14 @@ function SettingsScreen({
             {naturalSpeechDiagnostic.source === "natural"
               ? "Natural AI"
               : "Device fallback"}{" "}
-            · {naturalSpeechDiagnostic.voice} · {naturalSpeechDiagnostic.speed}{" "}
-            · {naturalSpeechDiagnostic.stage}
+            · {naturalSpeechDiagnosticSource(naturalSpeechDiagnostic)}·{" "}
+            {naturalSpeechDiagnostic.voice} · {naturalSpeechDiagnostic.speed} ·{" "}
+            {naturalSpeechDiagnostic.stage}
             {naturalSpeechDiagnostic.code
               ? ` · ${naturalSpeechDiagnostic.code}`
+              : ""}
+            {naturalSpeechDiagnostic.retryAfterSeconds
+              ? ` · retry in ${naturalSpeechDiagnostic.retryAfterSeconds}s`
               : ""}
           </Text>
         ) : null}

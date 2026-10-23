@@ -6,6 +6,11 @@ import {
   naturalSpeechResponseMatchesSelection,
   type NaturalSpeechRequestStage,
 } from "./natural-speech-response";
+import {
+  activeNaturalSpeechCooldown,
+  setNaturalSpeechCooldown,
+  type NaturalSpeechRequestKind,
+} from "./natural-speech-cooldown";
 import { mobileVoiceJsonHeaders } from "./voice-auth";
 import { mobileVoiceConfig } from "./config";
 import {
@@ -24,6 +29,7 @@ export class NaturalSpeechApiError extends MobileVoiceApiError {
     message: string,
     code: string | undefined,
     public readonly stage: NaturalSpeechStage,
+    public readonly retryAfterSeconds?: number,
   ) {
     super(message, code);
     this.name = "NaturalSpeechApiError";
@@ -58,11 +64,13 @@ function speechError(
   message: string,
   code: string | undefined,
   stage: NaturalSpeechStage,
+  retryAfterSeconds?: number,
 ) {
   return new NaturalSpeechApiError(
     message || "LeadLoop could not create a natural voice response.",
     code,
     stage,
+    retryAfterSeconds,
   );
 }
 
@@ -73,6 +81,7 @@ export async function requestNaturalSpeech(input: {
   text: string;
   voice: AssistantVoiceId;
   speed: AssistantSpeed;
+  kind: NaturalSpeechRequestKind;
 }): Promise<NaturalSpeechResponse> {
   const config = naturalSpeechConfig();
   if (!config)
@@ -80,6 +89,17 @@ export async function requestNaturalSpeech(input: {
       "Natural voices need the secure LeadLoop API address. Device speech is still available.",
       "SPEECH_NOT_CONFIGURED",
       "configuration",
+    );
+  const cooldown = activeNaturalSpeechCooldown({
+    workspaceId: input.workspaceId,
+    kind: input.kind,
+  });
+  if (cooldown)
+    throw speechError(
+      "Natural voice is cooling down. Device speech is still available.",
+      "LOCAL_RATE_LIMIT",
+      "response",
+      cooldown,
     );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -94,6 +114,7 @@ export async function requestNaturalSpeech(input: {
         text: input.text,
         voice: input.voice,
         speed: input.speed,
+        kind: input.kind,
       });
     } catch {
       throw speechError(
@@ -112,11 +133,28 @@ export async function requestNaturalSpeech(input: {
       const payload = (await response.json().catch(() => ({}))) as {
         error?: string;
         code?: string;
+        retryAfterSeconds?: number;
       };
+      const retryAfterHeader = Number(response.headers.get("retry-after"));
+      const retryAfterSeconds =
+        Number.isSafeInteger(payload.retryAfterSeconds) &&
+        payload.retryAfterSeconds &&
+        payload.retryAfterSeconds > 0
+          ? payload.retryAfterSeconds
+          : Number.isSafeInteger(retryAfterHeader) && retryAfterHeader > 0
+            ? retryAfterHeader
+            : undefined;
+      if (response.status === 429)
+        setNaturalSpeechCooldown({
+          workspaceId: input.workspaceId,
+          kind: input.kind,
+          retryAfterSeconds,
+        });
       throw speechError(
         payload.error ?? "",
         payload.code ?? `SPEECH_HTTP_${response.status}`,
         "response",
+        retryAfterSeconds,
       );
     }
     const contentType = response.headers.get("content-type")?.toLowerCase();
