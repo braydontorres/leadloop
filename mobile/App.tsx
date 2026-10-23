@@ -120,6 +120,12 @@ import {
 import { readBuildInfo, shareableBuildInfo } from "./src/build-info";
 import { HandsFreeTurnTimer } from "./src/hands-free-timer";
 import {
+  canRunMeterRecovery,
+  HANDS_FREE_METER_RECOVERY,
+  shouldRecoverMeter,
+  type ListeningStartReason,
+} from "./src/hands-free-meter-recovery";
+import {
   ASSISTANT_SPEEDS,
   DEFAULT_ASSISTANT_PREFERENCES,
   deviceSpeechRate,
@@ -196,6 +202,10 @@ const COLORS = {
   line: "#E5E4DA",
   danger: "#A63C32",
 };
+
+function waitForAudioRoute(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
 
 function MobileApp() {
   const buildInfo = readBuildInfo(Constants);
@@ -275,10 +285,15 @@ function MobileApp() {
   const handsFreeActiveRef = useRef(false);
   const activeRecordingTurnRef = useRef<number | null>(null);
   const autoFinalizeTurnRef = useRef<number | null>(null);
-  const voiceActivityRef = useRef<VoiceActivityState>(newVoiceActivity());
-  const startListeningRef = useRef<(sessionId: number) => Promise<void>>(
-    async () => {},
+  const meterRecoveryAttemptsRef = useRef(0);
+  const meterRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
   );
+  const voiceActivityRef = useRef<VoiceActivityState>(newVoiceActivity());
+  const recordingStartReasonRef = useRef<ListeningStartReason>("manual");
+  const startListeningRef = useRef<
+    (sessionId: number, reason?: ListeningStartReason) => Promise<void>
+  >(async () => {});
   const workspaceRequestRef = useRef(0);
   const workspaceDataRevisionRef = useRef(0);
   const restoreRequestRef = useRef(0);
@@ -779,7 +794,7 @@ function MobileApp() {
             nextStage: nextState.stage,
           })
         ) {
-          void startListeningRef.current(sessionId);
+          void startListeningRef.current(sessionId, "after_playback");
           return;
         }
         setVoiceStatus("ready");
@@ -1135,6 +1150,12 @@ function MobileApp() {
     }));
   }, []);
 
+  const clearMeterRecovery = useCallback(() => {
+    if (meterRecoveryTimerRef.current !== null)
+      clearTimeout(meterRecoveryTimerRef.current);
+    meterRecoveryTimerRef.current = null;
+  }, []);
+
   const startHandsFreeTicker = useCallback(
     (turn: number) => {
       clearHandsFreeTicker();
@@ -1161,15 +1182,19 @@ function MobileApp() {
   );
 
   const startListeningTurn = useCallback(
-    async (sessionId?: number) => {
+    async (sessionId?: number, reason: ListeningStartReason = "manual") => {
       if (
         sessionId !== undefined &&
         (!handsFreeActiveRef.current ||
           sessionId !== handsFreeSessionRef.current)
       )
         return;
+      // React's polling state can briefly describe the recorder that was just
+      // stopped for assistant playback. Consult the guarded native status for
+      // this transition so a stale render cannot block the next hands-free turn.
+      const currentRecorderStatus = readRecorderStatus(recorder);
       if (
-        recordingRef.current.isRecording ||
+        currentRecorderStatus.isRecording ||
         activeRecordingTurnRef.current !== null
       )
         return;
@@ -1179,6 +1204,7 @@ function MobileApp() {
         return;
       }
       let stage: MicrophoneStage = "permission";
+      recordingStartReasonRef.current = reason;
       try {
         const permission = await requestRecordingPermissionsAsync();
         if (!permission.granted) {
@@ -1199,7 +1225,16 @@ function MobileApp() {
           allowsRecording: true,
           playsInSilentMode: true,
         });
-        recordMicrophoneDiagnostic(microphoneSuccess("audio_session"));
+        recordMicrophoneDiagnostic(microphoneSuccess("audio_session", reason));
+        // Give iOS a bounded opportunity to reattach the foreground input
+        // route after MP3 playback before reading AVAudioRecorder metering.
+        await waitForAudioRoute(HANDS_FREE_METER_RECOVERY.audioSessionSettleMs);
+        if (
+          sessionId !== undefined &&
+          (!handsFreeActiveRef.current ||
+            sessionId !== handsFreeSessionRef.current)
+        )
+          return;
         stage = "prepare";
         await recorder.prepareToRecordAsync();
         recordMicrophoneDiagnostic(microphoneSuccess("prepare"));
@@ -1226,6 +1261,7 @@ function MobileApp() {
         handsFreeRecorderStatusRef.current = initialStatus;
         setHandsFreeRecorderStatus(initialStatus);
         recordVadTransition(turn, "recording_started", 0);
+        recordMicrophoneDiagnostic(microphoneSuccess("meter_startup", reason));
         recordMicrophoneDiagnostic(microphoneSuccess("start"));
         setVoiceStatus("listening");
         if (sessionId !== undefined) startHandsFreeTicker(turn);
@@ -1236,7 +1272,7 @@ function MobileApp() {
         );
       } catch {
         activeRecordingTurnRef.current = null;
-        recordMicrophoneDiagnostic(microphoneFailure(stage));
+        recordMicrophoneDiagnostic(microphoneFailure(stage, reason));
         setError(microphoneErrorMessage(stage));
         setVoiceStatus("error");
       }
@@ -1290,7 +1326,7 @@ function MobileApp() {
           setRecordingNotice(
             "I didn’t hear a usable response. Still listening…",
           );
-          await startListeningRef.current(sessionId);
+          await startListeningRef.current(sessionId, "no_speech_retry");
         } else if (!options.preserveError) {
           setVoiceStatus("ready");
         }
@@ -1354,6 +1390,12 @@ function MobileApp() {
     ) => {
       if (!canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)) return;
       autoFinalizeTurnRef.current = turn;
+      const shouldRecover = shouldRecoverMeter({
+        action,
+        speechStarted: voiceActivityRef.current.activity.speechStarted,
+        attempts: meterRecoveryAttemptsRef.current,
+      });
+      const sessionId = handsFreeSessionRef.current;
       if (action === "recorder_invalidated")
         recordMicrophoneDiagnostic(microphoneFailure("status"));
       recordVadTransition(turn, action, handsFreeWallElapsedRef.current);
@@ -1368,6 +1410,55 @@ function MobileApp() {
         handsFreeRecorderStatusRef.current = next;
         return next;
       });
+      if (shouldRecover) {
+        meterRecoveryAttemptsRef.current += 1;
+        clearHandsFreeTicker(turn);
+        recordMicrophoneDiagnostic(
+          microphoneFailure(
+            "meter_recovery",
+            `${recordingStartReasonRef.current}:${action}:attempt-${meterRecoveryAttemptsRef.current}`,
+          ),
+        );
+        setError("");
+        setVoiceStatus("listening");
+        setRecordingNotice(
+          "Refreshing the iPhone microphone before listening again…",
+        );
+        void stopAndProcessRecording(turn, {
+          discard: true,
+          preserveError: true,
+        }).finally(() => {
+          clearMeterRecovery();
+          meterRecoveryTimerRef.current = setTimeout(() => {
+            meterRecoveryTimerRef.current = null;
+            if (
+              !canRunMeterRecovery({
+                active: handsFreeActiveRef.current,
+                scheduledSessionId: sessionId,
+                currentSessionId: handsFreeSessionRef.current,
+                scheduledTurn: turn,
+                activeTurn: activeRecordingTurnRef.current,
+              })
+            )
+              return;
+            recordMicrophoneDiagnostic(
+              microphoneSuccess(
+                "meter_recovery",
+                `${recordingStartReasonRef.current}:${action}:restart-${meterRecoveryAttemptsRef.current}`,
+              ),
+            );
+            void startListeningRef.current(sessionId, "meter_recovery");
+          }, HANDS_FREE_METER_RECOVERY.retryDelayMs);
+        });
+        return;
+      }
+      if (action === "meter_unavailable" || action === "meter_stalled")
+        recordMicrophoneDiagnostic(
+          microphoneFailure(
+            "meter_startup",
+            `${recordingStartReasonRef.current}:${action}:recovery_exhausted`,
+          ),
+        );
       setRecordingNotice(
         "Hands-free listening paused. Your reminder was not changed.",
       );
@@ -1378,7 +1469,13 @@ function MobileApp() {
         preserveError: true,
       });
     },
-    [recordMicrophoneDiagnostic, recordVadTransition, stopAndProcessRecording],
+    [
+      clearHandsFreeTicker,
+      clearMeterRecovery,
+      recordMicrophoneDiagnostic,
+      recordVadTransition,
+      stopAndProcessRecording,
+    ],
   );
 
   // Keep this implementation in a ref so the timer created by
@@ -1517,6 +1614,7 @@ function MobileApp() {
     () => () => {
       handsFreeActiveRef.current = false;
       handsFreeTimerRef.current?.stop();
+      clearMeterRecovery();
       handsFreeTimerTurnRef.current = null;
       handsFreeRecordingStartedAtRef.current = null;
       handsFreeStatusStartedAtRef.current = null;
@@ -1529,11 +1627,13 @@ function MobileApp() {
         // A released recorder needs no further cleanup.
       });
     },
-    [clearNaturalSpeech, recorder],
+    [clearMeterRecovery, clearNaturalSpeech, recorder],
   );
 
   const startHandsFreeConversation = async () => {
     if (handsFreeActiveRef.current) return;
+    clearMeterRecovery();
+    meterRecoveryAttemptsRef.current = 0;
     speechPlaybackRef.current += 1;
     Speech.stop();
     clearNaturalSpeech();
@@ -1545,12 +1645,13 @@ function MobileApp() {
     const next = startConversation(conversationRef.current);
     conversationRef.current = next;
     setConversation(next);
-    await startListeningTurn(sessionId);
+    await startListeningTurn(sessionId, "initial");
   };
 
   const endHandsFreeConversation = async () => {
     handsFreeActiveRef.current = false;
     clearHandsFreeTicker();
+    clearMeterRecovery();
     setHandsFreeActive(false);
     handsFreeSessionRef.current += 1;
     voiceTurnRef.current += 1;
@@ -1573,8 +1674,9 @@ function MobileApp() {
 
   const resumeHandsFreeConversation = async () => {
     if (!handsFreeActiveRef.current) return;
+    clearMeterRecovery();
     setError("");
-    await startListeningTurn(handsFreeSessionRef.current);
+    await startListeningTurn(handsFreeSessionRef.current, "user_resume");
   };
 
   const toggleRecording = async () => {
@@ -1588,7 +1690,7 @@ function MobileApp() {
     speechPlaybackRef.current += 1;
     Speech.stop();
     clearNaturalSpeech();
-    await startListeningTurn();
+    await startListeningTurn(undefined, "manual");
   };
 
   if (!client)
@@ -2556,6 +2658,7 @@ function Capture({
                   >
                     {diagnostic.outcome} · {diagnostic.stage} ·{" "}
                     {diagnostic.category}
+                    {diagnostic.detail ? ` · ${diagnostic.detail}` : ""}
                   </Text>
                 ))
               ) : (

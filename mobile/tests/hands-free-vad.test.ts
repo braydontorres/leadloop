@@ -155,3 +155,22 @@ test("unavailable or frozen meters remain explicit recovery states", () => {
   );
   assert.equal(frozen.action, "meter_stalled");
 });
+
+test("temporary iOS -120 dB startup placeholders wait for a live meter before recovery", () => {
+  let state = newVoiceActivity();
+  for (const elapsedMs of [0, 500, 1_000, 1_500, 2_000]) {
+    const next = advanceVoiceActivity(state, elapsedMs, -120);
+    state = next.state;
+    assert.equal(next.action, "continue");
+  }
+  const unavailable = advanceVoiceActivity(
+    state,
+    HANDS_FREE_VAD.startupPlaceholderGraceMs +
+      HANDS_FREE_VAD.meterUnavailableMs,
+    -120,
+  );
+  assert.equal(unavailable.action, "meter_unavailable");
+
+  const live = advanceVoiceActivity(unavailable.state, 4_500, -43);
+  assert.notEqual(live.action, "meter_stalled");
+});

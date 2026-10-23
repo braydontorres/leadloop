@@ -20,6 +20,11 @@ export const HANDS_FREE_VAD = {
   noSpeechTimeoutMs: 12_000,
   meterUnavailableMs: 2_000,
   meterStalledMs: 2_500,
+  // AVAudioRecorder can transiently report its floor value while iOS restores
+  // the recording route after assistant playback. Wait for a live meter before
+  // treating that placeholder as a failed recorder.
+  startupPlaceholderDb: -118,
+  startupPlaceholderGraceMs: 2_200,
   meterChangeEpsilonDb: 0.5,
   maxFrameMs: 250,
 } as const;
@@ -158,6 +163,17 @@ export function advanceVoiceActivity(
   }
 
   const meter = clampMeter(meterDb as number);
+  if (!state.sawMeter && meter <= HANDS_FREE_VAD.startupPlaceholderDb) {
+    return {
+      state: { ...state, lastElapsedMs: elapsedMs },
+      action:
+        elapsedMs >=
+        HANDS_FREE_VAD.startupPlaceholderGraceMs +
+          HANDS_FREE_VAD.meterUnavailableMs
+          ? "meter_unavailable"
+          : "continue",
+    };
+  }
   const meterChanged =
     state.lastMeterDb === null ||
     Math.abs(meter - state.lastMeterDb) >= HANDS_FREE_VAD.meterChangeEpsilonDb;
