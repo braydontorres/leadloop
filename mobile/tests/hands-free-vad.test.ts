@@ -3,10 +3,12 @@ import test from "node:test";
 import {
   advanceVoiceActivity,
   HANDS_FREE_VAD,
+  voiceActivityEndThreshold,
   newVoiceActivity,
   voiceActivityNoiseFloor,
   voiceActivitySilenceMs,
   voiceActivityThreshold,
+  voiceActivityTrailingBackgroundDecision,
 } from "../src/hands-free-vad";
 
 function runTrace(levels: number[]) {
@@ -18,6 +20,10 @@ function runTrace(levels: number[]) {
     actions.push(next.action);
   });
   return { state, actions };
+}
+
+function firstActionIndex(actions: string[], action: string) {
+  return actions.findIndex((current) => current === action);
 }
 
 test("iOS room baseline, speech, and ambient silence produce speech_started then submit", () => {
@@ -109,6 +115,101 @@ test("loud speech followed by quiet frames advances silence instead of remaining
   assert.ok(
     voiceActivitySilenceMs(result.state) >= HANDS_FREE_VAD.endSilenceMs,
   );
+});
+
+test("the SDK 58 third-turn trace adapts a noisier trailing room level and submits", () => {
+  // This mirrors the iPhone diagnostic: startup floor around -56 dBFS, voice
+  // around -36 dBFS, then a stable post-speech room level near -46 dBFS.
+  const result = runTrace([
+    -56,
+    -55,
+    -56,
+    -55,
+    -56,
+    -38,
+    -36,
+    -39,
+    -37,
+    -38,
+    ...Array.from(
+      { length: 24 },
+      (_, index) => [-46.3, -45.7, -46.8, -46.1][index % 4],
+    ),
+  ]);
+  const submitAt = firstActionIndex(result.actions, "submit");
+  assert.ok(firstActionIndex(result.actions, "speech_started") >= 0);
+  assert.ok(submitAt >= 0, "the trailing room level must end the turn");
+  assert.ok(submitAt < 30, "it must not wait through a long stuck recording");
+  assert.equal(
+    voiceActivityTrailingBackgroundDecision(result.state),
+    "adapted_background",
+  );
+  assert.ok(voiceActivityEndThreshold(result.state) > -45);
+});
+
+test("short Yes and No answers submit after stable moderately noisy silence", () => {
+  for (const answer of [
+    [-38, -35, -37], // Yes
+    [-39, -36, -38], // No
+  ]) {
+    const result = runTrace([
+      -57,
+      -56,
+      -57,
+      -56,
+      -57,
+      ...answer,
+      ...Array.from(
+        { length: 24 },
+        (_, index) => [-46, -47, -45.5, -46.5][index % 4],
+      ),
+    ]);
+    assert.ok(result.actions.includes("speech_started"));
+    assert.ok(result.actions.includes("submit"));
+  }
+});
+
+test("a resumed phrase clears a meaningful pause without a premature submit", () => {
+  const firstPhrase = [-38, -36, -37];
+  const meaningfulPause = Array.from({ length: 8 }, () => -56);
+  const secondPhrase = [-37, -35, -38];
+  const finalSilence = Array.from({ length: 16 }, () => -56);
+  const result = runTrace([
+    -56,
+    -56,
+    -56,
+    -56,
+    -56,
+    ...firstPhrase,
+    ...meaningfulPause,
+    ...secondPhrase,
+    ...finalSilence,
+  ]);
+  const resumeAt = 5 + firstPhrase.length + meaningfulPause.length;
+  const submitAt = firstActionIndex(result.actions, "submit");
+  assert.ok(submitAt > resumeAt + secondPhrase.length);
+  assert.ok(
+    result.actions.slice(0, resumeAt).every((action) => action !== "submit"),
+  );
+});
+
+test("post-playback recorder starts give each consecutive natural-voice turn a fresh trailing baseline", () => {
+  const levelsFor = (ambient: number, speech: number) => [
+    ...Array.from({ length: 5 }, () => ambient),
+    speech,
+    speech + 1,
+    speech,
+    ...Array.from({ length: 16 }, () => ambient),
+  ];
+  for (const [ambient, speech] of [
+    [-56, -37],
+    [-48, -31],
+    [-63, -51],
+  ]) {
+    const result = runTrace(levelsFor(ambient, speech));
+    assert.ok(result.actions.includes("speech_started"));
+    assert.ok(result.actions.includes("submit"));
+  }
 });
 
 test("multiple turns receive independent ambient calibration", () => {

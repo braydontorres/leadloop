@@ -82,9 +82,11 @@ import {
 import {
   advanceVoiceActivity,
   newVoiceActivity,
+  voiceActivityEndThreshold,
   voiceActivityNoiseFloor,
   voiceActivitySilenceMs,
   voiceActivityThreshold,
+  voiceActivityTrailingBackgroundDecision,
   type VoiceActivityState,
 } from "./src/hands-free-vad";
 import {
@@ -2628,7 +2630,10 @@ function Capture({
                 {voiceActivityNoiseFloor(voiceActivity).toFixed(1)} dB
               </Text>
               <Text style={styles.diagnosticText}>
-                Threshold: {voiceActivityThreshold(voiceActivity).toFixed(1)} dB
+                Start threshold:{" "}
+                {voiceActivityThreshold(voiceActivity).toFixed(1)} dB
+                {" · end threshold: "}
+                {voiceActivityEndThreshold(voiceActivity).toFixed(1)} dB
                 {" · speech: "}
                 {voiceActivity.activity.speechStarted
                   ? "detected"
@@ -2637,6 +2642,10 @@ function Capture({
                 {Math.round(voiceActivitySilenceMs(voiceActivity))}ms
                 {" · action: "}
                 {handsFreeRecorderStatus.action}
+              </Text>
+              <Text style={styles.diagnosticText}>
+                Trailing background:{" "}
+                {voiceActivityTrailingBackgroundDecision(voiceActivity)}
               </Text>
               <Text style={styles.diagnosticText}>
                 Silence target: 1200ms · no-speech target: 12000ms

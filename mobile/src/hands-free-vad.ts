@@ -14,6 +14,13 @@ export const HANDS_FREE_VAD = {
   initialAmbientCeilingDb: -50,
   startMarginDb: 8,
   endMarginDb: 3,
+  // Once speech has begun, iOS can report a different steady room level than
+  // it did during recorder startup (for example after assistant playback).
+  // Learn that level only from a sustained, low-variance tail so a spoken
+  // phrase or brief pause cannot become the end-of-turn baseline.
+  trailingBackgroundWindowMs: 400,
+  trailingBackgroundMaxSpreadDb: 4,
+  strongSpeechMarginDb: 3,
   speechHoldMs: 180,
   speechGapMs: 140,
   endSilenceMs: 1_200,
@@ -32,6 +39,13 @@ export const HANDS_FREE_VAD = {
 export type VoiceActivityState = {
   activity: { speechStarted: boolean; quietMs: number };
   ambientDb: number | null;
+  endAmbientDb: number | null;
+  trailingSamples: Array<{ elapsedMs: number; meterDb: number }>;
+  trailingBackgroundDecision:
+    "start_baseline" | "learning_background" | "adapted_background";
+  speechStartedAtMs: number | null;
+  lastStrongSpeechAtMs: number | null;
+  strongSpeechMs: number;
   calibrationSamples: number[];
   calibrationComplete: boolean;
   candidateSpeechMs: number;
@@ -54,6 +68,12 @@ export function newVoiceActivity(): VoiceActivityState {
   return {
     activity: { speechStarted: false, quietMs: 0 },
     ambientDb: null,
+    endAmbientDb: null,
+    trailingSamples: [],
+    trailingBackgroundDecision: "start_baseline",
+    speechStartedAtMs: null,
+    lastStrongSpeechAtMs: null,
+    strongSpeechMs: 0,
     calibrationSamples: [],
     calibrationComplete: false,
     candidateSpeechMs: 0,
@@ -102,6 +122,18 @@ export function voiceActivityNoiseFloor(state: VoiceActivityState) {
   return effectiveAmbient(state, state.lastElapsedMs);
 }
 
+/** The trailing background is used only after speech begins to end a turn. */
+export function voiceActivityEndThreshold(state: VoiceActivityState) {
+  const ambient = state.endAmbientDb ?? voiceActivityNoiseFloor(state);
+  return ambient + HANDS_FREE_VAD.endMarginDb;
+}
+
+export function voiceActivityTrailingBackgroundDecision(
+  state: VoiceActivityState,
+) {
+  return state.trailingBackgroundDecision;
+}
+
 export function voiceActivitySilenceMs(state: VoiceActivityState) {
   return state.activity.quietMs;
 }
@@ -139,6 +171,94 @@ function updateAmbient(
   return {
     ambientDb: baseline + (meter - baseline) * alpha,
     calibrationSamples,
+  };
+}
+
+function trailingSampleSpread(
+  samples: Array<{ elapsedMs: number; meterDb: number }>,
+) {
+  if (samples.length === 0) return Infinity;
+  const levels = samples.map((sample) => sample.meterDb);
+  return Math.max(...levels) - Math.min(...levels);
+}
+
+function updateTrailingBackground(input: {
+  previous: VoiceActivityState;
+  meter: number;
+  elapsedMs: number;
+  speechStarted: boolean;
+  speechStartedAtMs: number | null;
+  startThreshold: number;
+}) {
+  if (!input.speechStarted)
+    return {
+      endAmbientDb: null,
+      trailingSamples: [],
+      trailingBackgroundDecision: "start_baseline" as const,
+      speechStartedAtMs: null,
+      lastStrongSpeechAtMs: null,
+      strongSpeechMs: 0,
+    };
+
+  const startedAt = input.speechStartedAtMs ?? input.elapsedMs;
+  const strongFrame =
+    input.meter >= input.startThreshold + HANDS_FREE_VAD.strongSpeechMarginDb;
+  const strongSpeechMs = strongFrame
+    ? input.previous.strongSpeechMs +
+      Math.min(
+        HANDS_FREE_VAD.maxFrameMs,
+        Math.max(0, input.elapsedMs - input.previous.lastElapsedMs),
+      )
+    : 0;
+  // A single loud fan click or meter spike is not enough to discard a useful
+  // trailing-noise window. Require the same temporal evidence used for speech
+  // qualification before treating frames as an active speech continuation.
+  const strongSpeechEvidence = strongSpeechMs >= HANDS_FREE_VAD.speechHoldMs;
+  const lastStrongSpeechAtMs = strongSpeechEvidence
+    ? input.elapsedMs
+    : (input.previous.lastStrongSpeechAtMs ?? startedAt);
+  const trailingSamples = strongSpeechEvidence
+    ? []
+    : (strongFrame
+        ? input.previous.trailingSamples
+        : [
+            ...input.previous.trailingSamples,
+            { elapsedMs: input.elapsedMs, meterDb: input.meter },
+          ]
+      ).filter(
+        (sample) =>
+          input.elapsedMs - sample.elapsedMs <=
+          HANDS_FREE_VAD.trailingBackgroundWindowMs,
+      );
+  const hasStableWindow =
+    trailingSamples.length >= 3 &&
+    input.elapsedMs - trailingSamples[0].elapsedMs >=
+      HANDS_FREE_VAD.trailingBackgroundWindowMs &&
+    input.elapsedMs - lastStrongSpeechAtMs >=
+      HANDS_FREE_VAD.trailingBackgroundWindowMs &&
+    trailingSampleSpread(trailingSamples) <=
+      HANDS_FREE_VAD.trailingBackgroundMaxSpreadDb;
+  if (!hasStableWindow)
+    return {
+      endAmbientDb: input.previous.endAmbientDb,
+      trailingSamples,
+      trailingBackgroundDecision: strongSpeechEvidence
+        ? ("start_baseline" as const)
+        : ("learning_background" as const),
+      speechStartedAtMs: startedAt,
+      lastStrongSpeechAtMs,
+      strongSpeechMs,
+    };
+  // A direct median update is intentional: its only input is an independently
+  // sustained, low-variance window after strong speech has stopped. A slow
+  // blend leaves the old startup floor in control for too long on iOS.
+  return {
+    endAmbientDb: median(trailingSamples.map((sample) => sample.meterDb)),
+    trailingSamples,
+    trailingBackgroundDecision: "adapted_background" as const,
+    speechStartedAtMs: startedAt,
+    lastStrongSpeechAtMs,
+    strongSpeechMs,
   };
 }
 
@@ -202,7 +322,6 @@ export function advanceVoiceActivity(
   );
   const ambientBefore = effectiveAmbient(state, elapsedMs);
   const startThreshold = ambientBefore + HANDS_FREE_VAD.startMarginDb;
-  const endThreshold = ambientBefore + HANDS_FREE_VAD.endMarginDb;
   const candidateSpeech = meter >= startThreshold;
   const ambient = updateAmbient(state, meter, elapsedMs, candidateSpeech);
 
@@ -227,9 +346,30 @@ export function advanceVoiceActivity(
     } else if (elapsedMs >= HANDS_FREE_VAD.noSpeechTimeoutMs) {
       action = "retry_silence";
     }
-  } else if (meter <= endThreshold) {
+  }
+  const trailing = updateTrailingBackground({
+    previous: state,
+    meter,
+    elapsedMs,
+    speechStarted,
+    speechStartedAtMs:
+      speechStarted && !state.activity.speechStarted
+        ? elapsedMs
+        : state.speechStartedAtMs,
+    startThreshold,
+  });
+  const endThreshold =
+    (trailing.endAmbientDb ?? ambientBefore) + HANDS_FREE_VAD.endMarginDb;
+  if (speechStarted && meter <= endThreshold) {
     quietMs += deltaMs;
-  } else {
+  } else if (
+    speechStarted &&
+    trailing.strongSpeechMs >= HANDS_FREE_VAD.speechHoldMs
+  ) {
+    // Several strong voice-like frames prove the person resumed speaking;
+    // discard a prior natural pause without letting one fan click do so.
+    quietMs = 0;
+  } else if (speechStarted) {
     // A one-frame fan click or distant voice should not erase all silence.
     quietMs = Math.max(0, quietMs - deltaMs * 0.4);
   }
@@ -240,6 +380,12 @@ export function advanceVoiceActivity(
     state: {
       activity: { speechStarted, quietMs },
       ambientDb: ambient.ambientDb,
+      endAmbientDb: trailing.endAmbientDb,
+      trailingSamples: trailing.trailingSamples,
+      trailingBackgroundDecision: trailing.trailingBackgroundDecision,
+      speechStartedAtMs: trailing.speechStartedAtMs,
+      lastStrongSpeechAtMs: trailing.lastStrongSpeechAtMs,
+      strongSpeechMs: trailing.strongSpeechMs,
       calibrationSamples: ambient.calibrationSamples,
       calibrationComplete:
         state.calibrationComplete || elapsedMs >= HANDS_FREE_VAD.calibrationMs,
