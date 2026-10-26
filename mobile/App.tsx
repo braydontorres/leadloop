@@ -64,7 +64,12 @@ import {
   type MobileTaskFilter,
   mobileTaskSections,
 } from "./src/task-list";
-import { uploadMobileVoiceTurn } from "./src/voice-api";
+import {
+  uploadMobileVoiceTurn,
+  type MobileVoiceClientTiming,
+} from "./src/voice-api";
+import { MobileVoiceApiError } from "./src/voice-response";
+import { canAutoRetryEmptyTranscript } from "./src/voice-recovery";
 import { linkVoiceTask } from "./src/voice-task-link";
 import {
   cloudDiagnostic,
@@ -82,6 +87,7 @@ import {
 import {
   advanceVoiceActivity,
   newVoiceActivity,
+  SHORT_CONFIRMATION_VAD,
   voiceActivityEndThreshold,
   voiceActivityNoiseFloor,
   voiceActivitySilenceMs,
@@ -163,6 +169,25 @@ type VadTransition = {
   turn: number;
   event: string;
   elapsedMs: number;
+};
+type VoiceTurnLatency = {
+  turn: number;
+  endOfSpeechAtMs: number;
+  recorderStoppedAtMs?: number;
+  fileReadyAtMs?: number;
+  upload?: MobileVoiceClientTiming;
+  conversationUpdatedAtMs?: number;
+  saveStartedAtMs?: number;
+  saveCompletedAtMs?: number;
+  naturalSpeech?: {
+    requestedAtMs: number;
+    preparedAtMs?: number;
+    playbackStartedAtMs?: number;
+    sessionMs?: number;
+    requestRoundTripMs?: number;
+    downloadMs?: number;
+    cacheMs?: number;
+  };
 };
 type HandsFreeLoopDiagnostics = {
   timerRunning: boolean;
@@ -291,6 +316,7 @@ function MobileApp() {
   const activeRecordingTurnRef = useRef<number | null>(null);
   const autoFinalizeTurnRef = useRef<number | null>(null);
   const meterRecoveryAttemptsRef = useRef(0);
+  const emptyTranscriptRetriesRef = useRef(0);
   const meterRecoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -309,6 +335,9 @@ function MobileApp() {
     MicrophoneDiagnostic[]
   >([]);
   const [vadTransitions, setVadTransitions] = useState<VadTransition[]>([]);
+  const [voiceTurnLatency, setVoiceTurnLatency] =
+    useState<VoiceTurnLatency | null>(null);
+  const voiceTurnLatencyRef = useRef<VoiceTurnLatency | null>(null);
   if (handsFreeTimerRef.current === null)
     handsFreeTimerRef.current = new HandsFreeTurnTimer();
   const [handsFreeLoopDiagnostics, setHandsFreeLoopDiagnostics] =
@@ -341,6 +370,31 @@ function MobileApp() {
       setVadTransitions((current) =>
         [{ turn, event, elapsedMs }, ...current].slice(0, 12),
       );
+    },
+    [],
+  );
+  const beginVoiceTurnLatency = useCallback((turn: number) => {
+    const next: VoiceTurnLatency = { turn, endOfSpeechAtMs: Date.now() };
+    voiceTurnLatencyRef.current = next;
+    setVoiceTurnLatency(next);
+  }, []);
+  const updateVoiceTurnLatency = useCallback(
+    (turn: number, change: Partial<VoiceTurnLatency>) => {
+      const current = voiceTurnLatencyRef.current;
+      if (!current || current.turn !== turn) return;
+      const next = { ...current, ...change };
+      voiceTurnLatencyRef.current = next;
+      setVoiceTurnLatency(next);
+    },
+    [],
+  );
+  const updateCurrentVoiceLatency = useCallback(
+    (change: Partial<VoiceTurnLatency>) => {
+      const current = voiceTurnLatencyRef.current;
+      if (!current) return;
+      const next = { ...current, ...change };
+      voiceTurnLatencyRef.current = next;
+      setVoiceTurnLatency(next);
     },
     [],
   );
@@ -409,6 +463,19 @@ function MobileApp() {
     removeNaturalSpeechFile(naturalSpeechFileRef.current);
     naturalSpeechFileRef.current = null;
   }, [naturalSpeechPlayer]);
+
+  useEffect(() => {
+    if (!naturalSpeechStatus.playing) return;
+    const current = voiceTurnLatencyRef.current;
+    if (!current?.naturalSpeech || current.naturalSpeech.playbackStartedAtMs)
+      return;
+    updateCurrentVoiceLatency({
+      naturalSpeech: {
+        ...current.naturalSpeech,
+        playbackStartedAtMs: Date.now(),
+      },
+    });
+  }, [naturalSpeechStatus.playing, updateCurrentVoiceLatency]);
 
   useEffect(() => {
     const playbackError = (
@@ -770,6 +837,9 @@ function MobileApp() {
     (reply: string, nextState: ConversationState) => {
       setAssistantReply(reply);
       setVoiceStatus("speaking");
+      updateCurrentVoiceLatency({
+        naturalSpeech: { requestedAtMs: Date.now() },
+      });
       const sessionId = handsFreeSessionRef.current;
       const playbackId = ++speechPlaybackRef.current;
       const complete = () => {
@@ -817,6 +887,15 @@ function MobileApp() {
           Speech.stop();
           Speech.speak(reply, {
             rate: deviceSpeechRate(assistantPreferencesRef.current.speed),
+            onStart: () =>
+              updateCurrentVoiceLatency({
+                naturalSpeech: {
+                  ...(voiceTurnLatencyRef.current?.naturalSpeech ?? {
+                    requestedAtMs: Date.now(),
+                  }),
+                  playbackStartedAtMs: Date.now(),
+                },
+              }),
             onDone: complete,
             onError: complete,
             onStopped: complete,
@@ -879,6 +958,18 @@ function MobileApp() {
             return;
           }
           naturalSpeechFileRef.current = naturalSpeech.file;
+          updateCurrentVoiceLatency({
+            naturalSpeech: {
+              ...(voiceTurnLatencyRef.current?.naturalSpeech ?? {
+                requestedAtMs: Date.now(),
+              }),
+              preparedAtMs: Date.now(),
+              sessionMs: naturalSpeech.timing.sessionMs,
+              requestRoundTripMs: naturalSpeech.timing.requestRoundTripMs,
+              downloadMs: naturalSpeech.timing.downloadMs,
+              cacheMs: naturalSpeech.timing.cacheMs,
+            },
+          });
           naturalSpeechCompletionRef.current = complete;
           naturalSpeechFallbackRef.current = deviceFallback;
           setNaturalSpeechDiagnostic({
@@ -911,7 +1002,13 @@ function MobileApp() {
           deviceFallback();
         });
     },
-    [clearNaturalSpeech, client, data, naturalSpeechPlayer],
+    [
+      clearNaturalSpeech,
+      client,
+      data,
+      naturalSpeechPlayer,
+      updateCurrentVoiceLatency,
+    ],
   );
 
   const previewNaturalVoice = useCallback(
@@ -1055,6 +1152,7 @@ function MobileApp() {
         data.quotes,
       );
       try {
+        updateCurrentVoiceLatency({ saveStartedAtMs: Date.now() });
         await createMobileTask(client, {
           ...linked,
           workspaceId: data.workspace.id,
@@ -1071,6 +1169,7 @@ function MobileApp() {
             : current,
         );
         setPendingSave(null);
+        updateCurrentVoiceLatency({ saveCompletedAtMs: Date.now() });
         conversationRef.current = nextState;
         setConversation(nextState);
         speakReply(
@@ -1085,7 +1184,7 @@ function MobileApp() {
         );
       }
     },
-    [client, data, speakReply],
+    [client, data, speakReply, updateCurrentVoiceLatency],
   );
 
   const applyVoiceResult = useCallback(
@@ -1311,6 +1410,8 @@ function MobileApp() {
       } = {},
     ) => {
       if (turn !== voiceTurnRef.current) return;
+      if (voiceTurnLatencyRef.current?.turn !== turn)
+        beginVoiceTurnLatency(turn);
       clearHandsFreeTicker(turn);
       const durationMs = Math.max(
         recordingRef.current.durationMillis,
@@ -1329,6 +1430,7 @@ function MobileApp() {
       }
       if (turn !== voiceTurnRef.current) return;
       activeRecordingTurnRef.current = null;
+      updateVoiceTurnLatency(turn, { recorderStoppedAtMs: Date.now() });
       recordMicrophoneDiagnostic(microphoneSuccess("stop"));
       const sessionId = handsFreeSessionRef.current;
       if (options.discard) {
@@ -1350,6 +1452,7 @@ function MobileApp() {
         setError(microphoneErrorMessage("file"));
         return;
       }
+      updateVoiceTurnLatency(turn, { fileReadyAtMs: Date.now() });
       recordMicrophoneDiagnostic(microphoneSuccess("file"));
       if (!client || !data) {
         setVoiceStatus("error");
@@ -1366,26 +1469,50 @@ function MobileApp() {
           durationMs: capturedDurationMs,
           timeZone: data.timezone,
           context: conversationContext(conversationRef.current),
+          onTiming: (upload) => updateVoiceTurnLatency(turn, { upload }),
         });
         if (turn !== voiceTurnRef.current) return;
+        emptyTranscriptRetriesRef.current = 0;
         setTranscript(payload.transcript);
         setRecordingNotice("");
+        updateVoiceTurnLatency(turn, { conversationUpdatedAtMs: Date.now() });
         await applyVoiceResult(payload.result, payload.transcript);
       } catch (reason) {
         if (turn !== voiceTurnRef.current) return;
         recordCloudDiagnostic(cloudDiagnostic("voice_upload", reason));
+        if (
+          reason instanceof MobileVoiceApiError &&
+          canAutoRetryEmptyTranscript({
+            code: reason.code,
+            handsFreeActive: handsFreeActiveRef.current,
+            consecutiveRetries: emptyTranscriptRetriesRef.current,
+          })
+        ) {
+          emptyTranscriptRetriesRef.current += 1;
+          setTranscript("");
+          setError("");
+          setRecordingNotice("I didn’t catch that. Please say it again.");
+          setAssistantReply("I didn’t catch that. Please say it again.");
+          await startListeningRef.current(
+            handsFreeSessionRef.current,
+            "no_speech_retry",
+          );
+          return;
+        }
         setVoiceStatus("error");
         setError(errorMessage(reason));
       }
     },
     [
       applyVoiceResult,
+      beginVoiceTurnLatency,
       clearHandsFreeTicker,
       client,
       data,
       recorder,
       recordCloudDiagnostic,
       recordMicrophoneDiagnostic,
+      updateVoiceTurnLatency,
     ],
   );
 
@@ -1565,6 +1692,9 @@ function MobileApp() {
       voiceActivityRef.current,
       elapsedMs,
       meterDb,
+      conversationRef.current.stage === "awaiting_confirmation"
+        ? SHORT_CONFIRMATION_VAD
+        : undefined,
     );
     voiceActivityRef.current = result.state;
     const next = { ...snapshot, action: result.action };
@@ -1589,6 +1719,7 @@ function MobileApp() {
       canFinalizeHandsFreeTurn(turn, autoFinalizeTurnRef.current)
     ) {
       autoFinalizeTurnRef.current = turn;
+      if (result.action === "submit") beginVoiceTurnLatency(turn);
       void stopAndProcessRecording(turn, {
         discard: result.action === "retry_silence",
         retryListening: result.action === "retry_silence",
@@ -1644,6 +1775,7 @@ function MobileApp() {
     if (handsFreeActiveRef.current) return;
     clearMeterRecovery();
     meterRecoveryAttemptsRef.current = 0;
+    emptyTranscriptRetriesRef.current = 0;
     speechPlaybackRef.current += 1;
     Speech.stop();
     clearNaturalSpeech();
@@ -1884,6 +2016,7 @@ function MobileApp() {
             handsFreeLoopDiagnostics={handsFreeLoopDiagnostics}
             voiceActivity={voiceActivityRef.current}
             vadTransitions={vadTransitions}
+            voiceTurnLatency={voiceTurnLatency}
             workspaceLoaded={Boolean(data)}
             showDiagnostics={process.env.NODE_ENV !== "production"}
             onNewReminder={() => {
@@ -2425,6 +2558,7 @@ function Capture({
   handsFreeLoopDiagnostics,
   voiceActivity,
   vadTransitions,
+  voiceTurnLatency,
   workspaceLoaded,
   showDiagnostics,
   onNewReminder,
@@ -2454,6 +2588,7 @@ function Capture({
   handsFreeLoopDiagnostics: HandsFreeLoopDiagnostics;
   voiceActivity: VoiceActivityState;
   vadTransitions: VadTransition[];
+  voiceTurnLatency: VoiceTurnLatency | null;
   workspaceLoaded: boolean;
   showDiagnostics: boolean;
   onNewReminder(): void;
@@ -2648,8 +2783,73 @@ function Capture({
                 {voiceActivityTrailingBackgroundDecision(voiceActivity)}
               </Text>
               <Text style={styles.diagnosticText}>
-                Silence target: 1200ms · no-speech target: 12000ms
+                Silence target: {awaitingConfirmation ? "1000" : "1200"}ms
+                {" · no-speech target: 12000ms"}
               </Text>
+              {voiceTurnLatency ? (
+                <>
+                  <Text style={styles.diagnosticHeading}>Voice timing</Text>
+                  <Text style={styles.diagnosticText}>
+                    turn {voiceTurnLatency.turn} · recorder stop{" "}
+                    {voiceTurnLatency.recorderStoppedAtMs
+                      ? `${Math.max(0, voiceTurnLatency.recorderStoppedAtMs - voiceTurnLatency.endOfSpeechAtMs)}ms`
+                      : "pending"}
+                    {" · file ready "}
+                    {voiceTurnLatency.fileReadyAtMs
+                      ? `${Math.max(0, voiceTurnLatency.fileReadyAtMs - voiceTurnLatency.endOfSpeechAtMs)}ms`
+                      : "pending"}
+                  </Text>
+                  {voiceTurnLatency.upload ? (
+                    <Text style={styles.diagnosticText}>
+                      mobile request{" "}
+                      {voiceTurnLatency.upload.requestRoundTripMs}ms
+                      {" · session "}
+                      {voiceTurnLatency.upload.sessionMs}ms
+                      {" · setup "}
+                      {voiceTurnLatency.upload.requestSetupMs}ms
+                      {" · audio "}
+                      {voiceTurnLatency.upload.audioBytes ?? "unavailable"}{" "}
+                      bytes
+                      {" · server "}
+                      {voiceTurnLatency.upload.server?.totalMs ?? "unavailable"}
+                      ms
+                      {" · transcription "}
+                      {voiceTurnLatency.upload.server?.transcriptionMs ??
+                        "unavailable"}
+                      ms
+                      {" · interpretation "}
+                      {voiceTurnLatency.upload.server?.interpretationMs ??
+                        "unavailable"}
+                      ms
+                      {voiceTurnLatency.upload.server
+                        ? ` · ${voiceTurnLatency.upload.server.interpretationSource}`
+                        : ""}
+                    </Text>
+                  ) : null}
+                  {voiceTurnLatency.naturalSpeech ? (
+                    <Text style={styles.diagnosticText}>
+                      natural request{" "}
+                      {voiceTurnLatency.naturalSpeech.requestRoundTripMs ??
+                        "pending"}
+                      ms
+                      {" · download "}
+                      {voiceTurnLatency.naturalSpeech.downloadMs ?? "pending"}ms
+                      {" · first playback "}
+                      {voiceTurnLatency.naturalSpeech.playbackStartedAtMs
+                        ? `${Math.max(0, voiceTurnLatency.naturalSpeech.playbackStartedAtMs - voiceTurnLatency.endOfSpeechAtMs)}ms`
+                        : "pending"}
+                    </Text>
+                  ) : null}
+                  {voiceTurnLatency.saveStartedAtMs ? (
+                    <Text style={styles.diagnosticText}>
+                      cloud save{" "}
+                      {voiceTurnLatency.saveCompletedAtMs
+                        ? `${Math.max(0, voiceTurnLatency.saveCompletedAtMs - voiceTurnLatency.saveStartedAtMs)}ms`
+                        : "pending"}
+                    </Text>
+                  ) : null}
+                </>
+              ) : null}
               <Text style={styles.diagnosticText}>
                 Native recorder error:{" "}
                 {handsFreeRecorderStatus.nativeError ||

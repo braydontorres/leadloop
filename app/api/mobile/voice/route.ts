@@ -15,6 +15,7 @@ import {
   releaseRequest,
   type RequestPermit,
 } from "../../../../lib/request-limit";
+import { standaloneVoiceConfirmation } from "../../../../lib/voice-confirmation";
 
 export const runtime = "nodejs";
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
@@ -30,13 +31,29 @@ function numericDuration(value: FormDataEntryValue | null) {
       400,
       "AUDIO_DURATION_INVALID",
     );
+  return Math.round(duration);
 }
 
 export async function POST(request: Request) {
   let permit: RequestPermit | undefined;
   const startedAt = performance.now();
+  let operation:
+    | "form_data"
+    | "authorization"
+    | "validation"
+    | "transcription"
+    | "interpretation" = "form_data";
+  let formDataMs = 0;
+  let authorizationMs = 0;
+  let validationMs = 0;
+  let transcriptionMs = 0;
+  let interpretationMs = 0;
+  let audioBytes: number | null = null;
+  let durationMs: number | null = null;
   try {
+    const formStartedAt = performance.now();
     const form = await request.formData();
+    formDataMs = Math.round(performance.now() - formStartedAt);
     const workspaceId = form.get("workspaceId");
     if (typeof workspaceId !== "string" || !WORKSPACE_ID.test(workspaceId))
       throw new ApiError(
@@ -44,7 +61,12 @@ export async function POST(request: Request) {
         400,
         "WORKSPACE_INVALID",
       );
+    operation = "authorization";
+    const authorizationStartedAt = performance.now();
     const user = await authorizeMobileVoice(request, workspaceId);
+    authorizationMs = Math.round(performance.now() - authorizationStartedAt);
+    operation = "validation";
+    const validationStartedAt = performance.now();
     const audio = form.get("audio");
     if (!(audio instanceof File) || audio.size === 0)
       throw new ApiError(
@@ -64,7 +86,8 @@ export async function POST(request: Request) {
         415,
         "AUDIO_UNSUPPORTED",
       );
-    numericDuration(form.get("durationMs"));
+    durationMs = numericDuration(form.get("durationMs"));
+    audioBytes = audio.size;
     const rawContext = form.get("context");
     const context =
       typeof rawContext === "string" ? JSON.parse(rawContext) : {};
@@ -73,28 +96,42 @@ export async function POST(request: Request) {
       timeZone: form.get("timeZone"),
       context,
     });
+    validationMs = Math.round(performance.now() - validationStartedAt);
     permit = limitRequest(`mobile:${user.id}`);
+    operation = "transcription";
     const transcriptionStarted = performance.now();
     const transcript = await transcribeAudio(audio);
+    transcriptionMs = Math.round(performance.now() - transcriptionStarted);
+    operation = "interpretation";
     const interpretationStarted = performance.now();
-    const result = await interpretThought(
-      transcript,
-      valid.timeZone,
-      valid.context,
-    );
+    const confirmation = standaloneVoiceConfirmation(transcript, valid.context);
+    const result =
+      confirmation ??
+      (await interpretThought(transcript, valid.timeZone, valid.context));
+    interpretationMs = Math.round(performance.now() - interpretationStarted);
+    const interpretationSource = confirmation
+      ? "confirmation_fast_path"
+      : "openai";
+    const timing = {
+      formDataMs,
+      authorizationMs,
+      validationMs,
+      transcriptionMs,
+      interpretationMs,
+      interpretationSource,
+      audioBytes,
+      durationMs,
+      totalMs: Math.round(performance.now() - startedAt),
+    };
     console.info(
       "[LeadLoop mobile voice]",
       JSON.stringify({
         operation: "complete",
         contextStage: valid.context.stage,
-        transcriptionMs: Math.round(
-          interpretationStarted - transcriptionStarted,
-        ),
-        interpretationMs: Math.round(performance.now() - interpretationStarted),
-        totalMs: Math.round(performance.now() - startedAt),
+        ...timing,
       }),
     );
-    return NextResponse.json({ transcript, result });
+    return NextResponse.json({ transcript, result, timing });
   } catch (error) {
     const known =
       error instanceof ApiError
@@ -114,6 +151,14 @@ export async function POST(request: Request) {
         rateLimitSource: known.status === 429 ? known.source : undefined,
         retryAfterSeconds: known.retryAfterSeconds,
         authVerification: mobileVoiceAuthDiagnostic(known),
+        operation,
+        formDataMs,
+        authorizationMs,
+        validationMs,
+        transcriptionMs,
+        interpretationMs,
+        audioBytes,
+        durationMs,
         totalMs: Math.round(performance.now() - startedAt),
       }),
     );

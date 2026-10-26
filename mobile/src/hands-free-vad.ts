@@ -64,6 +64,21 @@ export type VoiceActivityAction =
   | "meter_unavailable"
   | "meter_stalled";
 
+/**
+ * A confirmation is only accepted in a completed read-back state. It can use
+ * a modestly shorter qualification/silence window because "Yes" and "No"
+ * are often much shorter than an initial reminder sentence.
+ */
+export const SHORT_CONFIRMATION_VAD = {
+  speechHoldMs: 120,
+  endSilenceMs: 1_000,
+} as const;
+
+export type VoiceActivityOptions = {
+  speechHoldMs?: number;
+  endSilenceMs?: number;
+};
+
 export function newVoiceActivity(): VoiceActivityState {
   return {
     activity: { speechStarted: false, quietMs: 0 },
@@ -189,6 +204,7 @@ function updateTrailingBackground(input: {
   speechStarted: boolean;
   speechStartedAtMs: number | null;
   startThreshold: number;
+  speechHoldMs: number;
 }) {
   if (!input.speechStarted)
     return {
@@ -213,7 +229,7 @@ function updateTrailingBackground(input: {
   // A single loud fan click or meter spike is not enough to discard a useful
   // trailing-noise window. Require the same temporal evidence used for speech
   // qualification before treating frames as an active speech continuation.
-  const strongSpeechEvidence = strongSpeechMs >= HANDS_FREE_VAD.speechHoldMs;
+  const strongSpeechEvidence = strongSpeechMs >= input.speechHoldMs;
   const lastStrongSpeechAtMs = strongSpeechEvidence
     ? input.elapsedMs
     : (input.previous.lastStrongSpeechAtMs ?? startedAt);
@@ -271,7 +287,10 @@ export function advanceVoiceActivity(
   state: VoiceActivityState,
   elapsedMs: number,
   meterDb: number | undefined,
+  options: VoiceActivityOptions = {},
 ): { state: VoiceActivityState; action: VoiceActivityAction } {
+  const speechHoldMs = options.speechHoldMs ?? HANDS_FREE_VAD.speechHoldMs;
+  const endSilenceMs = options.endSilenceMs ?? HANDS_FREE_VAD.endSilenceMs;
   if (!Number.isFinite(meterDb)) {
     return {
       state: { ...state, lastElapsedMs: elapsedMs },
@@ -339,7 +358,7 @@ export function advanceVoiceActivity(
       candidateGapMs += deltaMs;
       if (candidateGapMs > HANDS_FREE_VAD.speechGapMs) candidateSpeechMs = 0;
     }
-    if (candidateSpeechMs >= HANDS_FREE_VAD.speechHoldMs) {
+    if (candidateSpeechMs >= speechHoldMs) {
       speechStarted = true;
       quietMs = 0;
       action = "speech_started";
@@ -357,15 +376,13 @@ export function advanceVoiceActivity(
         ? elapsedMs
         : state.speechStartedAtMs,
     startThreshold,
+    speechHoldMs,
   });
   const endThreshold =
     (trailing.endAmbientDb ?? ambientBefore) + HANDS_FREE_VAD.endMarginDb;
   if (speechStarted && meter <= endThreshold) {
     quietMs += deltaMs;
-  } else if (
-    speechStarted &&
-    trailing.strongSpeechMs >= HANDS_FREE_VAD.speechHoldMs
-  ) {
+  } else if (speechStarted && trailing.strongSpeechMs >= speechHoldMs) {
     // Several strong voice-like frames prove the person resumed speaking;
     // discard a prior natural pause without letting one fan click do so.
     quietMs = 0;
@@ -373,8 +390,7 @@ export function advanceVoiceActivity(
     // A one-frame fan click or distant voice should not erase all silence.
     quietMs = Math.max(0, quietMs - deltaMs * 0.4);
   }
-  if (speechStarted && quietMs >= HANDS_FREE_VAD.endSilenceMs)
-    action = "submit";
+  if (speechStarted && quietMs >= endSilenceMs) action = "submit";
 
   return {
     state: {

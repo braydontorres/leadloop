@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   advanceVoiceActivity,
   HANDS_FREE_VAD,
+  SHORT_CONFIRMATION_VAD,
   voiceActivityEndThreshold,
   newVoiceActivity,
   voiceActivityNoiseFloor,
@@ -167,6 +168,30 @@ test("short Yes and No answers submit after stable moderately noisy silence", ()
     assert.ok(result.actions.includes("speech_started"));
     assert.ok(result.actions.includes("submit"));
   }
+});
+
+test("a short confirmation has a bounded context-aware end-of-turn window", () => {
+  let state = newVoiceActivity();
+  const actions: string[] = [];
+  [-58, -58, -58, -58, -58, -43, -42, -43]
+    .concat(Array.from({ length: 12 }, () => -58))
+    .forEach((db, index) => {
+      const result = advanceVoiceActivity(
+        state,
+        index * 100,
+        db,
+        SHORT_CONFIRMATION_VAD,
+      );
+      state = result.state;
+      actions.push(result.action);
+    });
+  assert.ok(actions.includes("speech_started"));
+  assert.ok(actions.includes("submit"));
+  assert.equal(
+    actions.slice(0, 8).includes("submit"),
+    false,
+    "the word itself must finish before a turn submits",
+  );
 });
 
 test("a resumed phrase clears a meaningful pause without a premature submit", () => {

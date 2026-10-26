@@ -41,6 +41,13 @@ export type NaturalSpeechResponse = {
   source: "openai-tts";
   voice: AssistantVoiceId;
   speed: AssistantSpeed;
+  timing: {
+    sessionMs: number;
+    requestRoundTripMs: number;
+    downloadMs: number;
+    cacheMs: number;
+    totalMs: number;
+  };
 };
 
 function naturalSpeechConfig() {
@@ -103,8 +110,15 @@ export async function requestNaturalSpeech(input: {
     );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+  let sessionMs = 0;
+  let requestRoundTripMs = 0;
+  let downloadMs = 0;
+  let cacheMs = 0;
   try {
+    const sessionStartedAt = Date.now();
     const accessToken = await currentMobileVoiceAccessToken(input.client);
+    sessionMs = Date.now() - sessionStartedAt;
     let headers: Headers;
     let body: string;
     try {
@@ -123,12 +137,14 @@ export async function requestNaturalSpeech(input: {
         "request",
       );
     }
+    const requestStartedAt = Date.now();
     const response = await expoFetch(`${config.apiBaseUrl}/api/mobile/speech`, {
       method: "POST",
       headers,
       body,
       signal: controller.signal,
     });
+    requestRoundTripMs = Date.now() - requestStartedAt;
     if (!response.ok) {
       const payload = (await response.json().catch(() => ({}))) as {
         error?: string;
@@ -172,7 +188,9 @@ export async function requestNaturalSpeech(input: {
       );
     let bytes: Uint8Array;
     try {
+      const downloadStartedAt = Date.now();
       bytes = new Uint8Array(await response.arrayBuffer());
+      downloadMs = Date.now() - downloadStartedAt;
     } catch {
       throw speechError(
         "LeadLoop could not download the natural voice audio. Device speech is still available.",
@@ -187,17 +205,26 @@ export async function requestNaturalSpeech(input: {
         "response",
       );
     try {
+      const cacheStartedAt = Date.now();
       const file = new File(
         Paths.cache,
         `leadloop-assistant-${Date.now()}-${Math.random().toString(36).slice(2)}.mp3`,
       );
       file.create({ overwrite: true, intermediates: true });
       file.write(bytes);
+      cacheMs = Date.now() - cacheStartedAt;
       return {
         file,
         source: "openai-tts",
         voice: input.voice,
         speed: input.speed,
+        timing: {
+          sessionMs,
+          requestRoundTripMs,
+          downloadMs,
+          cacheMs,
+          totalMs: Date.now() - startedAt,
+        },
       };
     } catch {
       throw speechError(

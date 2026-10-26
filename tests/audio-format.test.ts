@@ -209,6 +209,24 @@ test("reports a missing transcription model with a safe request-id diagnostic", 
   );
 });
 
+test("empty transcription is rejected without recording text or audio in diagnostics", async () => {
+  await withMockedOpenAi(
+    async () => new Response(JSON.stringify({ text: "   " }), { status: 200 }),
+    async (diagnostics) => {
+      await assert.rejects(
+        () => transcribeAudio(audioFile()),
+        (error: unknown) => {
+          assert(error instanceof ApiError);
+          assert.equal(error.code, "EMPTY_TRANSCRIPT");
+          assert.equal(error.status, 422);
+          return true;
+        },
+      );
+      assert.doesNotMatch(diagnostics.join("\n"), /safe test audio/);
+    },
+  );
+});
+
 test("distinguishes an exhausted quota from a rate limit", async () => {
   await withMockedOpenAi(
     async () =>

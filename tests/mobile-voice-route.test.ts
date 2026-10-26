@@ -1,20 +1,50 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { POST } from "../app/api/mobile/voice/route";
+import {
+  advanceConversation,
+  conversationContext,
+  emptyConversationState,
+  finishSpeech,
+} from "../lib/conversation-machine";
 import { resetRateLimitsForTest } from "../lib/request-limit";
 
-function request(headers?: HeadersInit) {
+function request(headers?: HeadersInit, context: unknown = {}) {
   const form = new FormData();
   form.append("workspaceId", "11111111-1111-4111-8111-111111111111");
   form.append("durationMs", "200");
   form.append("timeZone", "America/Chicago");
-  form.append("context", "{}");
+  form.append("context", JSON.stringify(context));
   form.append("audio", new Blob(["audio"], { type: "audio/m4a" }), "voice.m4a");
   return new Request("https://leadloop.test/api/mobile/voice", {
     method: "POST",
     headers,
     body: form,
   });
+}
+
+function awaitingConfirmationContext() {
+  const transition = advanceConversation({
+    state: emptyConversationState(),
+    text: "Remind me to call Mike tomorrow at 3 PM.",
+    timeZone: "America/Chicago",
+    now: new Date("2026-10-22T17:00:00.000Z"),
+    createId: () => "voice-confirmation-draft",
+    result: {
+      intent: {
+        kind: "new_task",
+        fields: {
+          title: "Call Mike",
+          person: "Mike",
+          date: "2026-10-23",
+          time: "15:00",
+          notes: null,
+          clearDue: false,
+        },
+      },
+    },
+  });
+  return conversationContext(finishSpeech(transition.state));
 }
 
 test("mobile voice reports when Expo did not deliver an Authorization header", async () => {
@@ -181,6 +211,68 @@ test("mobile voice accepts an authenticated member and reaches the shared AI pip
     assert(urls.some((url) => url.endsWith("/auth/v1/user")));
     assert(urls.some((url) => url.includes("workspace_members")));
     assert(urls.some((url) => url.includes("audio/transcriptions")));
+  } finally {
+    globalThis.fetch = previous.fetch;
+    if (previous.url === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
+    else process.env.NEXT_PUBLIC_SUPABASE_URL = previous.url;
+    if (previous.key === undefined)
+      delete process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    else process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = previous.key;
+    if (previous.openAi === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previous.openAi;
+  }
+});
+
+test("mobile voice bypasses interpretation only for a strict transcribed confirmation", async () => {
+  const previous = {
+    url: process.env.NEXT_PUBLIC_SUPABASE_URL,
+    key: process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    openAi: process.env.OPENAI_API_KEY,
+    fetch: globalThis.fetch,
+  };
+  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://project.supabase.co";
+  process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "public-key";
+  process.env.OPENAI_API_KEY = "test-key";
+  resetRateLimitsForTest();
+  const urls: string[] = [];
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    urls.push(url);
+    if (url.endsWith("/auth/v1/user"))
+      return new Response(JSON.stringify({ id: "user-1" }), { status: 200 });
+    if (url.includes("/rest/v1/workspace_members"))
+      return new Response(
+        JSON.stringify([
+          { workspace_id: "11111111-1111-4111-8111-111111111111" },
+        ]),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    if (url.includes("audio/transcriptions"))
+      return new Response(JSON.stringify({ text: "Yes." }), { status: 200 });
+    throw new Error(`Unexpected fetch ${url}`);
+  };
+  try {
+    const response = await POST(
+      request(
+        { Authorization: "Bearer signed-user-token" },
+        awaitingConfirmationContext(),
+      ),
+    );
+    const payload = (await response.json()) as {
+      result?: { intent?: { kind?: string } };
+      timing?: { interpretationSource?: string; interpretationMs?: number };
+    };
+    assert.equal(response.status, 200);
+    assert.equal(payload.result?.intent?.kind, "confirm");
+    assert.equal(
+      payload.timing?.interpretationSource,
+      "confirmation_fast_path",
+    );
+    assert.equal(payload.timing?.interpretationMs, 0);
+    assert.equal(
+      urls.some((url) => url.includes("chat/completions")),
+      false,
+    );
   } finally {
     globalThis.fetch = previous.fetch;
     if (previous.url === undefined) delete process.env.NEXT_PUBLIC_SUPABASE_URL;
