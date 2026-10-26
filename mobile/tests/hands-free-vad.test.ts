@@ -23,6 +23,19 @@ function runTrace(levels: number[]) {
   return { state, actions };
 }
 
+function runTimestampedTrace(
+  samples: Array<{ elapsedMs: number; db: number }>,
+) {
+  let state = newVoiceActivity();
+  const actions: string[] = [];
+  for (const sample of samples) {
+    const next = advanceVoiceActivity(state, sample.elapsedMs, sample.db);
+    state = next.state;
+    actions.push(next.action);
+  }
+  return { state, actions };
+}
+
 function firstActionIndex(actions: string[], action: string) {
   return actions.findIndex((current) => current === action);
 }
@@ -148,6 +161,43 @@ test("the SDK 58 third-turn trace adapts a noisier trailing room level and submi
   assert.ok(voiceActivityEndThreshold(result.state) > -45);
 });
 
+test("an irregular iOS polling cadence retains a full trailing background window", () => {
+  // Before the retention fix, 97/103/112/119ms callbacks repeatedly removed
+  // the one sample old enough to prove a 400ms stable tail.
+  const result = runTimestampedTrace([
+    { elapsedMs: 0, db: -56 },
+    { elapsedMs: 97, db: -55 },
+    { elapsedMs: 200, db: -56 },
+    { elapsedMs: 312, db: -55 },
+    { elapsedMs: 431, db: -56 },
+    { elapsedMs: 528, db: -37 },
+    { elapsedMs: 631, db: -36 },
+    { elapsedMs: 743, db: -38 },
+    { elapsedMs: 862, db: -46.2 },
+    { elapsedMs: 959, db: -45.8 },
+    { elapsedMs: 1062, db: -46.4 },
+    { elapsedMs: 1174, db: -46.1 },
+    { elapsedMs: 1293, db: -45.9 },
+    { elapsedMs: 1390, db: -46.3 },
+    { elapsedMs: 1493, db: -46 },
+    { elapsedMs: 1605, db: -46.2 },
+    { elapsedMs: 1724, db: -45.8 },
+    { elapsedMs: 1821, db: -46.1 },
+    { elapsedMs: 1924, db: -46.3 },
+    { elapsedMs: 2036, db: -46 },
+    { elapsedMs: 2155, db: -46.2 },
+    { elapsedMs: 2252, db: -46.1 },
+    { elapsedMs: 2355, db: -46 },
+    { elapsedMs: 2467, db: -46.2 },
+    { elapsedMs: 2586, db: -46.1 },
+  ]);
+  assert.equal(
+    voiceActivityTrailingBackgroundDecision(result.state),
+    "adapted_background",
+  );
+  assert.ok(result.actions.includes("submit"));
+});
+
 test("short Yes and No answers submit after stable moderately noisy silence", () => {
   for (const answer of [
     [-38, -35, -37], // Yes
@@ -232,6 +282,36 @@ test("post-playback recorder starts give each consecutive natural-voice turn a f
     [-63, -51],
   ]) {
     const result = runTrace(levelsFor(ambient, speech));
+    assert.ok(result.actions.includes("speech_started"));
+    assert.ok(result.actions.includes("submit"));
+  }
+});
+
+test("three consecutive post-playback turns adapt independently with jittered samples", () => {
+  const cadence = [97, 103, 112, 119];
+  const turn = (ambient: number, speech: number) => {
+    let elapsedMs = 0;
+    const readings = [ambient, ambient + 1, ambient, ambient + 1, ambient];
+    const samples = readings.map((db, index) => {
+      elapsedMs += cadence[index % cadence.length];
+      return { elapsedMs, db };
+    });
+    for (let index = 0; index < 3; index += 1) {
+      elapsedMs += cadence[index % cadence.length];
+      samples.push({ elapsedMs, db: speech + (index % 2) });
+    }
+    for (let index = 0; index < 15; index += 1) {
+      elapsedMs += cadence[index % cadence.length];
+      samples.push({ elapsedMs, db: ambient + (index % 3 === 0 ? 0.5 : 0) });
+    }
+    return runTimestampedTrace(samples);
+  };
+  for (const [ambient, speech] of [
+    [-56, -37],
+    [-48, -30],
+    [-63, -51],
+  ]) {
+    const result = turn(ambient, speech);
     assert.ok(result.actions.includes("speech_started"));
     assert.ok(result.actions.includes("submit"));
   }

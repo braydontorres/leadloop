@@ -19,6 +19,10 @@ export const HANDS_FREE_VAD = {
   // Learn that level only from a sustained, low-variance tail so a spoken
   // phrase or brief pause cannot become the end-of-turn baseline.
   trailingBackgroundWindowMs: 400,
+  // Poll callbacks are not aligned to an exact 400 ms boundary. Retain one
+  // additional maximum frame so a valid 400 ms quiet span is still observable
+  // after the sample that began it would otherwise have rolled out.
+  trailingBackgroundRetentionMs: 650,
   trailingBackgroundMaxSpreadDb: 4,
   strongSpeechMarginDb: 3,
   speechHoldMs: 180,
@@ -244,7 +248,7 @@ function updateTrailingBackground(input: {
       ).filter(
         (sample) =>
           input.elapsedMs - sample.elapsedMs <=
-          HANDS_FREE_VAD.trailingBackgroundWindowMs,
+          HANDS_FREE_VAD.trailingBackgroundRetentionMs,
       );
   const hasStableWindow =
     trailingSamples.length >= 3 &&
