@@ -2,6 +2,7 @@ import * as SecureStore from "expo-secure-store";
 import { AppState } from "react-native";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { mobileSupabaseConfig } from "./config";
+import { shouldRefreshSupabaseForAppState } from "./app-state-refresh";
 
 const config = mobileSupabaseConfig(process.env);
 
@@ -26,8 +27,9 @@ export const supabase: SupabaseClient | null = config
 // backgrounded. Keep the native session current when the app returns to the
 // foreground so the voice request does not send an expired access token.
 if (supabase) {
-  const refreshForAppState = (state: string) => {
-    if (state === "active") supabase.auth.startAutoRefresh();
+  const refreshForAppState = (state: string | null | undefined) => {
+    if (shouldRefreshSupabaseForAppState(state))
+      supabase.auth.startAutoRefresh();
     else supabase.auth.stopAutoRefresh();
   };
   refreshForAppState(AppState.currentState);

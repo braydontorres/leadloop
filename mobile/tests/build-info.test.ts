@@ -5,7 +5,7 @@ import { readBuildInfo, shareableBuildInfo } from "../src/build-info";
 test("build information identifies the bundled JavaScript commit separately from Expo Go", () => {
   const info = readBuildInfo({
     executionEnvironment: "storeClient",
-    expoVersion: "57.0.0",
+    expoVersion: "58.0.0",
     expoConfig: {
       extra: {
         leadloopBuild: {
@@ -17,7 +17,7 @@ test("build information identifies the bundled JavaScript commit separately from
     },
   });
   assert.equal(info.commit, "0dc83c050009");
-  assert.equal(info.nativeRuntime, "Expo Go 57.0.0");
+  assert.equal(info.nativeRuntime, "Expo Go 58.0.0");
   assert.match(shareableBuildInfo(info), /JavaScript commit: 0dc83c050009/);
 });
 

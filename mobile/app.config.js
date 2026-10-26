@@ -1,5 +1,28 @@
 const { execFileSync } = require("node:child_process");
-const base = require("./app.json");
+
+// Keep one source of Expo configuration. A separate app.json alongside this
+// dynamic build-information config makes Expo Doctor treat the project as
+// having competing configuration sources.
+const baseExpoConfig = {
+  name: "LeadLoop",
+  slug: "leadloop",
+  version: "0.1.0",
+  orientation: "portrait",
+  userInterfaceStyle: "light",
+  scheme: "leadloop",
+  ios: {
+    supportsTablet: false,
+    bundleIdentifier: "com.leadloop.app",
+    infoPlist: {
+      NSMicrophoneUsageDescription:
+        "LeadLoop records only when you tap Capture so you can create a reminder.",
+    },
+  },
+  plugins: ["expo-audio", "expo-secure-store"],
+  extra: {
+    eas: { projectId: "" },
+  },
+};
 
 function gitShortSha() {
   if (process.env.EAS_BUILD_GIT_COMMIT_HASH) {
@@ -22,9 +45,9 @@ module.exports = () => {
   const commit = gitShortSha();
   const builtAt = new Date().toISOString();
   return {
-    ...base.expo,
+    ...baseExpoConfig,
     extra: {
-      ...base.expo.extra,
+      ...baseExpoConfig.extra,
       leadloopBuild: {
         commit,
         builtAt,
